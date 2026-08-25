@@ -60,6 +60,14 @@ pub struct RateLimit {
     pub limit: Option<u64>,
 }
 
+/// An inline PR review comment on a specific line (RIGHT side of the diff).
+#[derive(Debug, Clone)]
+pub struct ReviewComment {
+    pub path: String,
+    pub line: u64,
+    pub body: String,
+}
+
 pub struct GitHubClient {
     http: Client,
     token: String,
@@ -208,52 +216,100 @@ impl GitHubClient {
         number: u64,
         body: Option<&str>,
     ) -> Result<()> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews");
-        let mut payload = serde_json::Map::new();
-        payload.insert("event".into(), serde_json::Value::String("APPROVE".into()));
-        if let Some(b) = body.filter(|s| !s.trim().is_empty()) {
-            payload.insert("body".into(), serde_json::Value::String(b.to_string()));
-        }
-        let resp = self
-            .http
-            .post(&url)
-            .headers(self.headers())
-            .json(&serde_json::Value::Object(payload))
-            .send()
-            .await?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("approve failed: {status} {body}"));
-        }
-        Ok(())
+        self.submit_review(owner, repo, number, "APPROVE", body, &[]).await
     }
 
-    /// Post a non-approving COMMENT review carrying the review body.
-    /// Used when the review score is below the auto-approve threshold — the
-    /// substantive review is still delivered, just without an approval.
+    /// Approve with inline line comments attached (creates resolvable threads).
+    pub async fn approve_pull_with_comments(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: Option<&str>,
+        comments: &[ReviewComment],
+    ) -> Result<()> {
+        self.submit_review(owner, repo, number, "APPROVE", body, comments).await
+    }
+
+    /// Post a non-approving COMMENT review carrying the review body (+ optional
+    /// inline line comments). Used when the score is below the approve threshold.
     pub async fn comment_pull(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
         body: &str,
+        comments: &[ReviewComment],
+    ) -> Result<()> {
+        self.submit_review(owner, repo, number, "COMMENT", Some(body), comments).await
+    }
+
+    /// Submit a review. Inline `comments` reference diff lines; if GitHub rejects
+    /// them (422 — a line not in the diff), retry once WITHOUT comments so the
+    /// review body still lands.
+    async fn submit_review(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        event: &str,
+        body: Option<&str>,
+        comments: &[ReviewComment],
     ) -> Result<()> {
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews");
-        let payload = serde_json::json!({ "event": "COMMENT", "body": body });
+        let build = |with_comments: bool| -> serde_json::Value {
+            let mut payload = serde_json::Map::new();
+            payload.insert("event".into(), serde_json::Value::String(event.into()));
+            if let Some(b) = body.filter(|s| !s.trim().is_empty()) {
+                payload.insert("body".into(), serde_json::Value::String(b.to_string()));
+            }
+            if with_comments && !comments.is_empty() {
+                let arr = comments
+                    .iter()
+                    .map(|c| {
+                        serde_json::json!({
+                            "path": c.path,
+                            "line": c.line,
+                            "side": "RIGHT",
+                            "body": c.body,
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                payload.insert("comments".into(), serde_json::Value::Array(arr));
+            }
+            serde_json::Value::Object(payload)
+        };
+
         let resp = self
             .http
             .post(&url)
             .headers(self.headers())
-            .json(&payload)
+            .json(&build(true))
             .send()
             .await?;
         let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("comment failed: {status} {body}"));
+        if status.is_success() {
+            return Ok(());
         }
-        Ok(())
+        // 422 usually means an inline comment pointed at a line not in the diff.
+        // Retry without the inline comments so the review body still posts.
+        if status == StatusCode::UNPROCESSABLE_ENTITY && !comments.is_empty() {
+            let resp2 = self
+                .http
+                .post(&url)
+                .headers(self.headers())
+                .json(&build(false))
+                .send()
+                .await?;
+            let s2 = resp2.status();
+            if s2.is_success() {
+                return Ok(());
+            }
+            let b = resp2.text().await.unwrap_or_default();
+            return Err(anyhow!("{event} failed (no-comments retry): {s2} {b}"));
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(anyhow!("{event} failed: {status} {b}"))
     }
 
     /// Fetch the unified diff for a PR (Accept: `...v3.diff`). Bounded by the

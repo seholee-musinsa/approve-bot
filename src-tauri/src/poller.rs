@@ -367,13 +367,24 @@ async fn handle_pr(
             .unwrap_or_default();
         // Posted to GitHub with the marker; the in-app detail keeps the clean body.
         let posted_body = format!("{REVIEW_MARKER}\n{}", outcome.body);
+        let inline_str = if outcome.inline.is_empty() {
+            String::new()
+        } else {
+            format!(", 인라인 {}건", outcome.inline.len())
+        };
         let approve = outcome.finished_cleanly
             && outcome.verdict == "approve"
             && outcome.score >= cfg.min_approve_score;
 
         if approve {
             match client
-                .approve_pull(owner, repo, pr.number, Some(posted_body.as_str()))
+                .approve_pull_with_comments(
+                    owner,
+                    repo,
+                    pr.number,
+                    Some(posted_body.as_str()),
+                    &outcome.inline,
+                )
                 .await
             {
                 Ok(()) => {
@@ -388,7 +399,7 @@ async fn handle_pr(
                             pr_title: Some(pr.title.clone()),
                             author: Some(pr.user.login.clone()),
                             url: Some(pr.html_url.clone()),
-                            message: format!("approved (리뷰 {score_str}/5{cost_str})"),
+                            message: format!("approved (리뷰 {score_str}/5{cost_str}{inline_str})"),
                             detail: Some(outcome.body.clone()),
                         },
                     )
@@ -414,7 +425,10 @@ async fn handle_pr(
             } else {
                 format!("점수 {score_str}/5 < {:.1}", cfg.min_approve_score)
             };
-            match client.comment_pull(owner, repo, pr.number, &posted_body).await {
+            match client
+                .comment_pull(owner, repo, pr.number, &posted_body, &outcome.inline)
+                .await
+            {
                 Ok(()) => {
                     push_and_emit(
                         app,
@@ -427,7 +441,7 @@ async fn handle_pr(
                             pr_title: Some(pr.title.clone()),
                             author: Some(pr.user.login.clone()),
                             url: Some(pr.html_url.clone()),
-                            message: format!("리뷰 코멘트 게시 (approve 보류: {why})"),
+                            message: format!("리뷰 코멘트 게시 (approve 보류: {why}{inline_str})"),
                             detail: Some(outcome.body.clone()),
                         },
                     )

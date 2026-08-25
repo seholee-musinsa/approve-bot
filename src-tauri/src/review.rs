@@ -10,8 +10,10 @@
 //! JSON drives the approve/comment gate. Anything malformed fails closed
 //! (score 0 → comment, never auto-approve).
 
+use crate::github::ReviewComment;
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::Command;
 
@@ -39,11 +41,13 @@ blocking_issues(short sentences), and a human-readable Korean review body. Follo
 /// The exact output contract: markdown review first, tiny JSON verdict last.
 const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것) ===
 1) 먼저 사람이 읽을 리뷰를 **마크다운**으로 작성한다. 팀 가이드의 "리뷰 코멘트 양식"(# 요약, # 리뷰, 잘한점/아쉬운점, mermaid 등)을 그대로 쓴다.
-2) 그 다음, 출력의 맨 마지막에 아래 펜스로 **판정만** 내보낸다. 리뷰 본문/마크다운은 이 JSON 안에 절대 넣지 마라:
+2) 그 다음, 출력의 맨 마지막에 아래 펜스로 **판정 + 인라인 코멘트**만 내보낸다. 리뷰 본문/마크다운은 이 JSON 안에 절대 넣지 마라:
 ```json
-{"verdict":"approve|comment|request_changes","score":<0-5 숫자>,"blocking_issues":["짧은 문장", "..."]}
+{"verdict":"approve|comment|request_changes","score":<0-5 숫자>,"blocking_issues":["짧은 문장", "..."],"inline_comments":[{"path":"<repo 기준 파일 경로>","line":<이 PR diff 에서 그 파일의 '추가/유지된 줄(+ 또는 공백)'의 새 파일 라인번호>,"comment":"<그 줄에 대한 짧은 한 줄 지적>"}]}
 ```
-blocking_issues 는 짧은 한 줄 문장들의 배열(없으면 []). 마크다운 본문 전체가 사람에게 보여지고, 이 JSON 은 게이트 판정에만 쓰인다."#;
+- blocking_issues 는 짧은 한 줄 문장 배열(없으면 []).
+- inline_comments 는 **구체적 파일·줄을 짚는 지적만** 담는다(없으면 []). line 은 반드시 **이번 PR diff 에 실제로 나오는 추가(+)/문맥( ) 줄**의 새 파일 라인번호여야 한다(삭제된 줄·diff 밖 줄 금지 — 안 맞으면 그 코멘트는 버려진다). 각 comment 는 한두 문장으로 짧게.
+- 마크다운 본문 전체가 사람에게 보여지고, 이 JSON 은 게이트 판정 + 인라인 코멘트 게시에 쓰인다."#;
 
 /// Cap the diff we hand to the CLI so a huge PR can't blow past the OS argv
 /// limit (macOS ARG_MAX ~1MB). Truncation is flagged to the model.
@@ -57,6 +61,8 @@ pub struct ReviewOutcome {
     pub verdict: String,
     pub score: f64,
     pub blocking_issues: Vec<String>,
+    /// Inline line comments, already filtered to lines that exist in the diff.
+    pub inline: Vec<ReviewComment>,
     /// False when the CLI/JSON was malformed — caller must NOT auto-approve.
     pub finished_cleanly: bool,
     pub cost_usd: Option<f64>,
@@ -69,6 +75,7 @@ impl ReviewOutcome {
             verdict: "comment".into(),
             score: 0.0,
             blocking_issues: vec!["리뷰가 정상 완료되지 않아 자동승인 불가 — 사람 리뷰 필요".into()],
+            inline: vec![],
             finished_cleanly: false,
             cost_usd: None,
         }
@@ -158,6 +165,78 @@ struct Verdict {
     score: Option<f64>,
     #[serde(default)]
     blocking_issues: Vec<String>,
+    #[serde(default)]
+    inline_comments: Vec<InlineRaw>,
+}
+
+#[derive(Debug, Deserialize)]
+struct InlineRaw {
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    line: u64,
+    #[serde(default)]
+    comment: String,
+}
+
+/// Lines that can carry an inline comment = added/context lines on the RIGHT
+/// side of each file's diff. Used to drop model-hallucinated line refs before
+/// posting (GitHub 422s on a comment line that isn't in the diff).
+fn commentable_lines(diff: &str) -> HashMap<String, HashSet<u64>> {
+    let mut map: HashMap<String, HashSet<u64>> = HashMap::new();
+    let mut path: Option<String> = None;
+    let mut right_line: u64 = 0;
+    for raw in diff.lines() {
+        if let Some(rest) = raw.strip_prefix("+++ ") {
+            // "+++ b/path" (or "+++ /dev/null" for deletions)
+            path = rest
+                .strip_prefix("b/")
+                .or_else(|| if rest == "/dev/null" { None } else { Some(rest) })
+                .map(|s| s.to_string());
+            continue;
+        }
+        if let Some(hunk) = raw.strip_prefix("@@ ") {
+            // "@@ -a,b +c,d @@ ..." → RIGHT side starts at c
+            right_line = hunk
+                .split('+')
+                .nth(1)
+                .and_then(|s| s.split([',', ' ']).next())
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            continue;
+        }
+        let Some(p) = path.as_ref() else { continue };
+        match raw.as_bytes().first() {
+            Some(b'+') => {
+                map.entry(p.clone()).or_default().insert(right_line);
+                right_line += 1;
+            }
+            Some(b' ') => {
+                map.entry(p.clone()).or_default().insert(right_line);
+                right_line += 1;
+            }
+            Some(b'-') => { /* left-only, no RIGHT line consumed */ }
+            _ => {}
+        }
+    }
+    map
+}
+
+/// Keep only inline comments whose (path, line) exists in the diff.
+fn filter_inline(raw: Vec<InlineRaw>, diff: &str) -> Vec<ReviewComment> {
+    let allowed = commentable_lines(diff);
+    raw.into_iter()
+        .filter(|c| {
+            !c.path.is_empty()
+                && !c.comment.trim().is_empty()
+                && allowed.get(&c.path).is_some_and(|set| set.contains(&c.line))
+        })
+        .map(|c| ReviewComment {
+            path: c.path,
+            line: c.line,
+            body: c.comment,
+        })
+        .collect()
 }
 
 /// Extract the last ```json fence as the verdict; text before it is the body.
@@ -208,8 +287,15 @@ struct RunOpts<'a> {
 }
 
 /// Spawn `claude -p`, parse the envelope + trailing verdict fence into an
-/// outcome. Blocking; call from `spawn_blocking`. Fails closed on any error.
-fn run_claude(prompt: &str, model: &str, thinking_tokens: u32, opts: &RunOpts) -> ReviewOutcome {
+/// outcome. `diff` is used to drop inline comments that don't match a diff line.
+/// Blocking; call from `spawn_blocking`. Fails closed on any error.
+fn run_claude(
+    prompt: &str,
+    model: &str,
+    thinking_tokens: u32,
+    diff: &str,
+    opts: &RunOpts,
+) -> ReviewOutcome {
     let mut cmd = Command::new(claude_bin());
     cmd.args([
         "-p",
@@ -292,6 +378,7 @@ fn run_claude(prompt: &str, model: &str, thinking_tokens: u32, opts: &RunOpts) -
                 verdict,
                 score,
                 blocking_issues: v.blocking_issues,
+                inline: filter_inline(v.inline_comments, diff),
                 finished_cleanly: true,
                 cost_usd: envelope.total_cost_usd,
             }
@@ -328,6 +415,7 @@ pub fn review_pr(
         &prompt,
         model,
         thinking_tokens,
+        diff,
         &RunOpts {
             cwd: None,
             allowed_tools: "",
@@ -365,6 +453,7 @@ pub fn review_pr_deep(
         &prompt,
         model,
         thinking_tokens,
+        diff,
         &RunOpts {
             cwd: Some(&cloned),
             allowed_tools: READ_ONLY_TOOLS,
@@ -485,6 +574,34 @@ mod tests {
         assert!(extract_review("그냥 텍스트, JSON 없음").is_err());
     }
 
+    const SAMPLE_DIFF: &str = "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -10,3 +10,4 @@ ctx\n line10\n-line11old\n+line11new\n+line12new\n line13\n";
+
+    #[test]
+    fn commentable_lines_tracks_right_side() {
+        let map = commentable_lines(SAMPLE_DIFF);
+        let set = map.get("src/x.ts").expect("path present");
+        // context 10, added 11 & 12, context 13 are commentable; deleted line is not.
+        assert!(set.contains(&10));
+        assert!(set.contains(&11));
+        assert!(set.contains(&12));
+        assert!(set.contains(&13));
+        assert!(!set.contains(&14));
+    }
+
+    #[test]
+    fn filter_inline_keeps_valid_drops_bogus() {
+        let raw = vec![
+            InlineRaw { path: "src/x.ts".into(), line: 11, comment: "실제 줄".into() },
+            InlineRaw { path: "src/x.ts".into(), line: 99, comment: "diff 밖 줄".into() },
+            InlineRaw { path: "other.ts".into(), line: 11, comment: "다른 파일".into() },
+            InlineRaw { path: "src/x.ts".into(), line: 12, comment: "  ".into() }, // empty
+        ];
+        let kept = filter_inline(raw, SAMPLE_DIFF);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, 11);
+        assert_eq!(kept[0].path, "src/x.ts");
+    }
+
     #[test]
     fn base64_matches_known_vectors() {
         // Covers all three padding cases (0, 1, 2 leftover bytes).
@@ -536,17 +653,23 @@ mod tests {
     fn live_deep_review_clones_and_reviews() {
         let token = std::env::var("APPROVE_BOT_TEST_TOKEN").expect("set APPROVE_BOT_TEST_TOKEN");
         let guide = "## 리뷰 가이드\n- 버그/보안은 blocking. 스타일은 notes. 주변 코드를 열어 검증.";
-        let meta = "Repository: musinsa/core-partner-frontend  PR #5173\nAuthor: someone\nTitle: 상품번호 검색 방어\nBody:\n(none)";
-        let diff = "diff --git a/x b/x\n@@\n+// see the checked-out repo for context\n";
+        let meta = "Repository: musinsa/core-partner-frontend  PR #5188\nAuthor: cigon\nTitle: 컬러 옵션 노출\nBody:\n(none)";
+        // Real diff so inline_comments can be validated against actual lines.
+        let diff = std::process::Command::new("gh")
+            .args(["api", "repos/musinsa/core-partner-frontend/pulls/5188", "-H", "Accept: application/vnd.github.v3.diff"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
         let out = review_pr_deep(
             guide,
             meta,
-            diff,
+            &diff,
             "claude-sonnet-5",
             0,
             "musinsa",
             "core-partner-frontend",
-            5173,
+            5188,
             &token,
         );
         assert!(out.finished_cleanly, "engine should finish: {}", out.body);
@@ -555,11 +678,15 @@ mod tests {
             "approve" | "comment" | "request_changes"
         ));
         eprintln!(
-            "DEEP verdict={} score={} cost={:?} body_len={}",
+            "DEEP verdict={} score={} cost={:?} body_len={} inline={}",
             out.verdict,
             out.score,
             out.cost_usd,
-            out.body.len()
+            out.body.len(),
+            out.inline.len()
         );
+        for c in &out.inline {
+            eprintln!("  inline {}:{} — {}", c.path, c.line, c.body.chars().take(60).collect::<String>());
+        }
     }
 }
