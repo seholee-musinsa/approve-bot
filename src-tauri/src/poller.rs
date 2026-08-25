@@ -311,8 +311,14 @@ async fn handle_pr(
             ReviewAction::Skip => return,
             ReviewAction::ApproveOnly => {
                 // Already reviewed earlier — just approve the new head (auto-approve
-                // already confirmed above).
-                approve_only(app, state, client, cfg, repo_full, owner, repo, pr).await;
+                // already confirmed above). Carry the prior review body so the UI
+                // still shows it.
+                let prior = my_reviews
+                    .iter()
+                    .rev()
+                    .find(|r| r.body.contains(REVIEW_MARKER))
+                    .map(|r| r.body.replace(REVIEW_MARKER, "").trim().to_string());
+                approve_only(app, state, client, cfg, repo_full, owner, repo, pr, prior).await;
                 return;
             }
             // Fall through to the review engine below.
@@ -487,6 +493,7 @@ async fn handle_pr(
 
 /// Approve the current head without re-reviewing — used when this PR already has
 /// an engine review on an earlier commit and `approve_only_after_review` is on.
+#[allow(clippy::too_many_arguments)]
 async fn approve_only(
     app: &AppHandle,
     state: &Arc<AppState>,
@@ -496,6 +503,7 @@ async fn approve_only(
     owner: &str,
     repo: &str,
     pr: &PullRequest,
+    prior_review: Option<String>,
 ) {
     let msg = if cfg.approval_message.trim().is_empty() {
         "이전 리뷰 확인됨 — 새 커밋 자동 승인".to_string()
@@ -516,7 +524,7 @@ async fn approve_only(
                     author: Some(pr.user.login.clone()),
                     url: Some(pr.html_url.clone()),
                     message: "approved (이전 리뷰 있음 — 재리뷰 생략)".into(),
-                    detail: None,
+                    detail: prior_review,
                 },
             )
             .await;
