@@ -118,6 +118,7 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
                         author: None,
                         url: None,
                         message: format!("invalid repo entry: {e}"),
+                        detail: None,
                     },
                 )
                 .await;
@@ -140,6 +141,7 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
                         author: None,
                         url: None,
                         message: format!("list pulls failed: {e}"),
+                        detail: None,
                     },
                 )
                 .await;
@@ -207,6 +209,7 @@ async fn handle_pr(
                     author: Some(pr.user.login.clone()),
                     url: Some(pr.html_url.clone()),
                     message: format!("list reviews failed: {e}"),
+                    detail: None,
                 },
             )
             .await;
@@ -244,6 +247,7 @@ async fn handle_pr(
                 author: Some(pr.user.login.clone()),
                 url: Some(pr.html_url.clone()),
                 message: "auto-approve is disabled".into(),
+                detail: None,
             },
         )
         .await;
@@ -320,6 +324,7 @@ async fn handle_pr(
                             author: Some(pr.user.login.clone()),
                             url: Some(pr.html_url.clone()),
                             message: format!("approved (리뷰 {score_str}/5{cost_str})"),
+                            detail: Some(outcome.body.clone()),
                         },
                     )
                     .await;
@@ -358,6 +363,7 @@ async fn handle_pr(
                             author: Some(pr.user.login.clone()),
                             url: Some(pr.html_url.clone()),
                             message: format!("리뷰 코멘트 게시 (approve 보류: {why})"),
+                            detail: Some(outcome.body.clone()),
                         },
                     )
                     .await;
@@ -389,6 +395,7 @@ async fn handle_pr(
                     author: Some(pr.user.login.clone()),
                     url: Some(pr.html_url.clone()),
                     message: "approved".into(),
+                    detail: None,
                 },
             )
             .await;
@@ -415,6 +422,7 @@ fn err_entry(repo_full: &str, pr: &PullRequest, message: String) -> ActivityEntr
         author: Some(pr.user.login.clone()),
         url: Some(pr.html_url.clone()),
         message,
+        detail: None,
     }
 }
 

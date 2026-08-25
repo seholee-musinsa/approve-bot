@@ -33,6 +33,8 @@ export interface ActivityEntry {
   author: string | null;
   url: string | null;
   message: string;
+  /** Long-form detail (full review body) — shown collapsed, expandable. */
+  detail?: string | null;
 }
 
 export type GhLoginProgress =

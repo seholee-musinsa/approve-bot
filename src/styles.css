@@ -183,6 +183,31 @@ ul.list li {
 .activity a { color: var(--accent); text-decoration: none; }
 .activity a:hover { text-decoration: underline; }
 
+.review-detail { margin-top: 4px; }
+.review-detail > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-size: 12px;
+  list-style: none;
+  user-select: none;
+}
+.review-detail > summary::-webkit-details-marker { display: none; }
+.review-detail > summary::before { content: "▸ "; }
+.review-detail[open] > summary::before { content: "▾ "; }
+.review-body {
+  margin: 6px 0 2px;
+  padding: 8px 10px;
+  max-height: 320px;
+  overflow: auto;
+  background: var(--panel-2, rgba(127, 127, 127, 0.08));
+  border-radius: 6px;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
 .toggle {
   display: inline-flex;
   align-items: center;

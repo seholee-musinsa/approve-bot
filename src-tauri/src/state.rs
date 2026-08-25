@@ -50,6 +50,10 @@ pub struct ActivityEntry {
     pub author: Option<String>,
     pub url: Option<String>,
     pub message: String,
+    /// Optional long-form detail (e.g. the full review body) shown collapsed in
+    /// the activity log, expandable on click. Serde-defaulted for backward compat.
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 pub struct AppState {
