@@ -54,7 +54,7 @@ pub async fn start(app: AppHandle, state: Arc<AppState>) -> Result<()> {
 async fn run(app: &AppHandle) -> Result<()> {
     let _ = app.emit(PROGRESS_EVENT, &GhLoginProgress::Started);
 
-    let mut child = Command::new("gh")
+    let mut child = Command::new(crate::auth::gh_bin())
         .args([
             "auth",
             "login",
