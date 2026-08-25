@@ -52,6 +52,7 @@ body, html, #root {
   flex-direction: column;
   gap: 12px;
   min-height: 0;
+  overflow-y: auto;
 }
 
 .panel {
@@ -63,6 +64,10 @@ body, html, #root {
   flex-direction: column;
   gap: 8px;
   min-height: 0;
+  /* Don't let a tall stack squeeze a panel below its content (content would
+     spill outside the card). The column scrolls instead. ActivityLog overrides
+     via inline flex:1 to keep filling + internal scroll. */
+  flex-shrink: 0;
 }
 
 .panel h2 {
