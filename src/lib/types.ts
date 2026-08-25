@@ -5,6 +5,7 @@ export interface AppConfig {
   auto_approve_enabled: boolean;
   approval_message: string;
   skip_drafts: boolean;
+  notifications_enabled: boolean;
 }
 
 export interface ConnectionStatus {

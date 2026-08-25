@@ -14,6 +14,7 @@ const DEFAULT_CFG: AppConfig = {
   auto_approve_enabled: true,
   approval_message: "",
   skip_drafts: true,
+  notifications_enabled: true,
 };
 
 function eq(a: AppConfig, b: AppConfig): boolean {

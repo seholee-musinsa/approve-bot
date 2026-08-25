@@ -29,6 +29,14 @@ export function SettingsPanel({ value, onChange }: Props) {
         />
         Skip draft PRs
       </label>
+      <label className="toggle">
+        <input
+          type="checkbox"
+          checked={value.notifications_enabled}
+          onChange={(e) => patch({ notifications_enabled: e.target.checked })}
+        />
+        Desktop notifications on approve
+      </label>
       <div className="row">
         <span style={{ minWidth: 120 }}>Polling interval</span>
         <input

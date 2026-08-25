@@ -259,9 +259,11 @@ async fn handle_pr(
                 },
             )
             .await;
-            let title = format!("Approved {repo_full}#{}", pr.number);
-            let body = format!("by @{}: {}", pr.user.login, pr.title);
-            let _ = app.notification().builder().title(title).body(body).show();
+            if cfg.notifications_enabled {
+                let title = format!("Approved {repo_full}#{}", pr.number);
+                let body = format!("by @{}: {}", pr.user.login, pr.title);
+                let _ = app.notification().builder().title(title).body(body).show();
+            }
         }
         Err(e) => {
             push_and_emit(

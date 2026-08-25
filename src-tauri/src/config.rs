@@ -11,6 +11,14 @@ pub struct AppConfig {
     pub auto_approve_enabled: bool,
     pub approval_message: String,
     pub skip_drafts: bool,
+    // Backward-compatible: existing config.json written before this field will
+    // deserialize with the default (notifications on) instead of failing.
+    #[serde(default = "default_true")]
+    pub notifications_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AppConfig {
@@ -22,6 +30,7 @@ impl Default for AppConfig {
             auto_approve_enabled: true,
             approval_message: String::new(),
             skip_drafts: true,
+            notifications_enabled: true,
         }
     }
 }
