@@ -34,6 +34,10 @@ pub struct AppConfig {
     /// Extended-thinking token budget for the review (0 = off).
     #[serde(default = "default_thinking")]
     pub review_thinking_tokens: u32,
+    /// Deep review: clone the PR head and let the model explore it read-only
+    /// (more accurate, slower). Clone failure falls back to diff-only.
+    #[serde(default = "default_true")]
+    pub review_deep: bool,
 }
 
 fn default_true() -> bool {
@@ -67,6 +71,7 @@ impl Default for AppConfig {
             review_guide_path: String::new(),
             min_approve_score: default_min_score(),
             review_thinking_tokens: default_thinking(),
+            review_deep: true,
         }
     }
 }

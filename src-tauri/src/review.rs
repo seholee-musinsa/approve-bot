@@ -114,7 +114,7 @@ pub fn load_guide(base_dir: &Path, guide_override: &str, login: &str) -> String 
     text.replace("{{GITHUB_LOGIN}}", login)
 }
 
-fn build_prompt(guide: &str, meta: &str, diff: &str) -> String {
+fn build_prompt(guide: &str, meta: &str, diff: &str, deep: bool) -> String {
     let diff = if diff.len() > MAX_DIFF_BYTES {
         let mut cut = MAX_DIFF_BYTES;
         while !diff.is_char_boundary(cut) {
@@ -128,8 +128,15 @@ fn build_prompt(guide: &str, meta: &str, diff: &str) -> String {
     } else {
         diff.to_string()
     };
+    // Deep mode injects TOOL_NOTE so the model knows the PR head is checked out
+    // and it may explore with read-only tools.
+    let tool_note = if deep {
+        format!("\n\n{TOOL_NOTE}")
+    } else {
+        String::new()
+    };
     format!(
-        "{SYSTEM_PROMPT_CORE}\n\n=== 팀 리뷰 가이드 (아래 기준을 따르되, 위 CRITICAL RULES 와 출력형식은 절대 우선) ===\n{guide}\n\n{meta}\n\n<pr_diff>\n{diff}\n</pr_diff>\n\n{CLI_OUTPUT_FORMAT}",
+        "{SYSTEM_PROMPT_CORE}\n\n=== 팀 리뷰 가이드 (아래 기준을 따르되, 위 CRITICAL RULES 와 출력형식은 절대 우선) ===\n{guide}{tool_note}\n\n{meta}\n\n<pr_diff>\n{diff}\n</pr_diff>\n\n{CLI_OUTPUT_FORMAT}",
     )
 }
 
@@ -180,32 +187,59 @@ fn extract_review(result: &str) -> Result<(String, Verdict)> {
     Ok((t.to_string(), verdict))
 }
 
-/// Run one review. Blocking (spawns `claude -p` which can take minutes) — call
-/// from a blocking context (`spawn_blocking`), never on the async runtime.
-pub fn review_pr(
-    guide: &str,
-    meta: &str,
-    diff: &str,
-    model: &str,
-    thinking_tokens: u32,
-) -> ReviewOutcome {
-    let prompt = build_prompt(guide, meta, diff);
+/// Read-only tool set the model may use in deep mode (no Bash/Write/network).
+const READ_ONLY_TOOLS: &str = "Read,Grep,Glob";
+const DENIED_TOOLS: &str = "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task";
+const TOOL_NOTE: &str = r#"=== 실행 환경 ===
+이 PR 의 head 가 현재 작업 디렉토리에 체크아웃되어 있습니다.
+Read/Grep/Glob 도구로 변경 파일은 물론 주변 코드·소비처·컨벤션 문서를 직접 열람해 검증하세요.
+(git clone 불필요 — 이미 됨. Bash·쓰기·네트워크 도구는 비활성화되어 있습니다.)
+탐색을 마치면 아래 "출력 형식"대로 응답하세요."#;
 
+/// Options for a single `claude -p` invocation.
+struct RunOpts<'a> {
+    cwd: Option<&'a Path>,
+    allowed_tools: &'a str,
+    disallowed_tools: Option<&'a str>,
+    extra_args: &'a [&'a str],
+    /// Strip bot secrets (GH_*/SLACK_*/tokens) from the child env — used in the
+    /// tool-enabled sandbox so an untrusted repo can't read them.
+    scrub_env: bool,
+}
+
+/// Spawn `claude -p`, parse the envelope + trailing verdict fence into an
+/// outcome. Blocking; call from `spawn_blocking`. Fails closed on any error.
+fn run_claude(prompt: &str, model: &str, thinking_tokens: u32, opts: &RunOpts) -> ReviewOutcome {
     let mut cmd = Command::new(claude_bin());
     cmd.args([
         "-p",
-        &prompt,
+        prompt,
         "--output-format",
         "json",
         // Don't read the (untrusted) cloned repo's project/local settings.
         "--setting-sources",
         "user",
-        // diff-only: no tools at all — the untrusted diff can't invoke anything.
         "--allowedTools",
-        "",
+        opts.allowed_tools,
         "--model",
         model,
     ]);
+    if let Some(denied) = opts.disallowed_tools {
+        cmd.args(["--disallowedTools", denied]);
+    }
+    cmd.args(opts.extra_args);
+    if let Some(dir) = opts.cwd {
+        cmd.current_dir(dir);
+    }
+    if opts.scrub_env {
+        cmd.env_clear();
+        for (k, v) in std::env::vars() {
+            if is_secret_env(&k) {
+                continue;
+            }
+            cmd.env(k, v);
+        }
+    }
     if thinking_tokens > 0 {
         cmd.env("MAX_THINKING_TOKENS", thinking_tokens.to_string());
     }
@@ -266,6 +300,156 @@ pub fn review_pr(
     }
 }
 
+fn is_secret_env(key: &str) -> bool {
+    let k = key.to_ascii_uppercase();
+    k.starts_with("GH_")
+        || k == "GITHUB_TOKEN"
+        || k.starts_with("SLACK_")
+        || k.starts_with("ANTHROPIC_")
+        || k.starts_with("OPENAI_")
+        || k.ends_with("TOKEN")
+        || k.ends_with("SECRET")
+        || k.ends_with("PASSWORD")
+        || k.ends_with("PRIVATE_KEY")
+        || k.ends_with("API_KEY")
+}
+
+/// Diff-only review: no tools, the untrusted diff can't invoke anything.
+/// Blocking (spawns `claude -p` for minutes) — call from `spawn_blocking`.
+pub fn review_pr(
+    guide: &str,
+    meta: &str,
+    diff: &str,
+    model: &str,
+    thinking_tokens: u32,
+) -> ReviewOutcome {
+    let prompt = build_prompt(guide, meta, diff, false);
+    run_claude(
+        &prompt,
+        model,
+        thinking_tokens,
+        &RunOpts {
+            cwd: None,
+            allowed_tools: "",
+            disallowed_tools: None,
+            extra_args: &[],
+            scrub_env: false,
+        },
+    )
+}
+
+/// Deep review: trusted code clones the PR head into a temp dir, then the model
+/// explores it read-only (Read/Grep/Glob) to verify against surrounding code.
+/// Clone failure falls back to a diff-only review. Blocking.
+#[allow(clippy::too_many_arguments)]
+pub fn review_pr_deep(
+    guide: &str,
+    meta: &str,
+    diff: &str,
+    model: &str,
+    thinking_tokens: u32,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+) -> ReviewOutcome {
+    let cloned = match clone_pr_head(owner, repo, number, token) {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("[review] clone 실패 → diff-only 폴백: {e}");
+            return review_pr(guide, meta, diff, model, thinking_tokens);
+        }
+    };
+    let prompt = build_prompt(guide, meta, diff, true);
+    let outcome = run_claude(
+        &prompt,
+        model,
+        thinking_tokens,
+        &RunOpts {
+            cwd: Some(&cloned),
+            allowed_tools: READ_ONLY_TOOLS,
+            disallowed_tools: Some(DENIED_TOOLS),
+            extra_args: &["--permission-mode", "default", "--strict-mcp-config"],
+            scrub_env: true,
+        },
+    );
+    let _ = std::fs::remove_dir_all(&cloned); // best-effort cleanup
+    outcome
+}
+
+/// Shallow-checkout a PR head into a fresh temp dir. Token is injected via
+/// `GIT_CONFIG_*` (http.extraHeader), never on argv, so it can't leak to `ps`.
+/// Returns the checkout dir; caller removes it.
+fn clone_pr_head(owner: &str, repo: &str, number: u64, token: &str) -> Result<std::path::PathBuf> {
+    let dir = make_temp_dir()?;
+    let repo_url = format!("https://github.com/{owner}/{repo}.git");
+    let basic = base64_encode(format!("x-access-token:{token}").as_bytes());
+
+    let git = |args: &[&str], cwd: Option<&Path>| -> Result<()> {
+        let mut c = Command::new("git");
+        c.args(args)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "http.extraHeader")
+            .env("GIT_CONFIG_VALUE_0", format!("Authorization: Basic {basic}"));
+        if let Some(d) = cwd {
+            c.current_dir(d);
+        }
+        let out = c.output().map_err(|e| anyhow!("git spawn 실패: {e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            return Err(anyhow!("{}", err.trim().chars().take(200).collect::<String>()));
+        }
+        Ok(())
+    };
+
+    let run = || -> Result<()> {
+        git(&["init", "--quiet", dir.to_str().unwrap()], None)?;
+        git(&["remote", "add", "origin", &repo_url], Some(&dir))?;
+        git(
+            &["fetch", "--depth", "1", "origin", &format!("pull/{number}/head")],
+            Some(&dir),
+        )?;
+        git(&["checkout", "--quiet", "FETCH_HEAD"], Some(&dir))?;
+        Ok(())
+    };
+    if let Err(e) = run() {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
+    Ok(dir)
+}
+
+/// Create a unique temp dir without pulling in a crate. Uniqueness from pid +
+/// nanosecond clock is sufficient for a single-process local bot.
+fn make_temp_dir() -> Result<std::path::PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("pr-review-{}-{}", std::process::id(), nanos));
+    std::fs::create_dir_all(&dir).map_err(|e| anyhow!("temp dir 생성 실패: {e}"))?;
+    Ok(dir)
+}
+
+/// Minimal standard base64 (for the basic-auth header). No padding edge cases —
+/// input is always non-empty ASCII.
+fn base64_encode(input: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(T[(n >> 18) as usize & 63] as char);
+        out.push(T[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 2 { T[n as usize & 63] as char } else { '=' });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -302,6 +486,23 @@ mod tests {
     }
 
     #[test]
+    fn base64_matches_known_vectors() {
+        // Covers all three padding cases (0, 1, 2 leftover bytes).
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+    }
+
+    #[test]
+    fn deep_prompt_includes_tool_note_diff_only_does_not() {
+        let deep = build_prompt("g", "m", "d", true);
+        let shallow = build_prompt("g", "m", "d", false);
+        assert!(deep.contains("실행 환경"));
+        assert!(!shallow.contains("실행 환경"));
+    }
+
+    #[test]
     fn missing_score_defaults_to_none_then_zero_at_gate() {
         // score absent → Option None → gate treats as 0 (fail-closed).
         let out = "본문\n```json\n{\"verdict\":\"approve\",\"blocking_issues\":[]}\n```";
@@ -326,5 +527,39 @@ mod tests {
         );
         assert!(!out.body.is_empty());
         eprintln!("verdict={} score={} body_len={}", out.verdict, out.score, out.body.len());
+    }
+
+    // Live deep smoke — clones a real (small) PR head + explores read-only.
+    // Opt-in: `APPROVE_BOT_TEST_TOKEN=$(gh auth token) cargo test -- --ignored live_deep`.
+    #[test]
+    #[ignore]
+    fn live_deep_review_clones_and_reviews() {
+        let token = std::env::var("APPROVE_BOT_TEST_TOKEN").expect("set APPROVE_BOT_TEST_TOKEN");
+        let guide = "## 리뷰 가이드\n- 버그/보안은 blocking. 스타일은 notes. 주변 코드를 열어 검증.";
+        let meta = "Repository: musinsa/core-partner-frontend  PR #5173\nAuthor: someone\nTitle: 상품번호 검색 방어\nBody:\n(none)";
+        let diff = "diff --git a/x b/x\n@@\n+// see the checked-out repo for context\n";
+        let out = review_pr_deep(
+            guide,
+            meta,
+            diff,
+            "claude-sonnet-5",
+            0,
+            "musinsa",
+            "core-partner-frontend",
+            5173,
+            &token,
+        );
+        assert!(out.finished_cleanly, "engine should finish: {}", out.body);
+        assert!(matches!(
+            out.verdict.as_str(),
+            "approve" | "comment" | "request_changes"
+        ));
+        eprintln!(
+            "DEEP verdict={} score={} cost={:?} body_len={}",
+            out.verdict,
+            out.score,
+            out.cost_usd,
+            out.body.len()
+        );
     }
 }

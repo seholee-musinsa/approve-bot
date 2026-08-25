@@ -267,10 +267,21 @@ async fn handle_pr(
         let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);
         let model = cfg.review_model.clone();
         let tk = cfg.review_thinking_tokens;
+        let deep = cfg.review_deep;
+        let owner_s = owner.to_string();
+        let repo_s = repo.to_string();
+        let number = pr.number;
+        let token = client.token().to_string();
 
         // `claude -p` can take minutes — keep it off the async runtime.
         let outcome = match tokio::task::spawn_blocking(move || {
-            crate::review::review_pr(&guide, &meta, &diff, &model, tk)
+            if deep {
+                crate::review::review_pr_deep(
+                    &guide, &meta, &diff, &model, tk, &owner_s, &repo_s, number, &token,
+                )
+            } else {
+                crate::review::review_pr(&guide, &meta, &diff, &model, tk)
+            }
         })
         .await
         {

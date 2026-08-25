@@ -58,6 +58,11 @@ impl GitHubClient {
         }
     }
 
+    /// The in-memory token (used by the deep-review clone to authenticate).
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     fn headers(&self) -> HeaderMap {
         let mut h = HeaderMap::new();
         h.insert(USER_AGENT, HeaderValue::from_static(UA));
