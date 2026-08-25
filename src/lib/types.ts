@@ -6,6 +6,11 @@ export interface AppConfig {
   approval_message: string;
   skip_drafts: boolean;
   notifications_enabled: boolean;
+  /** true = write a Claude review then gate approve on the score;
+   *  false = legacy blind approve only (no review). */
+  review_enabled: boolean;
+  /** true = deep review (clone PR head, explore code); false = diff-only. */
+  review_deep: boolean;
 }
 
 export interface ConnectionStatus {
