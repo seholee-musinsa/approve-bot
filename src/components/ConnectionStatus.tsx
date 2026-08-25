@@ -1,18 +1,42 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, onGhLoginProgress, onStatusChanged } from "../lib/tauri";
+import { showToast } from "../lib/toast";
 import type { ConnectionStatus as Status } from "../lib/types";
 
 export function ConnectionStatus() {
   const [status, setStatus] = useState<Status | null>(null);
   const [busy, setBusy] = useState(false);
+  const [checking, setChecking] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
   const [deviceCode, setDeviceCode] = useState<string | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
   const [codeCopied, setCodeCopied] = useState(false);
 
+  // "Check now" is fire-and-forget on the backend; the poll runs async and reports
+  // completion via a STATUS_EVENT. Track the pending check with a ref (stable across
+  // the status listener closure) plus a timeout fallback in case no event arrives.
+  const checkingRef = useRef(false);
+  const checkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function stopChecking(reason?: "done" | "timeout") {
+    const wasChecking = checkingRef.current;
+    checkingRef.current = false;
+    setChecking(false);
+    if (checkTimer.current) {
+      clearTimeout(checkTimer.current);
+      checkTimer.current = null;
+    }
+    if (!wasChecking) return;
+    if (reason === "done") showToast("Check complete", "success");
+    else if (reason === "timeout") showToast("Check finished — no response", "info");
+  }
+
   useEffect(() => {
     api.getConnectionStatus().then(setStatus).catch(() => {});
-    const offStatus = onStatusChanged(setStatus);
+    const offStatus = onStatusChanged((s) => {
+      setStatus(s);
+      if (checkingRef.current) stopChecking("done");
+    });
     const offLogin = onGhLoginProgress((p) => {
       switch (p.kind) {
         case "started":
@@ -38,8 +62,24 @@ export function ConnectionStatus() {
     return () => {
       offStatus.then((u) => u()).catch(() => {});
       offLogin.then((u) => u()).catch(() => {});
+      if (checkTimer.current) clearTimeout(checkTimer.current);
     };
   }, []);
+
+  async function checkNow() {
+    checkingRef.current = true;
+    setChecking(true);
+    try {
+      await api.forceCheckNow();
+    } catch {
+      stopChecking();
+      showToast("Check failed", "error");
+      return;
+    }
+    // Fallback: clear the spinner even if no STATUS_EVENT arrives (e.g. no repos configured).
+    if (checkTimer.current) clearTimeout(checkTimer.current);
+    checkTimer.current = setTimeout(() => stopChecking("timeout"), 10000);
+  }
 
   async function reconnect() {
     setBusy(true);
@@ -51,8 +91,13 @@ export function ConnectionStatus() {
       const needsLogin =
         !s.connected &&
         (err.includes("gh cli") || err.includes("gh auth") || err.includes("not authenticated"));
-      if (needsLogin) {
+      if (s.connected) {
+        showToast(`Reconnected as @${s.username}`, "success");
+      } else if (needsLogin) {
+        showToast("Sign-in required", "info");
         await api.startGhLogin();
+      } else {
+        showToast("Reconnect failed", "error");
       }
     } finally {
       setBusy(false);
@@ -101,14 +146,16 @@ export function ConnectionStatus() {
           )}
         </span>
         <button onClick={reconnect} disabled={busy || signingIn}>
-          {busy ? "Connecting…" : "Reconnect"}
+          {busy ? "Reconnecting…" : "Reconnect"}
         </button>
         {!ok && !signingIn && (
           <button onClick={signIn} disabled={busy}>
             Sign in with GitHub
           </button>
         )}
-        <button onClick={() => api.forceCheckNow()}>Check now</button>
+        <button onClick={checkNow} disabled={checking || busy}>
+          {checking ? "Checking…" : "Check now"}
+        </button>
       </div>
 
       {signingIn && (

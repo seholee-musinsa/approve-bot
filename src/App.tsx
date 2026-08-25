@@ -4,6 +4,7 @@ import { RepositoriesPanel } from "./components/RepositoriesPanel";
 import { AuthorsPanel } from "./components/AuthorsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ActivityLog } from "./components/ActivityLog";
+import { ToastHost } from "./components/ToastHost";
 import { api } from "./lib/tauri";
 import type { AppConfig } from "./lib/types";
 
@@ -96,6 +97,7 @@ export default function App() {
           <ActivityLog />
         </div>
       </div>
+      <ToastHost />
     </div>
   );
 }
