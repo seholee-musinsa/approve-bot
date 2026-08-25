@@ -28,9 +28,30 @@ export function ActivityLog() {
     };
   }, []);
 
+  async function clearAll() {
+    try {
+      await api.clearActivityLog();
+      setEntries([]);
+    } catch {
+      // ignore — backend clear failed; leave entries as-is
+    }
+  }
+
   return (
     <div className="panel" style={{ flex: 1, minHeight: 0 }}>
-      <h2>Activity ({entries.length})</h2>
+      <div
+        className="row"
+        style={{ justifyContent: "space-between", alignItems: "center" }}
+      >
+        <h2 style={{ margin: 0 }}>Activity ({entries.length})</h2>
+        <button
+          type="button"
+          onClick={clearAll}
+          disabled={entries.length === 0}
+        >
+          Clear
+        </button>
+      </div>
       <div className="activity">
         {entries.length === 0 && (
           <div className="muted">No activity yet. Polling will report results here.</div>

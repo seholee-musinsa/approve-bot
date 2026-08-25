@@ -48,6 +48,7 @@ pub fn run() {
             commands::get_config,
             commands::update_config,
             commands::get_activity_log,
+            commands::clear_activity_log,
             commands::force_check_now,
             commands::search_users,
             commands::start_gh_login,

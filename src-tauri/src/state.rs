@@ -85,6 +85,10 @@ impl AppState {
         log.push_front(entry);
     }
 
+    pub async fn clear_activity(&self) {
+        self.activity.lock().await.clear();
+    }
+
     pub async fn recent_activity(&self, limit: usize) -> Vec<ActivityEntry> {
         let log = self.activity.lock().await;
         log.iter().take(limit).cloned().collect()

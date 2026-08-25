@@ -21,6 +21,7 @@ export const api = {
     invoke<AppConfig>("update_config", { config }),
   getActivityLog: (limit = 100) =>
     invoke<ActivityEntry[]>("get_activity_log", { limit }),
+  clearActivityLog: () => invoke<void>("clear_activity_log"),
   forceCheckNow: () => invoke<void>("force_check_now"),
   searchUsers: (query: string) =>
     invoke<GhUserHint[]>("search_users", { query }),

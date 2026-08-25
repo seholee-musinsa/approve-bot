@@ -47,6 +47,12 @@ pub async fn get_activity_log(
 }
 
 #[tauri::command]
+pub async fn clear_activity_log(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    state.clear_activity().await;
+    Ok(())
+}
+
+#[tauri::command]
 pub async fn force_check_now(state: State<'_, Arc<AppState>>) -> Result<(), String> {
     state.poll_signal.notify_one();
     Ok(())
