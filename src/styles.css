@@ -215,7 +215,7 @@ ul.list li {
   cursor: pointer;
   user-select: none;
 }
-.toggle input { accent-color: var(--accent); }
+.toggle input { accent-color: var(--accent); flex-shrink: 0; }
 
 .autocomplete {
   position: relative;

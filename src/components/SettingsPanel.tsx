@@ -30,14 +30,19 @@ export function SettingsPanel({ value, onChange }: Props) {
         리뷰 작성 후 승인 (끄면 승인만)
       </label>
       {value.review_enabled ? (
-        <label className="toggle" style={{ marginLeft: 24 }}>
-          <input
-            type="checkbox"
-            checked={value.review_deep}
-            onChange={(e) => patch({ review_deep: e.target.checked })}
-          />
-          깊은 리뷰 — PR 코드를 clone 해 직접 탐색 (끄면 diff만, 빠름·저렴)
-        </label>
+        <div style={{ marginLeft: 24 }}>
+          <label className="toggle">
+            <input
+              type="checkbox"
+              checked={value.review_deep}
+              onChange={(e) => patch({ review_deep: e.target.checked })}
+            />
+            깊은 리뷰
+          </label>
+          <div className="muted" style={{ marginLeft: 26 }}>
+            PR 코드를 clone 해 직접 탐색 (끄면 diff만, 빠름·저렴)
+          </div>
+        </div>
       ) : (
         <div className="muted" style={{ marginLeft: 24 }}>
           리뷰 없이 허용 author 의 PR 을 바로 승인합니다.
