@@ -18,6 +18,7 @@ const DEFAULT_CFG: AppConfig = {
   notifications_enabled: true,
   review_enabled: true,
   review_deep: true,
+  approve_only_after_review: true,
 };
 
 function eq(a: AppConfig, b: AppConfig): boolean {

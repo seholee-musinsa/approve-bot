@@ -11,6 +11,9 @@ export interface AppConfig {
   review_enabled: boolean;
   /** true = deep review (clone PR head, explore code); false = diff-only. */
   review_deep: boolean;
+  /** true = once a PR has an engine review, later commits are approved without
+   *  re-reviewing (first review always runs). */
+  approve_only_after_review: boolean;
 }
 
 export interface ConnectionStatus {

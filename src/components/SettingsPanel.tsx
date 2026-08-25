@@ -42,6 +42,19 @@ export function SettingsPanel({ value, onChange }: Props) {
           <div className="muted" style={{ marginLeft: 26 }}>
             PR 코드를 clone 해 직접 탐색 (끄면 diff만, 빠름·저렴)
           </div>
+          <label className="toggle" style={{ marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={value.approve_only_after_review}
+              onChange={(e) =>
+                patch({ approve_only_after_review: e.target.checked })
+              }
+            />
+            이미 리뷰한 PR 은 재리뷰 없이 승인만
+          </label>
+          <div className="muted" style={{ marginLeft: 26 }}>
+            첫 리뷰는 항상 실행, 이후 새 커밋은 재리뷰 없이 승인 (비용·중복 코멘트 절약)
+          </div>
         </div>
       ) : (
         <div className="muted" style={{ marginLeft: 24 }}>

@@ -22,6 +22,12 @@ struct UserSearchResp {
     items: Vec<GhUserHint>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PrHead {
+    #[serde(default)]
+    pub sha: String,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PullRequest {
     pub number: u64,
@@ -29,12 +35,23 @@ pub struct PullRequest {
     pub draft: bool,
     pub html_url: String,
     pub user: GhUser,
+    /// Current head commit — reviews are deduped against this so a new commit
+    /// (or a dismissed prior review) is re-reviewed.
+    #[serde(default)]
+    pub head: PrHead,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct Review {
     pub user: GhUser,
     pub state: String,
+    /// Commit the review was left on (null for pending).
+    #[serde(default)]
+    pub commit_id: Option<String>,
+    /// Review body — used to detect our own engine reviews (they carry a marker)
+    /// vs a blind approve or another bot's review.
+    #[serde(default)]
+    pub body: String,
 }
 
 #[derive(Debug, Clone)]

@@ -11,6 +11,51 @@ use tracing::{debug, info, warn};
 pub const ACTIVITY_EVENT: &str = "approve-bot://activity";
 pub const STATUS_EVENT: &str = "approve-bot://status-changed";
 
+/// Hidden marker prepended to engine-posted review bodies so later polls can
+/// tell our own review apart from a blind approve or another bot's review.
+/// Renders invisibly on GitHub (HTML comment).
+const REVIEW_MARKER: &str = "<!-- approve-bot:review -->";
+
+/// What to do with a PR on the review path, given my prior reviews.
+#[derive(Debug, PartialEq, Eq)]
+enum ReviewAction {
+    /// Nothing to do (already approved / already reviewed this exact head).
+    Skip,
+    /// Already reviewed earlier; just approve the new head (no re-review).
+    ApproveOnly,
+    /// Run the review engine.
+    Review,
+}
+
+/// Pure dedup decision. `reviews` = my prior reviews as (state, commit_id, is
+/// engine-marker). Only marker reviews count as "reviewed" — a blind 👍 approve
+/// or another bot's review must not suppress the first real review.
+fn decide_review_action(
+    reviews: &[(&str, Option<&str>, bool)],
+    head_sha: &str,
+    approve_only_after_review: bool,
+) -> ReviewAction {
+    // Already approved the current head → done.
+    if reviews
+        .iter()
+        .any(|(s, c, _)| s.eq_ignore_ascii_case("APPROVED") && *c == Some(head_sha))
+    {
+        return ReviewAction::Skip;
+    }
+    // Already engine-reviewed THIS head (live) → don't re-post.
+    if reviews
+        .iter()
+        .any(|(s, c, marker)| *marker && !s.eq_ignore_ascii_case("DISMISSED") && *c == Some(head_sha))
+    {
+        return ReviewAction::Skip;
+    }
+    // Engine-reviewed an earlier commit → optionally approve without re-review.
+    if approve_only_after_review && reviews.iter().any(|(_, _, marker)| *marker) {
+        return ReviewAction::ApproveOnly;
+    }
+    ReviewAction::Review
+}
+
 pub fn spawn(app: AppHandle, state: Arc<AppState>) {
     tauri::async_runtime::spawn(async move {
         run_loop(app, state).await;
@@ -216,24 +261,21 @@ async fn handle_pr(
             return;
         }
     };
+    let head_sha = pr.head.sha.as_str();
     let my_reviews = reviews
         .iter()
         .filter(|r| r.user.login.eq_ignore_ascii_case(me))
         .collect::<Vec<_>>();
-    let already_approved = my_reviews
-        .iter()
-        .any(|r| r.state.eq_ignore_ascii_case("APPROVED"));
-    if already_approved {
-        return;
-    }
-    // When the review engine is on, treat ANY prior review by me (incl. a
-    // sub-threshold COMMENT) as "done" — re-reviewing every poll would burn
-    // Claude quota. Trade-off: a PR commented below threshold is not
-    // auto-re-reviewed after new commits (re-trigger manually). Cost safety wins.
-    if cfg.review_enabled && !my_reviews.is_empty() {
+    // Already approved the CURRENT head → nothing to do.
+    let approved_head = my_reviews.iter().any(|r| {
+        r.state.eq_ignore_ascii_case("APPROVED") && r.commit_id.as_deref() == Some(head_sha)
+    });
+    if approved_head {
         return;
     }
 
+    // Master switch: the bot only acts (review or approve) when auto-approve is
+    // on. Off = idle, so it never spams reviews across every open PR.
     if !cfg.auto_approve_enabled {
         push_and_emit(
             app,
@@ -254,7 +296,37 @@ async fn handle_pr(
         return;
     }
 
-    // ── Review engine: ask claude to review the diff, gate approve on score ──
+    if cfg.review_enabled {
+        let tuples: Vec<(&str, Option<&str>, bool)> = my_reviews
+            .iter()
+            .map(|r| {
+                (
+                    r.state.as_str(),
+                    r.commit_id.as_deref(),
+                    r.body.contains(REVIEW_MARKER),
+                )
+            })
+            .collect();
+        match decide_review_action(&tuples, head_sha, cfg.approve_only_after_review) {
+            ReviewAction::Skip => return,
+            ReviewAction::ApproveOnly => {
+                // Already reviewed earlier — just approve the new head (auto-approve
+                // already confirmed above).
+                approve_only(app, state, client, cfg, repo_full, owner, repo, pr).await;
+                return;
+            }
+            // Fall through to the review engine below.
+            ReviewAction::Review => {}
+        }
+    } else {
+        // Legacy blind approve: original behavior — skip while an APPROVED review
+        // still stands (a new commit dismisses it, letting us re-approve).
+        if my_reviews.iter().any(|r| r.state.eq_ignore_ascii_case("APPROVED")) {
+            return;
+        }
+    }
+
+    // ── Review engine: review the diff, gate approve on the score ──
     if cfg.review_enabled {
         let diff = match client.get_pr_diff(owner, repo, pr.number).await {
             Ok(d) => d,
@@ -302,13 +374,15 @@ async fn handle_pr(
             .cost_usd
             .map(|c| format!(", ${c:.2}"))
             .unwrap_or_default();
+        // Posted to GitHub with the marker; the in-app detail keeps the clean body.
+        let posted_body = format!("{REVIEW_MARKER}\n{}", outcome.body);
         let approve = outcome.finished_cleanly
             && outcome.verdict == "approve"
             && outcome.score >= cfg.min_approve_score;
 
         if approve {
             match client
-                .approve_pull(owner, repo, pr.number, Some(outcome.body.as_str()))
+                .approve_pull(owner, repo, pr.number, Some(posted_body.as_str()))
                 .await
             {
                 Ok(()) => {
@@ -349,7 +423,7 @@ async fn handle_pr(
             } else {
                 format!("점수 {score_str}/5 < {:.1}", cfg.min_approve_score)
             };
-            match client.comment_pull(owner, repo, pr.number, &outcome.body).await {
+            match client.comment_pull(owner, repo, pr.number, &posted_body).await {
                 Ok(()) => {
                     push_and_emit(
                         app,
@@ -411,6 +485,54 @@ async fn handle_pr(
     }
 }
 
+/// Approve the current head without re-reviewing — used when this PR already has
+/// an engine review on an earlier commit and `approve_only_after_review` is on.
+async fn approve_only(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    client: &GitHubClient,
+    cfg: &crate::config::AppConfig,
+    repo_full: &str,
+    owner: &str,
+    repo: &str,
+    pr: &PullRequest,
+) {
+    let msg = if cfg.approval_message.trim().is_empty() {
+        "이전 리뷰 확인됨 — 새 커밋 자동 승인".to_string()
+    } else {
+        cfg.approval_message.clone()
+    };
+    match client.approve_pull(owner, repo, pr.number, Some(msg.as_str())).await {
+        Ok(()) => {
+            push_and_emit(
+                app,
+                state,
+                ActivityEntry {
+                    timestamp: Utc::now(),
+                    kind: ActivityKind::Approved,
+                    repo: Some(repo_full.to_string()),
+                    pr_number: Some(pr.number),
+                    pr_title: Some(pr.title.clone()),
+                    author: Some(pr.user.login.clone()),
+                    url: Some(pr.html_url.clone()),
+                    message: "approved (이전 리뷰 있음 — 재리뷰 생략)".into(),
+                    detail: None,
+                },
+            )
+            .await;
+            if cfg.notifications_enabled {
+                let title = format!("Approved {repo_full}#{}", pr.number);
+                let body = format!("by @{}: {}", pr.user.login, pr.title);
+                let _ = app.notification().builder().title(title).body(body).show();
+            }
+        }
+        Err(e) => {
+            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e}")))
+                .await;
+        }
+    }
+}
+
 /// Build an `Error` activity entry for a PR (shared by the review/approve paths).
 fn err_entry(repo_full: &str, pr: &PullRequest, message: String) -> ActivityEntry {
     ActivityEntry {
@@ -429,4 +551,55 @@ fn err_entry(repo_full: &str, pr: &PullRequest, message: String) -> ActivityEntr
 async fn push_and_emit(app: &AppHandle, state: &Arc<AppState>, entry: ActivityEntry) {
     state.push_activity(entry.clone()).await;
     let _ = app.emit(ACTIVITY_EVENT, &entry);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_review_action, ReviewAction};
+
+    const HEAD: &str = "aaaa1111";
+    const OLD: &str = "bbbb2222";
+
+    #[test]
+    fn blind_emoji_approve_does_not_suppress_first_review() {
+        // The #1876 bug: a dismissed blind 👍 (no marker) must NOT count as reviewed.
+        let reviews = [("DISMISSED", Some(OLD), false)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Review);
+    }
+
+    #[test]
+    fn no_prior_reviews_reviews() {
+        assert_eq!(decide_review_action(&[], HEAD, true), ReviewAction::Review);
+    }
+
+    #[test]
+    fn engine_review_on_current_head_skips() {
+        let reviews = [("COMMENTED", Some(HEAD), true)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Skip);
+    }
+
+    #[test]
+    fn approved_current_head_skips() {
+        let reviews = [("APPROVED", Some(HEAD), false)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Skip);
+    }
+
+    #[test]
+    fn engine_review_on_old_commit_approve_only_when_enabled() {
+        let reviews = [("DISMISSED", Some(OLD), true)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::ApproveOnly);
+    }
+
+    #[test]
+    fn engine_review_on_old_commit_re_reviews_when_approve_only_off() {
+        let reviews = [("DISMISSED", Some(OLD), true)];
+        assert_eq!(decide_review_action(&reviews, HEAD, false), ReviewAction::Review);
+    }
+
+    #[test]
+    fn dismissed_engine_review_on_head_re_reviews() {
+        // Marker review but dismissed on the current head → stale → re-review.
+        let reviews = [("DISMISSED", Some(HEAD), true)];
+        assert_eq!(decide_review_action(&reviews, HEAD, false), ReviewAction::Review);
+    }
 }

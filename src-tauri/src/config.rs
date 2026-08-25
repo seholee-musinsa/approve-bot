@@ -38,6 +38,11 @@ pub struct AppConfig {
     /// (more accurate, slower). Clone failure falls back to diff-only.
     #[serde(default = "default_true")]
     pub review_deep: bool,
+    /// Once this PR already has an engine review, don't re-review new commits —
+    /// just approve them (saves Claude quota + avoids duplicate review comments).
+    /// The first review always runs; this only affects subsequent commits.
+    #[serde(default = "default_true")]
+    pub approve_only_after_review: bool,
 }
 
 fn default_true() -> bool {
@@ -72,6 +77,7 @@ impl Default for AppConfig {
             min_approve_score: default_min_score(),
             review_thinking_tokens: default_thinking(),
             review_deep: true,
+            approve_only_after_review: true,
         }
     }
 }
