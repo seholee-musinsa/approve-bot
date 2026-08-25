@@ -275,24 +275,9 @@ async fn handle_pr(
     }
 
     // Master switch: the bot only acts (review or approve) when auto-approve is
-    // on. Off = idle, so it never spams reviews across every open PR.
+    // on. Off = idle. Skip SILENTLY — emitting a per-PR "disabled" entry every
+    // poll floods the (now persisted) activity log with noise.
     if !cfg.auto_approve_enabled {
-        push_and_emit(
-            app,
-            state,
-            ActivityEntry {
-                timestamp: Utc::now(),
-                kind: ActivityKind::Skipped,
-                repo: Some(repo_full.to_string()),
-                pr_number: Some(pr.number),
-                pr_title: Some(pr.title.clone()),
-                author: Some(pr.user.login.clone()),
-                url: Some(pr.html_url.clone()),
-                message: "auto-approve is disabled".into(),
-                detail: None,
-            },
-        )
-        .await;
         return;
     }
 
