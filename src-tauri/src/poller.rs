@@ -367,10 +367,15 @@ async fn handle_pr(
             .unwrap_or_default();
         // Posted to GitHub with the marker; the in-app detail keeps the clean body.
         let posted_body = format!("{REVIEW_MARKER}\n{}", outcome.body);
-        let inline_str = if outcome.inline.is_empty() {
+        let inline: &[crate::github::ReviewComment] = if cfg.inline_comments_enabled {
+            &outcome.inline
+        } else {
+            &[]
+        };
+        let inline_str = if inline.is_empty() {
             String::new()
         } else {
-            format!(", 인라인 {}건", outcome.inline.len())
+            format!(", 인라인 {}건", inline.len())
         };
         let approve = outcome.finished_cleanly
             && outcome.verdict == "approve"
@@ -383,7 +388,7 @@ async fn handle_pr(
                     repo,
                     pr.number,
                     Some(posted_body.as_str()),
-                    &outcome.inline,
+                    inline,
                 )
                 .await
             {
@@ -426,7 +431,7 @@ async fn handle_pr(
                 format!("점수 {score_str}/5 < {:.1}", cfg.min_approve_score)
             };
             match client
-                .comment_pull(owner, repo, pr.number, &posted_body, &outcome.inline)
+                .comment_pull(owner, repo, pr.number, &posted_body, inline)
                 .await
             {
                 Ok(()) => {

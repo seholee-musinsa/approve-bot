@@ -14,6 +14,9 @@ export interface AppConfig {
   /** true = once a PR has an engine review, later commits are approved without
    *  re-reviewing (first review always runs). */
   approve_only_after_review: boolean;
+  /** true = attach inline line comments (resolvable threads). Turn off if a repo
+   *  requires conversation resolution to merge. */
+  inline_comments_enabled: boolean;
 }
 
 export interface ConnectionStatus {

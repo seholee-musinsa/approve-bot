@@ -19,6 +19,7 @@ const DEFAULT_CFG: AppConfig = {
   review_enabled: true,
   review_deep: true,
   approve_only_after_review: true,
+  inline_comments_enabled: true,
 };
 
 function eq(a: AppConfig, b: AppConfig): boolean {

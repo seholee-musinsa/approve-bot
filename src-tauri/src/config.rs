@@ -43,6 +43,11 @@ pub struct AppConfig {
     /// The first review always runs; this only affects subsequent commits.
     #[serde(default = "default_true")]
     pub approve_only_after_review: bool,
+    /// Attach inline line comments to reviews (resolvable threads). Turn off if a
+    /// repo enables "require conversation resolution" and the threads become a
+    /// merge bottleneck.
+    #[serde(default = "default_true")]
+    pub inline_comments_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -78,6 +83,7 @@ impl Default for AppConfig {
             review_thinking_tokens: default_thinking(),
             review_deep: true,
             approve_only_after_review: true,
+            inline_comments_enabled: true,
         }
     }
 }

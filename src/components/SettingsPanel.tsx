@@ -55,6 +55,19 @@ export function SettingsPanel({ value, onChange }: Props) {
           <div className="muted" style={{ marginLeft: 26 }}>
             첫 리뷰는 항상 실행, 이후 새 커밋은 재리뷰 없이 승인 (비용·중복 코멘트 절약)
           </div>
+          <label className="toggle" style={{ marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={value.inline_comments_enabled}
+              onChange={(e) =>
+                patch({ inline_comments_enabled: e.target.checked })
+              }
+            />
+            인라인 라인 코멘트 달기
+          </label>
+          <div className="muted" style={{ marginLeft: 26 }}>
+            줄별 지적을 스레드로 게시. repo 가 "대화 해결 필수"면 머지 병목이 될 수 있어 끌 수 있음
+          </div>
         </div>
       ) : (
         <div className="muted" style={{ marginLeft: 24 }}>
