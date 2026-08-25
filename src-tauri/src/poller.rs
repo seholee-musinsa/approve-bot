@@ -213,10 +213,21 @@ async fn handle_pr(
             return;
         }
     };
-    let already_approved = reviews
+    let my_reviews = reviews
         .iter()
-        .any(|r| r.user.login.eq_ignore_ascii_case(me) && r.state.eq_ignore_ascii_case("APPROVED"));
+        .filter(|r| r.user.login.eq_ignore_ascii_case(me))
+        .collect::<Vec<_>>();
+    let already_approved = my_reviews
+        .iter()
+        .any(|r| r.state.eq_ignore_ascii_case("APPROVED"));
     if already_approved {
+        return;
+    }
+    // When the review engine is on, treat ANY prior review by me (incl. a
+    // sub-threshold COMMENT) as "done" — re-reviewing every poll would burn
+    // Claude quota. Trade-off: a PR commented below threshold is not
+    // auto-re-reviewed after new commits (re-trigger manually). Cost safety wins.
+    if cfg.review_enabled && !my_reviews.is_empty() {
         return;
     }
 
@@ -239,6 +250,117 @@ async fn handle_pr(
         return;
     }
 
+    // ── Review engine: ask claude to review the diff, gate approve on score ──
+    if cfg.review_enabled {
+        let diff = match client.get_pr_diff(owner, repo, pr.number).await {
+            Ok(d) => d,
+            Err(e) => {
+                push_and_emit(app, state, err_entry(repo_full, pr, format!("get diff failed: {e}")))
+                    .await;
+                return;
+            }
+        };
+        let meta = format!(
+            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n(none)",
+            pr.number, pr.user.login, pr.title
+        );
+        let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);
+        let model = cfg.review_model.clone();
+        let tk = cfg.review_thinking_tokens;
+
+        // `claude -p` can take minutes — keep it off the async runtime.
+        let outcome = match tokio::task::spawn_blocking(move || {
+            crate::review::review_pr(&guide, &meta, &diff, &model, tk)
+        })
+        .await
+        {
+            Ok(o) => o,
+            Err(e) => {
+                push_and_emit(app, state, err_entry(repo_full, pr, format!("review task failed: {e}")))
+                    .await;
+                return;
+            }
+        };
+
+        let score_str = format!("{:.1}", outcome.score);
+        let cost_str = outcome
+            .cost_usd
+            .map(|c| format!(", ${c:.2}"))
+            .unwrap_or_default();
+        let approve = outcome.finished_cleanly
+            && outcome.verdict == "approve"
+            && outcome.score >= cfg.min_approve_score;
+
+        if approve {
+            match client
+                .approve_pull(owner, repo, pr.number, Some(outcome.body.as_str()))
+                .await
+            {
+                Ok(()) => {
+                    push_and_emit(
+                        app,
+                        state,
+                        ActivityEntry {
+                            timestamp: Utc::now(),
+                            kind: ActivityKind::Approved,
+                            repo: Some(repo_full.to_string()),
+                            pr_number: Some(pr.number),
+                            pr_title: Some(pr.title.clone()),
+                            author: Some(pr.user.login.clone()),
+                            url: Some(pr.html_url.clone()),
+                            message: format!("approved (리뷰 {score_str}/5{cost_str})"),
+                        },
+                    )
+                    .await;
+                    if cfg.notifications_enabled {
+                        let title = format!("Approved {repo_full}#{}", pr.number);
+                        let body = format!("by @{}: {} ({score_str}/5)", pr.user.login, pr.title);
+                        let _ = app.notification().builder().title(title).body(body).show();
+                    }
+                }
+                Err(e) => {
+                    push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e}")))
+                        .await;
+                }
+            }
+        } else {
+            // Below threshold / blocking / unclean → post the review as a
+            // COMMENT (substantive body still delivered), but do NOT approve.
+            let why = if !outcome.finished_cleanly {
+                "리뷰 미완료".to_string()
+            } else if !outcome.blocking_issues.is_empty() {
+                format!("blocking {}건", outcome.blocking_issues.len())
+            } else {
+                format!("점수 {score_str}/5 < {:.1}", cfg.min_approve_score)
+            };
+            match client.comment_pull(owner, repo, pr.number, &outcome.body).await {
+                Ok(()) => {
+                    push_and_emit(
+                        app,
+                        state,
+                        ActivityEntry {
+                            timestamp: Utc::now(),
+                            kind: ActivityKind::Info,
+                            repo: Some(repo_full.to_string()),
+                            pr_number: Some(pr.number),
+                            pr_title: Some(pr.title.clone()),
+                            author: Some(pr.user.login.clone()),
+                            url: Some(pr.html_url.clone()),
+                            message: format!("리뷰 코멘트 게시 (approve 보류: {why})"),
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    push_and_emit(app, state, err_entry(repo_full, pr, format!("comment failed: {e}")))
+                        .await;
+                }
+            }
+        }
+        return;
+    }
+
+    // ── Legacy blind approve (review engine disabled) ──
     match client
         .approve_pull(owner, repo, pr.number, Some(&cfg.approval_message))
         .await
@@ -266,22 +388,22 @@ async fn handle_pr(
             }
         }
         Err(e) => {
-            push_and_emit(
-                app,
-                state,
-                ActivityEntry {
-                    timestamp: Utc::now(),
-                    kind: ActivityKind::Error,
-                    repo: Some(repo_full.to_string()),
-                    pr_number: Some(pr.number),
-                    pr_title: Some(pr.title.clone()),
-                    author: Some(pr.user.login.clone()),
-                    url: Some(pr.html_url.clone()),
-                    message: format!("approve failed: {e}"),
-                },
-            )
-            .await;
+            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e}"))).await;
         }
+    }
+}
+
+/// Build an `Error` activity entry for a PR (shared by the review/approve paths).
+fn err_entry(repo_full: &str, pr: &PullRequest, message: String) -> ActivityEntry {
+    ActivityEntry {
+        timestamp: Utc::now(),
+        kind: ActivityKind::Error,
+        repo: Some(repo_full.to_string()),
+        pr_number: Some(pr.number),
+        pr_title: Some(pr.title.clone()),
+        author: Some(pr.user.login.clone()),
+        url: Some(pr.html_url.clone()),
+        message,
     }
 }
 

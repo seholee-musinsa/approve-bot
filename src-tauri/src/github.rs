@@ -206,6 +206,48 @@ impl GitHubClient {
         }
         Ok(())
     }
+
+    /// Post a non-approving COMMENT review carrying the review body.
+    /// Used when the review score is below the auto-approve threshold — the
+    /// substantive review is still delivered, just without an approval.
+    pub async fn comment_pull(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        body: &str,
+    ) -> Result<()> {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews");
+        let payload = serde_json::json!({ "event": "COMMENT", "body": body });
+        let resp = self
+            .http
+            .post(&url)
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("comment failed: {status} {body}"));
+        }
+        Ok(())
+    }
+
+    /// Fetch the unified diff for a PR (Accept: `...v3.diff`). Bounded by the
+    /// server; the caller truncates before handing it to the review engine.
+    pub async fn get_pr_diff(&self, owner: &str, repo: &str, number: u64) -> Result<String> {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}");
+        let mut headers = self.headers();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3.diff"));
+        let resp = self.http.get(&url).headers(headers).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("get diff failed: {status} {body}"));
+        }
+        Ok(resp.text().await?)
+    }
 }
 
 /// Parse "owner/repo" into (owner, repo). Trims whitespace and rejects malformed entries.
