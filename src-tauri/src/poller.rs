@@ -509,12 +509,9 @@ async fn approve_only(
     pr: &PullRequest,
     prior_review: Option<String>,
 ) {
-    let msg = if cfg.approval_message.trim().is_empty() {
-        "이전 리뷰 확인됨 — 새 커밋 자동 승인".to_string()
-    } else {
-        cfg.approval_message.clone()
-    };
-    match client.approve_pull(owner, repo, pr.number, Some(msg.as_str())).await {
+    // Already reviewed earlier — approve with NO body (a bare approval, no
+    // comment on the PR). The prior review already carries the substance.
+    match client.approve_pull(owner, repo, pr.number, None).await {
         Ok(()) => {
             push_and_emit(
                 app,
