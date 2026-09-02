@@ -6,6 +6,17 @@ export interface AppConfig {
   approval_message: string;
   skip_drafts: boolean;
   notifications_enabled: boolean;
+  /** true = write a Claude review then gate approve on the score;
+   *  false = legacy blind approve only (no review). */
+  review_enabled: boolean;
+  /** true = deep review (clone PR head, explore code); false = diff-only. */
+  review_deep: boolean;
+  /** true = once a PR has an engine review, later commits are approved without
+   *  re-reviewing (first review always runs). */
+  approve_only_after_review: boolean;
+  /** true = attach inline line comments (resolvable threads). Turn off if a repo
+   *  requires conversation resolution to merge. */
+  inline_comments_enabled: boolean;
 }
 
 export interface ConnectionStatus {
@@ -33,6 +44,8 @@ export interface ActivityEntry {
   author: string | null;
   url: string | null;
   message: string;
+  /** Long-form detail (full review body) — shown collapsed, expandable. */
+  detail?: string | null;
 }
 
 export type GhLoginProgress =

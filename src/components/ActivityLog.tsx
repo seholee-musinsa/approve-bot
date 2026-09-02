@@ -94,6 +94,12 @@ export function ActivityLog() {
                 )}
                 {e.pr_title && <div className="muted">{e.pr_title}</div>}
                 <div className="muted">{e.message}</div>
+                {e.detail && (
+                  <details className="review-detail">
+                    <summary>리뷰 전문 보기</summary>
+                    <pre className="review-body">{e.detail}</pre>
+                  </details>
+                )}
               </span>
               {e.url && !inlineLink && (
                 <a

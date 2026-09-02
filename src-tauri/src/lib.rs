@@ -4,6 +4,7 @@ mod config;
 mod gh_login;
 mod github;
 mod poller;
+mod review;
 mod state;
 
 use std::sync::Arc;
