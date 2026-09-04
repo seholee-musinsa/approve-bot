@@ -327,8 +327,27 @@ async fn handle_pr(
                 return;
             }
         };
+        // Include the real PR description so the reviewer doesn't wrongly flag it
+        // as empty. Cap length to keep the prompt bounded.
+        let pr_body = pr
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                if s.len() > 8000 {
+                    let mut cut = 8000;
+                    while !s.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    format!("{}\n[... 본문 일부 생략 ...]", &s[..cut])
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_else(|| "(none)".to_string());
         let meta = format!(
-            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n(none)",
+            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}",
             pr.number, pr.user.login, pr.title
         );
         let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);

@@ -39,6 +39,10 @@ pub struct PullRequest {
     /// (or a dismissed prior review) is re-reviewed.
     #[serde(default)]
     pub head: PrHead,
+    /// PR description body. Fed to the reviewer so it doesn't wrongly flag the PR
+    /// as having no description. Null when the author left it empty.
+    #[serde(default)]
+    pub body: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
