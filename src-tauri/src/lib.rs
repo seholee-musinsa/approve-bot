@@ -1,6 +1,7 @@
 mod auth;
 mod commands;
 mod config;
+mod eval_cli;
 mod gh_login;
 mod github;
 mod poller;
@@ -13,6 +14,12 @@ use tracing::warn;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Headless `review-once` eval subcommand — handles argv and exits before the
+    // GUI ever starts. No-op for a normal (GUI) launch.
+    if eval_cli::maybe_run_headless() {
+        return;
+    }
+
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()

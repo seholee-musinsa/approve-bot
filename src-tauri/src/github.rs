@@ -330,6 +330,20 @@ impl GitHubClient {
         }
         Ok(resp.text().await?)
     }
+
+    /// Fetch a single PR's metadata (title/body/author). Used by the headless
+    /// `review-once` eval subcommand, which reviews closed/merged PRs that the
+    /// open-PR poller never lists.
+    pub async fn get_pull(&self, owner: &str, repo: &str, number: u64) -> Result<PullRequest> {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}");
+        let resp = self.http.get(&url).headers(self.headers()).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("get pull failed: {status} {body}"));
+        }
+        Ok(resp.json().await?)
+    }
 }
 
 /// Parse "owner/repo" into (owner, repo). Trims whitespace and rejects malformed entries.
