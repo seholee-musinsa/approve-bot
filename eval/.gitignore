@@ -5,3 +5,9 @@ scores.json
 # 사내 PR 리뷰 발견이 담긴 로컬 산출물 — public repo 라 커밋 금지
 results.md
 score.log
+# eval v2 — every file below quotes private-repo code or review findings
+out2/
+scores2/
+cache/
+truth/*
+!truth/README.md
