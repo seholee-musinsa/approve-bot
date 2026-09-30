@@ -7,6 +7,7 @@ mod eval_cli;
 mod gh_login;
 mod github;
 mod poller;
+mod rereview;
 mod review;
 mod state;
 

@@ -55,6 +55,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것) ===
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 본문에만 남는다.
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
 - suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌거나 diff 밖이면 비우고 fix 에 설명한다.
+- 재리뷰 블록이 있으면 JSON 에 `"followups":[{"id":"<이전 지적 f:id>","status":"resolved|partial|unresolved|wont_fix|withdrawn","note":"<근거 한 줄>"}]` 를 이전 지적마다 하나씩 넣는다.
 - 이 JSON 은 게이트 판정과 인라인 코멘트 게시에 쓰인다."#;
 
 /// Diff-only counterpart of `TOOL_NOTE`: without it the guide's "read the
@@ -123,6 +124,8 @@ pub struct ReviewOutcome {
     pub omitted_files: Vec<String>,
     /// Structured findings as the model reported them (eval, later re-review).
     pub findings: Vec<Finding>,
+    /// Status of each earlier finding on a follow-up round (empty on round 1).
+    pub followups: Vec<crate::rereview::Followup>,
 }
 
 impl ReviewOutcome {
@@ -138,6 +141,7 @@ impl ReviewOutcome {
             explored: false,
             omitted_files: vec![],
             findings: vec![],
+            followups: vec![],
         }
     }
 }
@@ -226,6 +230,8 @@ struct Verdict {
     inline_comments: Vec<InlineRaw>,
     #[serde(default)]
     findings: Vec<Finding>,
+    #[serde(default)]
+    followups: Vec<crate::rereview::Followup>,
 }
 
 /// One problem the review asserts. Code, not the model, turns these into
@@ -622,6 +628,7 @@ fn run_claude(
                 explored: opts.cwd.is_some(),
                 omitted_files: vec![],
                 findings: v.findings,
+                followups: v.followups,
             }
         }
         Err(e) => ReviewOutcome::fail_closed(format!("판정 파싱 실패: {e}")),

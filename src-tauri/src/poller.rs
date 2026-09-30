@@ -45,8 +45,12 @@ fn marker_of(body: &str) -> Marker {
 enum ReviewAction {
     /// Nothing to do (already approved / already reviewed this exact head).
     Skip,
-    /// Already reviewed earlier; just approve the new head (no re-review).
+    /// My earlier engine review approved an older commit. Approve again without
+    /// a review only if the new commits touch docs/tests alone; else follow up.
     ApproveOnly,
+    /// My earlier engine review (not an approval) is on an older commit:
+    /// follow-up review of the delta + earlier findings.
+    FollowUp,
     /// Run the review engine.
     Review,
 }
@@ -79,14 +83,53 @@ fn decide_review_action(
     // A COMMENT (below threshold / blocking) or a failed run must be re-reviewed,
     // otherwise its findings are waved through unchecked.
     let latest_engine = reviews.iter().rev().find(|(_, _, m)| *m != Marker::None);
-    if approve_only_after_review {
-        if let Some((state, _, Marker::Reviewed)) = latest_engine {
-            if state.eq_ignore_ascii_case("APPROVED") || state.eq_ignore_ascii_case("DISMISSED") {
-                return ReviewAction::ApproveOnly;
-            }
+    let approved = |state: &str| state.eq_ignore_ascii_case("APPROVED") || state.eq_ignore_ascii_case("DISMISSED");
+    match latest_engine {
+        Some((state, _, Marker::Reviewed)) if approve_only_after_review && approved(state) => {
+            ReviewAction::ApproveOnly
         }
+        // Any finished engine review before → follow up on it.
+        // (A dismissed review on the current head has no delta: review afresh.)
+        _ if reviews
+            .iter()
+            .any(|(_, c, m)| *m == Marker::Reviewed && *c != Some(head_sha)) =>
+        {
+            ReviewAction::FollowUp
+        }
+        _ => ReviewAction::Review,
     }
-    ReviewAction::Review
+}
+
+/// Inputs for a follow-up round, from my latest finished engine review. None
+/// (→ a full first-round review) when that commit is gone (force-push) or
+/// GitHub can't diff it.
+async fn build_round(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr: &PullRequest,
+    my_reviews: &[&crate::github::Review],
+    me: &str,
+) -> Option<crate::rereview::Round> {
+    let engine: Vec<_> = my_reviews
+        .iter()
+        .filter(|r| marker_of(&r.body) == Marker::Reviewed)
+        .collect();
+    let prev_sha = engine.last()?.commit_id.clone()?;
+    let delta_diff = client
+        .get_compare_diff(owner, repo, &prev_sha, &pr.head.sha)
+        .await
+        .ok()?;
+    let comments = client
+        .list_review_comments(owner, repo, pr.number)
+        .await
+        .unwrap_or_default();
+    Some(crate::rereview::Round {
+        number: engine.len() + 1,
+        prev_sha,
+        prev: crate::rereview::prev_findings(&comments, me),
+        delta_diff,
+    })
 }
 
 /// Approve-gate verdict. Pure so every hold reason is testable.
@@ -370,6 +413,7 @@ async fn handle_pr(
         return;
     }
 
+    let mut round: Option<crate::rereview::Round> = None;
     if cfg.review_enabled {
         let tuples: Vec<(&str, Option<&str>, Marker)> = my_reviews
             .iter()
@@ -377,17 +421,22 @@ async fn handle_pr(
             .collect();
         match decide_review_action(&tuples, head_sha, cfg.approve_only_after_review) {
             ReviewAction::Skip => return,
-            ReviewAction::ApproveOnly => {
-                // Already reviewed earlier — just approve the new head (auto-approve
-                // already confirmed above). Carry the prior review body so the UI
-                // still shows it.
-                let prior = my_reviews
-                    .iter()
-                    .rev()
-                    .find(|r| marker_of(&r.body) == Marker::Reviewed)
-                    .map(|r| r.body.replace(REVIEW_MARKER, "").trim().to_string());
-                approve_only(app, state, client, cfg, repo_full, owner, repo, pr, prior).await;
-                return;
+            action @ (ReviewAction::ApproveOnly | ReviewAction::FollowUp) => {
+                round = build_round(client, owner, repo, pr, &my_reviews, me).await;
+                // An earlier approval still stands when the new commits only
+                // touch docs/tests. Anything else is followed up, not waved through.
+                let docs_only = round
+                    .as_ref()
+                    .is_some_and(|r| crate::rereview::only_docs_or_tests(&r.delta_diff));
+                if action == ReviewAction::ApproveOnly && docs_only {
+                    let prior = my_reviews
+                        .iter()
+                        .rev()
+                        .find(|r| marker_of(&r.body) == Marker::Reviewed)
+                        .map(|r| r.body.replace(REVIEW_MARKER, "").trim().to_string());
+                    approve_only(app, state, client, cfg, repo_full, owner, repo, pr, prior).await;
+                    return;
+                }
             }
             // Fall through to the review engine below.
             ReviewAction::Review => {}
@@ -447,8 +496,9 @@ async fn handle_pr(
             },
         )
         .await;
+        let round_block = round.as_ref().map(crate::rereview::render).unwrap_or_default();
         let meta = format!(
-            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}\n\n{context}",
+            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}\n\n{context}\n\n{round_block}",
             pr.number, pr.user.login, pr.title
         );
         let diff_for_gate = diff.clone();
@@ -486,6 +536,17 @@ async fn handle_pr(
             .cost_usd
             .map(|c| format!(", ${c:.2}"))
             .unwrap_or_default();
+        // Follow-up: an earlier blocker stays blocking until the model says it
+        // is resolved; a finding the model re-posts under an old id is dropped.
+        let mut outcome = outcome;
+        if let Some(r) = &round {
+            outcome
+                .blocking_issues
+                .extend(crate::rereview::open_blockers(&r.prev, &outcome.followups));
+            outcome
+                .inline
+                .retain(|c| !r.prev.iter().any(|p| c.body.contains(&format!("<!-- f:{} -->", p.id))));
+        }
         // Code-side policy the model can't talk its way past: sensitive files
         // always go to a human (the #4022-style ".env-only PR got 5/5" case).
         let sensitive = crate::review::sensitive_files(&diff_for_gate);
@@ -745,7 +806,7 @@ mod tests {
     #[test]
     fn engine_review_on_old_commit_re_reviews_when_approve_only_off() {
         let reviews = [("DISMISSED", Some(OLD), R)];
-        assert_eq!(decide_review_action(&reviews, HEAD, false), ReviewAction::Review);
+        assert_eq!(decide_review_action(&reviews, HEAD, false), ReviewAction::FollowUp);
     }
 
     #[test]
@@ -759,13 +820,16 @@ mod tests {
     fn commented_engine_review_on_old_commit_is_re_reviewed() {
         // Below-threshold / blocking review → new push must be checked, not waved through.
         let reviews = [("COMMENTED", Some(OLD), R)];
-        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Review);
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::FollowUp);
     }
 
     #[test]
     fn failed_run_on_old_commit_is_re_reviewed() {
         let reviews = [("DISMISSED", Some(OLD), R), ("COMMENTED", Some(OLD), F)];
-        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Review);
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::FollowUp);
+        // A failed run alone is not a review to follow up on.
+        let only_failed = [("COMMENTED", Some(OLD), F)];
+        assert_eq!(decide_review_action(&only_failed, HEAD, true), ReviewAction::Review);
     }
 
     #[test]
