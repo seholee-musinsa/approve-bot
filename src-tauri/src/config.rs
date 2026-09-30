@@ -82,9 +82,11 @@ fn default_min_score() -> f64 {
     4.0
 }
 
-/// 12000 found slightly more than 4000 at the same cost in the eval.
+/// 4000: on normal-risk PRs (21 cases × 2 samples) 12000 found fewer
+/// confirmed defects (33% vs 40%) at the same cost; the earlier "12000 is
+/// slightly better" read came from one noisy sample. opus was measured at 4000.
 fn default_thinking() -> u32 {
-    12000
+    4000
 }
 
 fn default_thinking_low() -> u32 {
