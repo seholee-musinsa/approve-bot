@@ -796,26 +796,11 @@ pub fn review_pr(
     outcome
 }
 
-/// Deep review: trusted code clones the PR head into a temp dir, then the model
-/// explores it read-only (Read/Grep/Glob) to verify against surrounding code.
-/// Clone failure falls back to a diff-only review. Blocking.
-#[allow(clippy::too_many_arguments)]
-pub fn review_pr_deep(
-    guide: &str,
-    meta: &str,
-    diff: &str,
-    model: &str,
-    thinking_tokens: u32,
-    owner: &str,
-    repo: &str,
-    number: u64,
-    token: &str,
-) -> ReviewOutcome {
-    review_pr_deep_at(guide, meta, diff, model, thinking_tokens, owner, repo, number, token, None, false)
-}
-
-/// `review_pr_deep`, but checks out `at_sha` instead of the PR's current head.
-/// The eval uses it to review the commit a human reviewer saw, before fixes.
+/// Deep review: trusted code clones the PR head (or `at_sha`, which the eval
+/// uses to review the commit a human reviewer saw) into a temp dir, then the
+/// model explores it read-only (Read/Grep/Glob). `second_pass` adds the
+/// authorization/contract re-check. Clone failure falls back to diff-only.
+/// Blocking.
 #[allow(clippy::too_many_arguments)]
 pub fn review_pr_deep_at(
     guide: &str,
@@ -1188,7 +1173,7 @@ mod tests {
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
             .unwrap_or_default();
-        let out = review_pr_deep(
+        let out = review_pr_deep_at(
             guide,
             meta,
             &diff,
@@ -1198,6 +1183,8 @@ mod tests {
             "core-partner-frontend",
             5188,
             &token,
+            None,
+            false,
         );
         assert!(out.finished_cleanly, "engine should finish: {}", out.body);
         assert!(matches!(
