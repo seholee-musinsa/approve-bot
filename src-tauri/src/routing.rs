@@ -5,7 +5,7 @@
 //!
 //! Eval basis (23 truth cases, 2026-09-30): opus found +11pp of confirmed
 //! defects over sonnet at ~2.5x cost, and the extra finds were in exactly these
-//! areas. thinking 12000 vs 4000 cost the same and found a little more.
+//! areas. Thinking stays at 4000: 12000 found fewer defects on normal PRs.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Risk {
@@ -122,10 +122,10 @@ mod tests {
     #[test]
     fn pick_follows_config_and_can_be_turned_off() {
         let mut cfg = crate::config::AppConfig::default();
-        assert_eq!(pick(&cfg, Risk::High), ("claude-opus-5-5".to_string(), 12000));
-        assert_eq!(pick(&cfg, Risk::Normal), ("claude-sonnet-5-5".to_string(), 12000));
+        assert_eq!(pick(&cfg, Risk::High), ("claude-opus-5-5".to_string(), 4000));
+        assert_eq!(pick(&cfg, Risk::Normal), ("claude-sonnet-5-5".to_string(), 4000));
         assert_eq!(pick(&cfg, Risk::Low), ("claude-sonnet-5-5".to_string(), 4000));
         cfg.review_routing_enabled = false;
-        assert_eq!(pick(&cfg, Risk::High), ("claude-sonnet-5-5".to_string(), 12000));
+        assert_eq!(pick(&cfg, Risk::High), ("claude-sonnet-5-5".to_string(), 4000));
     }
 }
