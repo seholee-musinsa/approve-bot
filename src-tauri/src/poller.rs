@@ -16,6 +16,30 @@ pub const STATUS_EVENT: &str = "approve-bot://status-changed";
 /// Renders invisibly on GitHub (HTML comment).
 const REVIEW_MARKER: &str = "<!-- approve-bot:review -->";
 
+/// Marker for a review that did not finish (engine error, parse failure). It
+/// stops the same head from being re-posted every poll, but unlike
+/// `REVIEW_MARKER` it never counts as "reviewed" — the next commit gets a real
+/// review instead of a bare approve.
+const FAILED_MARKER: &str = "<!-- approve-bot:review-failed -->";
+
+/// Which engine marker (if any) a prior review of mine carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Marker {
+    None,
+    Reviewed,
+    Failed,
+}
+
+fn marker_of(body: &str) -> Marker {
+    if body.contains(FAILED_MARKER) {
+        Marker::Failed
+    } else if body.contains(REVIEW_MARKER) {
+        Marker::Reviewed
+    } else {
+        Marker::None
+    }
+}
+
 /// What to do with a PR on the review path, given my prior reviews.
 #[derive(Debug, PartialEq, Eq)]
 enum ReviewAction {
@@ -27,11 +51,12 @@ enum ReviewAction {
     Review,
 }
 
-/// Pure dedup decision. `reviews` = my prior reviews as (state, commit_id, is
-/// engine-marker). Only marker reviews count as "reviewed" — a blind 👍 approve
-/// or another bot's review must not suppress the first real review.
+/// Pure dedup decision. `reviews` = my prior reviews, oldest first, as (state,
+/// commit_id, marker). Only a finished engine review counts as "reviewed" — a
+/// blind 👍 approve, another bot's review or a failed run must not suppress a
+/// real review.
 fn decide_review_action(
-    reviews: &[(&str, Option<&str>, bool)],
+    reviews: &[(&str, Option<&str>, Marker)],
     head_sha: &str,
     approve_only_after_review: bool,
 ) -> ReviewAction {
@@ -43,17 +68,75 @@ fn decide_review_action(
         return ReviewAction::Skip;
     }
     // Already engine-reviewed THIS head (live) → don't re-post.
-    if reviews
-        .iter()
-        .any(|(s, c, marker)| *marker && !s.eq_ignore_ascii_case("DISMISSED") && *c == Some(head_sha))
-    {
+    // Engine ran on THIS head (live), finished or failed → don't re-post.
+    if reviews.iter().any(|(s, c, marker)| {
+        *marker != Marker::None && !s.eq_ignore_ascii_case("DISMISSED") && *c == Some(head_sha)
+    }) {
         return ReviewAction::Skip;
     }
-    // Engine-reviewed an earlier commit → optionally approve without re-review.
-    if approve_only_after_review && reviews.iter().any(|(_, _, marker)| *marker) {
-        return ReviewAction::ApproveOnly;
+    // Earlier commit → approve without re-review only if my latest engine run
+    // finished AND approved (DISMISSED = an approval a new push dismissed).
+    // A COMMENT (below threshold / blocking) or a failed run must be re-reviewed,
+    // otherwise its findings are waved through unchecked.
+    let latest_engine = reviews.iter().rev().find(|(_, _, m)| *m != Marker::None);
+    if approve_only_after_review {
+        if let Some((state, _, Marker::Reviewed)) = latest_engine {
+            if state.eq_ignore_ascii_case("APPROVED") || state.eq_ignore_ascii_case("DISMISSED") {
+                return ReviewAction::ApproveOnly;
+            }
+        }
     }
     ReviewAction::Review
+}
+
+/// Approve-gate verdict. Pure so every hold reason is testable.
+#[derive(Debug, PartialEq, Eq)]
+enum Gate {
+    Approve,
+    HoldUnfinished,
+    HoldBlocking,
+    HoldSensitive(Vec<String>),
+    HoldVerdict,
+    HoldScore,
+}
+
+impl Gate {
+    fn reason(&self, blocking: usize, score: &str, min: f64) -> String {
+        match self {
+            Gate::Approve => "approve".to_string(),
+            Gate::HoldUnfinished => "리뷰 미완료".to_string(),
+            Gate::HoldBlocking => format!("blocking {blocking}건"),
+            Gate::HoldSensitive(files) => format!("민감 파일 {}건", files.len()),
+            Gate::HoldVerdict => "판정이 approve 아님".to_string(),
+            Gate::HoldScore => format!("점수 {score}/5 < {min:.1}"),
+        }
+    }
+}
+
+/// Approve only when every condition holds. `blocking_issues` is checked here
+/// even though the prompt tells the model not to approve with blockers — a
+/// self-contradicting verdict must not slip through.
+fn gate(
+    finished_cleanly: bool,
+    verdict: &str,
+    score: f64,
+    blocking: usize,
+    sensitive: &[String],
+    min_score: f64,
+) -> Gate {
+    if !finished_cleanly {
+        Gate::HoldUnfinished
+    } else if blocking > 0 {
+        Gate::HoldBlocking
+    } else if !sensitive.is_empty() {
+        Gate::HoldSensitive(sensitive.to_vec())
+    } else if verdict != "approve" {
+        Gate::HoldVerdict
+    } else if score < min_score {
+        Gate::HoldScore
+    } else {
+        Gate::Approve
+    }
 }
 
 pub fn spawn(app: AppHandle, state: Arc<AppState>) {
@@ -282,15 +365,9 @@ async fn handle_pr(
     }
 
     if cfg.review_enabled {
-        let tuples: Vec<(&str, Option<&str>, bool)> = my_reviews
+        let tuples: Vec<(&str, Option<&str>, Marker)> = my_reviews
             .iter()
-            .map(|r| {
-                (
-                    r.state.as_str(),
-                    r.commit_id.as_deref(),
-                    r.body.contains(REVIEW_MARKER),
-                )
-            })
+            .map(|r| (r.state.as_str(), r.commit_id.as_deref(), marker_of(&r.body)))
             .collect();
         match decide_review_action(&tuples, head_sha, cfg.approve_only_after_review) {
             ReviewAction::Skip => return,
@@ -301,7 +378,7 @@ async fn handle_pr(
                 let prior = my_reviews
                     .iter()
                     .rev()
-                    .find(|r| r.body.contains(REVIEW_MARKER))
+                    .find(|r| marker_of(&r.body) == Marker::Reviewed)
                     .map(|r| r.body.replace(REVIEW_MARKER, "").trim().to_string());
                 approve_only(app, state, client, cfg, repo_full, owner, repo, pr, prior).await;
                 return;
@@ -350,6 +427,7 @@ async fn handle_pr(
             "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}",
             pr.number, pr.user.login, pr.title
         );
+        let diff_for_gate = diff.clone();
         let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);
         let model = cfg.review_model.clone();
         let tk = cfg.review_thinking_tokens;
@@ -384,8 +462,29 @@ async fn handle_pr(
             .cost_usd
             .map(|c| format!(", ${c:.2}"))
             .unwrap_or_default();
+        // Code-side policy the model can't talk its way past: sensitive files
+        // always go to a human (the #4022-style ".env-only PR got 5/5" case).
+        let sensitive = crate::review::sensitive_files(&diff_for_gate);
+        let decision = gate(
+            outcome.finished_cleanly,
+            &outcome.verdict,
+            outcome.score,
+            outcome.blocking_issues.len(),
+            &sensitive,
+            cfg.min_approve_score,
+        );
+        let body = match &decision {
+            Gate::HoldSensitive(files) => format!(
+                "> ⚠️ **게이트**: 민감 파일 변경({}) — 자동 승인하지 않고 사람 승인으로 넘깁니다.\n\n{}",
+                files.join(", "),
+                outcome.body
+            ),
+            _ => outcome.body.clone(),
+        };
         // Posted to GitHub with the marker; the in-app detail keeps the clean body.
-        let posted_body = format!("{REVIEW_MARKER}\n{}", outcome.body);
+        // A failed run gets its own marker so the next commit is re-reviewed.
+        let marker = if outcome.finished_cleanly { REVIEW_MARKER } else { FAILED_MARKER };
+        let posted_body = format!("{marker}\n{body}");
         let inline: &[crate::github::ReviewComment] = if cfg.inline_comments_enabled {
             &outcome.inline
         } else {
@@ -396,11 +495,7 @@ async fn handle_pr(
         } else {
             format!(", 인라인 {}건", inline.len())
         };
-        let approve = outcome.finished_cleanly
-            && outcome.verdict == "approve"
-            && outcome.score >= cfg.min_approve_score;
-
-        if approve {
+        if decision == Gate::Approve {
             match client
                 .approve_pull_with_comments(
                     owner,
@@ -442,13 +537,7 @@ async fn handle_pr(
         } else {
             // Below threshold / blocking / unclean → post the review as a
             // COMMENT (substantive body still delivered), but do NOT approve.
-            let why = if !outcome.finished_cleanly {
-                "리뷰 미완료".to_string()
-            } else if !outcome.blocking_issues.is_empty() {
-                format!("blocking {}건", outcome.blocking_issues.len())
-            } else {
-                format!("점수 {score_str}/5 < {:.1}", cfg.min_approve_score)
-            };
+            let why = decision.reason(outcome.blocking_issues.len(), &score_str, cfg.min_approve_score);
             match client
                 .comment_pull(owner, repo, pr.number, &posted_body, inline)
                 .await
@@ -583,7 +672,11 @@ async fn push_and_emit(app: &AppHandle, state: &Arc<AppState>, entry: ActivityEn
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_review_action, ReviewAction};
+    use super::{decide_review_action, gate, Gate, Marker, ReviewAction};
+
+    const R: Marker = Marker::Reviewed;
+    const N: Marker = Marker::None;
+    const F: Marker = Marker::Failed;
 
     const HEAD: &str = "aaaa1111";
     const OLD: &str = "bbbb2222";
@@ -591,7 +684,7 @@ mod tests {
     #[test]
     fn blind_emoji_approve_does_not_suppress_first_review() {
         // The #1876 bug: a dismissed blind 👍 (no marker) must NOT count as reviewed.
-        let reviews = [("DISMISSED", Some(OLD), false)];
+        let reviews = [("DISMISSED", Some(OLD), N)];
         assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Review);
     }
 
@@ -602,32 +695,76 @@ mod tests {
 
     #[test]
     fn engine_review_on_current_head_skips() {
-        let reviews = [("COMMENTED", Some(HEAD), true)];
+        let reviews = [("COMMENTED", Some(HEAD), R)];
         assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Skip);
     }
 
     #[test]
     fn approved_current_head_skips() {
-        let reviews = [("APPROVED", Some(HEAD), false)];
+        let reviews = [("APPROVED", Some(HEAD), N)];
         assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Skip);
     }
 
     #[test]
     fn engine_review_on_old_commit_approve_only_when_enabled() {
-        let reviews = [("DISMISSED", Some(OLD), true)];
+        let reviews = [("DISMISSED", Some(OLD), R)];
         assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::ApproveOnly);
     }
 
     #[test]
     fn engine_review_on_old_commit_re_reviews_when_approve_only_off() {
-        let reviews = [("DISMISSED", Some(OLD), true)];
+        let reviews = [("DISMISSED", Some(OLD), R)];
         assert_eq!(decide_review_action(&reviews, HEAD, false), ReviewAction::Review);
     }
 
     #[test]
     fn dismissed_engine_review_on_head_re_reviews() {
         // Marker review but dismissed on the current head → stale → re-review.
-        let reviews = [("DISMISSED", Some(HEAD), true)];
+        let reviews = [("DISMISSED", Some(HEAD), R)];
         assert_eq!(decide_review_action(&reviews, HEAD, false), ReviewAction::Review);
+    }
+
+    #[test]
+    fn commented_engine_review_on_old_commit_is_re_reviewed() {
+        // Below-threshold / blocking review → new push must be checked, not waved through.
+        let reviews = [("COMMENTED", Some(OLD), R)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Review);
+    }
+
+    #[test]
+    fn failed_run_on_old_commit_is_re_reviewed() {
+        let reviews = [("DISMISSED", Some(OLD), R), ("COMMENTED", Some(OLD), F)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Review);
+    }
+
+    #[test]
+    fn failed_run_on_head_is_not_reposted() {
+        let reviews = [("COMMENTED", Some(HEAD), F)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Skip);
+    }
+
+    #[test]
+    fn latest_engine_review_decides_approve_only() {
+        let reviews = [("COMMENTED", Some("c1"), R), ("APPROVED", Some(OLD), R)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::ApproveOnly);
+    }
+
+    #[test]
+    fn gate_rejects_approve_with_blocking_issues() {
+        assert_eq!(gate(true, "approve", 5.0, 1, &[], 4.0), Gate::HoldBlocking);
+    }
+
+    #[test]
+    fn gate_holds_sensitive_files() {
+        let files = vec![".env.production".to_string()];
+        assert_eq!(gate(true, "approve", 5.0, 0, &files, 4.0), Gate::HoldSensitive(files));
+    }
+
+    #[test]
+    fn gate_approves_only_when_all_hold() {
+        assert_eq!(gate(true, "approve", 4.0, 0, &[], 4.0), Gate::Approve);
+        assert_eq!(gate(false, "approve", 5.0, 0, &[], 4.0), Gate::HoldUnfinished);
+        assert_eq!(gate(true, "comment", 5.0, 0, &[], 4.0), Gate::HoldVerdict);
+        assert_eq!(gate(true, "approve", 3.5, 0, &[], 4.0), Gate::HoldScore);
     }
 }
