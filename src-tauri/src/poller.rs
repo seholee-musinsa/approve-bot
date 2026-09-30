@@ -451,14 +451,26 @@ async fn handle_pr(
 
     // ── Review engine: review the diff, gate approve on the score ──
     if cfg.review_enabled {
+        let pr_key = format!("{repo_full}#{}", pr.number);
+        // This head already failed before reaching the model: wait for a new
+        // commit instead of retrying (and logging) every poll.
+        if state.failed_heads.lock().await.get(&pr_key).map(String::as_str) == Some(head_sha) {
+            return;
+        }
         let diff = match client.get_pr_diff(owner, repo, pr.number).await {
             Ok(d) => d,
             Err(e) => {
-                push_and_emit(app, state, err_entry(repo_full, pr, format!("get diff failed: {e}")))
-                    .await;
+                state.failed_heads.lock().await.insert(pr_key, head_sha.to_string());
+                push_and_emit(
+                    app,
+                    state,
+                    err_entry(repo_full, pr, format!("get diff failed (새 커밋까지 재시도 안 함): {e}")),
+                )
+                .await;
                 return;
             }
         };
+        state.failed_heads.lock().await.remove(&pr_key);
         // Include the real PR description so the reviewer doesn't wrongly flag it
         // as empty. Cap length to keep the prompt bounded.
         let pr_body = pr
