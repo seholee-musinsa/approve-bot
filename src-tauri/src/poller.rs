@@ -505,6 +505,7 @@ async fn handle_pr(
         let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);
         let (risk, risk_why) = crate::routing::classify(&diff);
         let (model, tk) = crate::routing::pick(cfg, risk);
+        let second = crate::routing::second_pass(cfg, risk);
         // Shown in the activity log so a slow/expensive review can be traced to its route.
         let route_str = format!(", {} {} ({risk_why})", risk.label(), model.trim_start_matches("claude-"));
         let deep = cfg.review_deep;
@@ -516,8 +517,8 @@ async fn handle_pr(
         // `claude -p` can take minutes — keep it off the async runtime.
         let outcome = match tokio::task::spawn_blocking(move || {
             if deep {
-                crate::review::review_pr_deep(
-                    &guide, &meta, &diff, &model, tk, &owner_s, &repo_s, number, &token,
+                crate::review::review_pr_deep_at(
+                    &guide, &meta, &diff, &model, tk, &owner_s, &repo_s, number, &token, None, second,
                 )
             } else {
                 crate::review::review_pr(&guide, &meta, &diff, &model, tk)

@@ -192,6 +192,102 @@ pub fn preview_prompt(guide: &str, meta: &str, diff: &str, deep: bool) -> String
     build_prompt(guide, meta, &prepared.render(), deep)
 }
 
+/// Guide for the second pass on high-risk PRs: try to overturn the first
+/// review's "safe" conclusions on authorization and contracts. Eval showed the
+/// first pass reading the right rule and still calling a missing write-permission
+/// check safe; a pass whose only job is to disprove catches that.
+const SECOND_PASS_GUIDE: &str = r#"# 권한·계약 재점검 (2차 리뷰)
+
+너는 이 PR 의 **두 번째 리뷰어**다. 첫 번째 리뷰가 아래에 있다. 네 일은 첫 리뷰를 되풀이하는 게 아니라,
+첫 리뷰가 **"안전하다", ✅, 문제없음** 이라고 결론 낸 권한·보안·계약 판단을 코드로 **반증해 보는 것**이다.
+
+## 볼 것 (이 PR 에 해당하는 것만)
+- **누가 호출할 수 있나**: 세션·로그인 여부만 보고 역할·권한(쓰기 권한, 소유권)은 안 보는가. 읽기와 쓰기에 같은 가드를 쓰는가.
+- **바깥에서 온 값**: 없는 ID, 남의 소유 ID, 빈 값, 매우 큰 값이 들어오면 어디로 가는가. 에러가 403/404 가 아니라 500 이나 "성공"으로 새지 않는가.
+- **에러 매핑**: 서버·하위 호출의 에러 종류(4xx 확정 실패, 5xx·타임아웃)를 구분하는가. 모르는 에러가 조용히 성공·일반 문구로 바뀌지 않는가.
+- **비교와 정규화**: 정규화된 값과 원문을 비교하지 않는가(URL·경로·대소문자·기본 포트). 접두어 비교가 너무 넓게 허용하지 않는가.
+- **응답 계약**: 성공 응답인데 필수 필드가 비어 오면 화면·상태가 어떻게 되는가. 응답 모양을 확인 없이 가정하는가.
+- 레포 규칙 문서(권한 규칙 등)가 컨텍스트에 있으면 그 기준으로 판정한다.
+
+## 규칙
+- 첫 리뷰가 이미 지적한 것은 다시 내지 않는다.
+- 반증하려면 코드를 열어 **호출 경로 끝까지** 따라간다. 확인 못 한 것은 question 으로만 낸다.
+- 새로 찾은 게 없으면 findings 를 [] 로 두고, 본문에 "재점검 결과 추가 지적 없음" 과 확인한 항목만 짧게 쓴다.
+
+## 본문 양식 (이것만)
+```
+# 재점검
+- ✅/❌ {첫 리뷰의 판단 또는 확인한 질문} — {방법} → {결과}
+```
+verdict·score 는 형식상 채우되 게이트에는 쓰이지 않는다.
+
+## 첫 번째 리뷰
+"#;
+
+fn second_pass_guide(first: &ReviewOutcome) -> String {
+    let findings: Vec<String> = first
+        .findings
+        .iter()
+        .map(|f| format!("- [{}] {}:{} — {}", f.severity, f.path, f.line.map(|l| l.to_string()).unwrap_or_default(), f.claim))
+        .collect();
+    format!(
+        "{SECOND_PASS_GUIDE}
+{}
+
+[첫 리뷰 지적 목록]
+{}
+",
+        first.body,
+        if findings.is_empty() { "(없음)".to_string() } else { findings.join("
+") }
+    )
+}
+
+/// Fold the second pass into the first review: new findings, inline comments
+/// and blockers are added (repeats by id or line dropped), its body becomes a
+/// section, costs add up. A failed second pass only leaves a note.
+fn merge_second_pass(first: &mut ReviewOutcome, second: ReviewOutcome) {
+    first.cost_usd = match (first.cost_usd, second.cost_usd) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, b) => a.or(b),
+    };
+    if !second.finished_cleanly {
+        first.body.push_str("
+
+# 권한·계약 재점검
+
+(재점검이 정상 완료되지 않아 1차 리뷰만 반영했습니다.)
+");
+        return;
+    }
+    let known: Vec<String> = first.findings.iter().map(|f| finding_id(&f.path, &f.symbol, &f.claim)).collect();
+    let taken: Vec<(String, u64)> = first.inline.iter().map(|c| (c.path.clone(), c.line)).collect();
+    let new_findings: Vec<Finding> = second
+        .findings
+        .into_iter()
+        .filter(|f| !known.contains(&finding_id(&f.path, &f.symbol, &f.claim)))
+        .collect();
+    let new_blockers = new_findings.iter().filter(|f| f.severity == "blocker").count();
+    first.inline.extend(second.inline.into_iter().filter(|c| !taken.contains(&(c.path.clone(), c.line))));
+    // Engine-rule hits (suspicious-instruction) from the second pass count too.
+    first.blocking_issues.extend(second.blocking_issues);
+    if new_blockers > 0 {
+        first.score = first.score.min(3.0);
+        if first.verdict == "approve" {
+            first.verdict = "comment".into();
+        }
+    }
+    first.findings.extend(new_findings);
+    let body = second.body.trim();
+    let body = body.strip_prefix("# 재점검").unwrap_or(body).trim();
+    first.body.push_str(&format!("
+
+# 권한·계약 재점검
+
+{body}
+"));
+}
+
 /// Deep-mode `preview_prompt`: clones like a real review so the value-trace
 /// block shows up. Falls back to the diff-only preview when the clone fails.
 #[allow(clippy::too_many_arguments)]
@@ -715,7 +811,7 @@ pub fn review_pr_deep(
     number: u64,
     token: &str,
 ) -> ReviewOutcome {
-    review_pr_deep_at(guide, meta, diff, model, thinking_tokens, owner, repo, number, token, None)
+    review_pr_deep_at(guide, meta, diff, model, thinking_tokens, owner, repo, number, token, None, false)
 }
 
 /// `review_pr_deep`, but checks out `at_sha` instead of the PR's current head.
@@ -732,6 +828,7 @@ pub fn review_pr_deep_at(
     number: u64,
     token: &str,
     at_sha: Option<&str>,
+    second_pass: bool,
 ) -> ReviewOutcome {
     let refspec = match at_sha {
         Some(sha) => sha.to_string(),
@@ -748,20 +845,22 @@ pub fn review_pr_deep_at(
     // Value tracing needs the checkout, so it is built here, not by the caller.
     let trace = crate::trace::build(&cloned, &crate::diffprep::added_lines(diff));
     let meta = if trace.is_empty() { meta.to_string() } else { format!("{meta}\n\n{trace}") };
-    let prompt = build_prompt(guide, &meta, &prepared.render(), true);
-    let mut outcome = run_claude(
-        &prompt,
-        model,
-        thinking_tokens,
-        diff,
-        &RunOpts {
-            cwd: Some(&cloned),
-            allowed_tools: READ_ONLY_TOOLS,
-            disallowed_tools: Some(DENIED_TOOLS),
-            extra_args: &["--permission-mode", "default", "--strict-mcp-config"],
-            scrub_env: true,
-        },
-    );
+    let rendered = prepared.render();
+    let prompt = build_prompt(guide, &meta, &rendered, true);
+    let opts = RunOpts {
+        cwd: Some(&cloned),
+        allowed_tools: READ_ONLY_TOOLS,
+        disallowed_tools: Some(DENIED_TOOLS),
+        extra_args: &["--permission-mode", "default", "--strict-mcp-config"],
+        scrub_env: true,
+    };
+    let mut outcome = run_claude(&prompt, model, thinking_tokens, diff, &opts);
+    if second_pass && outcome.finished_cleanly {
+        let guide2 = second_pass_guide(&outcome);
+        let prompt2 = build_prompt(&guide2, &meta, &rendered, true);
+        let second = run_claude(&prompt2, model, thinking_tokens, diff, &opts);
+        merge_second_pass(&mut outcome, second);
+    }
     let _ = std::fs::remove_dir_all(&cloned); // best-effort cleanup
     outcome.omitted_files = prepared.omitted();
     outcome
@@ -970,6 +1069,49 @@ mod tests {
         assert_eq!(s.blockers, vec!["빈 목록이 통과 (src/x.ts)".to_string()]);
         let un: Vec<&str> = s.unanchored.iter().map(|f| f.claim.as_str()).collect();
         assert_eq!(un, vec!["확신 낮음", "diff 밖 줄"], "blocker/major not posted inline stay visible");
+    }
+
+    fn outcome(findings: Vec<Finding>, inline: Vec<ReviewComment>) -> ReviewOutcome {
+        ReviewOutcome {
+            body: "# 총평\n좋아요".into(),
+            verdict: "approve".into(),
+            score: 4.5,
+            blocking_issues: vec![],
+            inline,
+            finished_cleanly: true,
+            cost_usd: Some(0.5),
+            explored: true,
+            omitted_files: vec![],
+            findings,
+            followups: vec![],
+        }
+    }
+
+    #[test]
+    fn second_pass_adds_new_blocker_and_holds() {
+        let known = finding("major", 80.0, "src/x.ts", Some(11), "이미 지적");
+        let mut first = outcome(vec![known.clone()], vec![]);
+        let new_blocker = finding("blocker", 90.0, "src/x.ts", Some(12), "쓰기 권한 확인 없음");
+        let mut second = outcome(vec![known, new_blocker], vec![ReviewComment { path: "src/x.ts".into(), line: 12, body: "b".into() }]);
+        second.body = "# 재점검\n- ❌ 권한 — 라우터 확인 → 쓰기 권한 없음".into();
+        second.blocking_issues = vec!["쓰기 권한 확인 없음 (src/x.ts)".into()];
+        merge_second_pass(&mut first, second);
+        assert_eq!(first.findings.len(), 2, "the repeated finding is dropped");
+        assert_eq!(first.verdict, "comment");
+        assert!(first.score <= 3.0);
+        assert_eq!(first.blocking_issues.len(), 1);
+        assert_eq!(first.inline.len(), 1);
+        assert!(first.body.contains("# 권한·계약 재점검\n\n- ❌ 권한"));
+        assert_eq!(first.cost_usd, Some(1.0));
+    }
+
+    #[test]
+    fn failed_second_pass_keeps_first_review() {
+        let mut first = outcome(vec![], vec![]);
+        merge_second_pass(&mut first, ReviewOutcome::fail_closed("boom"));
+        assert_eq!(first.verdict, "approve");
+        assert!(first.blocking_issues.is_empty());
+        assert!(first.body.contains("재점검이 정상 완료되지 않아"));
     }
 
     #[test]
