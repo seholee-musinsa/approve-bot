@@ -39,6 +39,7 @@ struct Args {
     guide: String,
     sha: Option<String>,
     deep: bool,
+    print_prompt: bool,
     model: String,
     thinking: u32,
 }
@@ -50,6 +51,7 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
         guide: String::new(),
         sha: None,
         deep: true,
+        print_prompt: false,
         model: "claude-sonnet-5-5".into(),
         thinking: 4000,
     };
@@ -77,6 +79,10 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
             }
             "--diff-only" => {
                 a.deep = false;
+            }
+            // Print the assembled prompt and exit, no model call.
+            "--print-prompt" => {
+                a.print_prompt = true;
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -127,14 +133,35 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let (login, pr, diff) = rt.block_on(async {
+    let (login, pr, diff, context) = rt.block_on(async {
         let (me, _) = client.get_user().await?;
         let pr = client.get_pull(&owner, &repo, number).await?;
         let diff = match &args.sha {
             Some(sha) => client.get_compare_diff(&owner, &repo, &pr.base.ref_name, sha).await?,
             None => client.get_pr_diff(&owner, &repo, number).await?,
         };
-        anyhow::Ok((me.login, pr, diff))
+        // Same context the poller gathers.
+        let changed = crate::diffprep::changed_paths(&diff);
+        // A pinned commit sees only the threads written before it; otherwise
+        // later reviews that name the scored defects would leak the answers.
+        let until = match &args.sha {
+            Some(sha) => Some(client.get_commit_date(&owner, &repo, sha).await?),
+            None => None,
+        };
+        let context = crate::context::gather(
+            &client,
+            &crate::context::Inputs {
+                owner: &owner,
+                repo: &repo,
+                number,
+                base_ref: &pr.base.ref_name,
+                changed: &changed,
+                me: &me.login,
+                until: until.as_deref(),
+            },
+        )
+        .await;
+        anyhow::Ok((me.login, pr, diff, context))
     })?;
 
     // Resolve the guide exactly like the poller: `--guide` path wins, else the
@@ -143,7 +170,11 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     let guide = review::load_guide(&config_dir, &args.guide, &login);
 
     // Build the PR meta block identically to poller.rs (capped body).
-    let meta = build_meta(&owner, &repo, &pr);
+    let meta = format!("{}\n\n{context}", build_meta(&owner, &repo, &pr));
+
+    if args.print_prompt {
+        return Ok(review::preview_prompt(&guide, &meta, &diff, args.deep));
+    }
 
     let token2 = client.token().to_string();
     let outcome = if args.deep {
@@ -178,6 +209,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         "guide": if args.guide.is_empty() { "config-dir/default".into() } else { args.guide.clone() },
         "deep": args.deep,
         "explored": outcome.explored,
+        "omitted_files": outcome.omitted_files,
         "sha": args.sha,
         "model": args.model,
         "verdict": outcome.verdict,

@@ -96,6 +96,7 @@ enum Gate {
     HoldUnfinished,
     HoldBlocking,
     HoldSensitive(Vec<String>),
+    HoldOmitted(Vec<String>),
     HoldVerdict,
     HoldScore,
 }
@@ -107,6 +108,7 @@ impl Gate {
             Gate::HoldUnfinished => "리뷰 미완료".to_string(),
             Gate::HoldBlocking => format!("blocking {blocking}건"),
             Gate::HoldSensitive(files) => format!("민감 파일 {}건", files.len()),
+            Gate::HoldOmitted(files) => format!("미검토 파일 {}건", files.len()),
             Gate::HoldVerdict => "판정이 approve 아님".to_string(),
             Gate::HoldScore => format!("점수 {score}/5 < {min:.1}"),
         }
@@ -122,6 +124,7 @@ fn gate(
     score: f64,
     blocking: usize,
     sensitive: &[String],
+    omitted: &[String],
     min_score: f64,
 ) -> Gate {
     if !finished_cleanly {
@@ -130,6 +133,9 @@ fn gate(
         Gate::HoldBlocking
     } else if !sensitive.is_empty() {
         Gate::HoldSensitive(sensitive.to_vec())
+    } else if !omitted.is_empty() {
+        // Approving files nobody read would be a blind approve.
+        Gate::HoldOmitted(omitted.to_vec())
     } else if verdict != "approve" {
         Gate::HoldVerdict
     } else if score < min_score {
@@ -423,8 +429,22 @@ async fn handle_pr(
                 }
             })
             .unwrap_or_else(|| "(none)".to_string());
+        let changed = crate::diffprep::changed_paths(&diff);
+        let context = crate::context::gather(
+            client,
+            &crate::context::Inputs {
+                owner,
+                repo,
+                number: pr.number,
+                base_ref: &pr.base.ref_name,
+                changed: &changed,
+                me,
+                until: None,
+            },
+        )
+        .await;
         let meta = format!(
-            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}",
+            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}\n\n{context}",
             pr.number, pr.user.login, pr.title
         );
         let diff_for_gate = diff.clone();
@@ -471,12 +491,19 @@ async fn handle_pr(
             outcome.score,
             outcome.blocking_issues.len(),
             &sensitive,
+            &outcome.omitted_files,
             cfg.min_approve_score,
         );
         let body = match &decision {
             Gate::HoldSensitive(files) => format!(
                 "> ⚠️ **게이트**: 민감 파일 변경({}) — 자동 승인하지 않고 사람 승인으로 넘깁니다.\n\n{}",
                 files.join(", "),
+                outcome.body
+            ),
+            Gate::HoldOmitted(files) => format!(
+                "> ⚠️ **게이트**: PR 이 커서 {}개 파일을 보지 못했습니다({}) — 자동 승인하지 않습니다.\n\n{}",
+                files.len(),
+                files.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
                 outcome.body
             ),
             _ => outcome.body.clone(),
@@ -751,20 +778,26 @@ mod tests {
 
     #[test]
     fn gate_rejects_approve_with_blocking_issues() {
-        assert_eq!(gate(true, "approve", 5.0, 1, &[], 4.0), Gate::HoldBlocking);
+        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], 4.0), Gate::HoldBlocking);
     }
 
     #[test]
     fn gate_holds_sensitive_files() {
         let files = vec![".env.production".to_string()];
-        assert_eq!(gate(true, "approve", 5.0, 0, &files, 4.0), Gate::HoldSensitive(files));
+        assert_eq!(gate(true, "approve", 5.0, 0, &files, &[], 4.0), Gate::HoldSensitive(files));
+    }
+
+    #[test]
+    fn gate_holds_when_files_were_not_reviewed() {
+        let omitted = vec!["src/big.ts".to_string()];
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, 4.0), Gate::HoldOmitted(omitted));
     }
 
     #[test]
     fn gate_approves_only_when_all_hold() {
-        assert_eq!(gate(true, "approve", 4.0, 0, &[], 4.0), Gate::Approve);
-        assert_eq!(gate(false, "approve", 5.0, 0, &[], 4.0), Gate::HoldUnfinished);
-        assert_eq!(gate(true, "comment", 5.0, 0, &[], 4.0), Gate::HoldVerdict);
-        assert_eq!(gate(true, "approve", 3.5, 0, &[], 4.0), Gate::HoldScore);
+        assert_eq!(gate(true, "approve", 4.0, 0, &[], &[], 4.0), Gate::Approve);
+        assert_eq!(gate(false, "approve", 5.0, 0, &[], &[], 4.0), Gate::HoldUnfinished);
+        assert_eq!(gate(true, "comment", 5.0, 0, &[], &[], 4.0), Gate::HoldVerdict);
+        assert_eq!(gate(true, "approve", 3.5, 0, &[], &[], 4.0), Gate::HoldScore);
     }
 }

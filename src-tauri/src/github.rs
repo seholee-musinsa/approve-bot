@@ -65,6 +65,25 @@ pub struct Review {
     /// vs a blind approve or another bot's review.
     #[serde(default)]
     pub body: String,
+    /// ISO-8601 UTC; only used to cut threads off at a point in time (eval).
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+}
+
+/// One inline review comment as GitHub returns it (only the fields we feed the reviewer).
+#[derive(Debug, Clone, Deserialize)]
+pub struct InlineThreadComment {
+    pub user: GhUser,
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub original_line: Option<u64>,
+    pub body: String,
+    #[serde(default)]
+    pub in_reply_to_id: Option<u64>,
+    #[serde(default)]
+    pub created_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -357,6 +376,99 @@ impl GitHubClient {
             return Err(anyhow!("compare diff failed: {status} {body}"));
         }
         Ok(resp.text().await?)
+    }
+
+    /// GET a JSON list, following nothing past the first page (`per_page=100`).
+    async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let resp = self.http.get(url).headers(self.headers()).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("GET {url} failed: {status} {body}"));
+        }
+        Ok(resp.json().await?)
+    }
+
+    /// Committer date of a commit (ISO-8601 UTC).
+    pub async fn get_commit_date(&self, owner: &str, repo: &str, sha: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct C {
+            commit: Inner,
+        }
+        #[derive(Deserialize)]
+        struct Inner {
+            committer: Who,
+        }
+        #[derive(Deserialize)]
+        struct Who {
+            date: String,
+        }
+        let url = format!("{API}/repos/{owner}/{repo}/commits/{sha}");
+        let c: C = self.get_json(&url).await?;
+        Ok(c.commit.committer.date)
+    }
+
+    /// Commit headlines of the PR, oldest first.
+    pub async fn list_commit_headlines(&self, owner: &str, repo: &str, number: u64) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct C {
+            commit: Inner,
+        }
+        #[derive(Deserialize)]
+        struct Inner {
+            message: String,
+        }
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/commits?per_page=100");
+        let cs: Vec<C> = self.get_json(&url).await?;
+        Ok(cs
+            .into_iter()
+            .map(|c| c.commit.message.lines().next().unwrap_or("").to_string())
+            .collect())
+    }
+
+    /// Inline review comments (people and bots), oldest first.
+    pub async fn list_review_comments(&self, owner: &str, repo: &str, number: u64) -> Result<Vec<InlineThreadComment>> {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100");
+        self.get_json(&url).await
+    }
+
+    /// File content at a git ref, or None when the file does not exist there.
+    pub async fn get_file_at(&self, owner: &str, repo: &str, path: &str, git_ref: &str) -> Result<Option<String>> {
+        let url = format!("{API}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let mut headers = self.headers();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.raw"));
+        let resp = self.http.get(&url).headers(headers).send().await?;
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("get file {path} failed: {status} {body}"));
+        }
+        Ok(Some(resp.text().await?))
+    }
+
+    /// File names in a directory at a git ref (empty when the dir is absent).
+    pub async fn list_dir_at(&self, owner: &str, repo: &str, path: &str, git_ref: &str) -> Result<Vec<String>> {
+        #[derive(Deserialize)]
+        struct E {
+            name: String,
+            #[serde(rename = "type")]
+            kind: String,
+        }
+        let url = format!("{API}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let resp = self.http.get(&url).headers(self.headers()).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(vec![]);
+        }
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("list dir {path} failed: {status} {body}"));
+        }
+        let es: Vec<E> = resp.json().await?;
+        Ok(es.into_iter().filter(|e| e.kind == "file").map(|e| e.name).collect())
     }
 
     pub async fn get_pull(&self, owner: &str, repo: &str, number: u64) -> Result<PullRequest> {
