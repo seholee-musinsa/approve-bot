@@ -52,6 +52,10 @@ pub struct PullRequest {
 pub struct PrBase {
     #[serde(rename = "ref", default)]
     pub ref_name: String,
+    /// Base commit GitHub recorded for the PR. Unlike the branch name it does
+    /// not move, so `base.sha...pinned` stays the PR's diff after it merges.
+    #[serde(default)]
+    pub sha: String,
 }
 
 #[derive(Debug, Deserialize)]
