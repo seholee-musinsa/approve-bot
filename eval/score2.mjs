@@ -25,13 +25,13 @@ const ROOT = new URL('..', import.meta.url).pathname;
 const P = (...s) => ROOT + s.join('/');
 const CLAUDE = process.env.CLAUDE_PATH || `${process.env.HOME}/.local/bin/claude`;
 
-// SPLIT=dev (cases without a split) | holdout | all (default). The held-out
+// SPLIT=dev (cases without a split) | holdout | holdout2 | ... | all (default). The held-out
 // batch was collected after the guide was tuned, so it is the honest check.
 const SPLIT = process.env.SPLIT || 'all';
 const cases = readdirSync(P('eval', 'truth'))
   .filter((f) => f.endsWith('.json'))
   .map((f) => ({ key: f.replace('.json', ''), ...JSON.parse(readFileSync(P('eval', 'truth', f), 'utf8')) }))
-  .filter((c) => SPLIT === 'all' || (SPLIT === 'holdout' ? c.split === 'holdout' : !c.split))
+  .filter((c) => SPLIT === 'all' || (SPLIT === 'dev' ? !c.split : c.split === SPLIT))
   .sort((a, b) => a.key.localeCompare(b.key));
 
 // ---- inputs -----------------------------------------------------------------
