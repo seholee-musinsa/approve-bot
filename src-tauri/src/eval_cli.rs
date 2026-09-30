@@ -40,6 +40,9 @@ struct Args {
     sha: Option<String>,
     deep: bool,
     print_prompt: bool,
+    /// Earlier `review-once` output + the commit it reviewed → follow-up round.
+    prev: Option<String>,
+    prev_sha: Option<String>,
     model: String,
     thinking: u32,
 }
@@ -52,6 +55,8 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
         sha: None,
         deep: true,
         print_prompt: false,
+        prev: None,
+        prev_sha: None,
         model: "claude-sonnet-5-5".into(),
         thinking: 4000,
     };
@@ -83,6 +88,12 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
             // Print the assembled prompt and exit, no model call.
             "--print-prompt" => {
                 a.print_prompt = true;
+            }
+            "--prev" => {
+                a.prev = Some(take(flags, &mut i, "--prev")?);
+            }
+            "--prev-sha" => {
+                a.prev_sha = Some(take(flags, &mut i, "--prev-sha")?);
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -133,7 +144,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let (login, pr, diff, context) = rt.block_on(async {
+    let (login, pr, diff, context, round) = rt.block_on(async {
         let (me, _) = client.get_user().await?;
         let pr = client.get_pull(&owner, &repo, number).await?;
         let diff = match &args.sha {
@@ -165,7 +176,31 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
             },
         )
         .await;
-        anyhow::Ok((me.login, pr, diff, context))
+        // Follow-up round: earlier findings come from the earlier run's JSON
+        // (the bot never posted them), the delta from the two commits.
+        let round = match (&args.prev, &args.prev_sha, &args.sha) {
+            (Some(prev), Some(prev_sha), Some(sha)) => {
+                let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(prev)?)?;
+                let findings: Vec<review::Finding> =
+                    serde_json::from_value(v["findings"].clone()).unwrap_or_default();
+                let prev_findings = findings
+                    .iter()
+                    .filter(|f| matches!(f.severity.as_str(), "blocker" | "major" | "minor"))
+                    .map(|f| crate::rereview::PrevFinding {
+                        id: review::finding_id(&f.path, &f.symbol, &f.claim),
+                        severity: f.severity.clone(),
+                        path: f.path.clone(),
+                        line: f.line,
+                        claim: f.claim.clone(),
+                    })
+                    .collect();
+                let delta_diff = client.get_compare_diff(&owner, &repo, prev_sha, sha).await?;
+                Some(crate::rereview::Round { number: 2, prev_sha: prev_sha.clone(), prev: prev_findings, delta_diff })
+            }
+            (None, None, _) => None,
+            _ => return Err(anyhow::anyhow!("--prev and --prev-sha go together, with --sha")),
+        };
+        anyhow::Ok((me.login, pr, diff, format!("{context}\n\n{}", round.as_ref().map(crate::rereview::render).unwrap_or_default()), round))
     })?;
 
     // Resolve the guide exactly like the poller: `--guide` path wins, else the
@@ -215,6 +250,11 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         "explored": outcome.explored,
         "omitted_files": outcome.omitted_files,
         "findings": outcome.findings,
+        "followups": outcome.followups,
+        "open_prev_blockers": round
+            .as_ref()
+            .map(|r| crate::rereview::open_blockers(&r.prev, &outcome.followups))
+            .unwrap_or_default(),
         "sha": args.sha,
         "model": args.model,
         "verdict": outcome.verdict,
