@@ -36,7 +36,7 @@ for f in eval/truth/*.json; do
     out="$OUT/$k.s$i.json"
     if [ -s "$out" ]; then echo "skip  $LABEL/$k.s$i"; continue; fi
     echo ">>    $LABEL/$k.s$i"
-    if ! "$BIN" review-once --pr "$url" "${pin[@]}" --guide "$GUIDE" >"$out" 2>"$OUT/$k.s$i.err"; then
+    if ! "$BIN" review-once --pr "$url" ${pin[@]+"${pin[@]}"} --guide "$GUIDE" >"$out" 2>"$OUT/$k.s$i.err"; then
       echo "FAIL  $LABEL/$k.s$i (see $OUT/$k.s$i.err)"; rm -f "$out"
     fi
   done
