@@ -119,7 +119,11 @@ pub fn open_blockers(prev: &[PrevFinding], followups: &[Followup]) -> Vec<String
     prev.iter()
         .filter(|p| p.severity == "blocker")
         .filter(|p| {
-            let status = followups.iter().find(|f| f.id == p.id).map(|f| f.status.as_str());
+            // The model often echoes the id as written in the prompt ("f:abcd1234").
+            let status = followups
+                .iter()
+                .find(|f| f.id.trim().trim_start_matches("f:") == p.id)
+                .map(|f| f.status.as_str());
             !matches!(status, Some("resolved" | "wont_fix" | "withdrawn"))
         })
         .map(|p| format!("이전 blocker 미해소: {} ({})", p.claim, p.path))
@@ -186,7 +190,7 @@ mod tests {
             PrevFinding { id: "d".into(), severity: "major".into(), path: "x".into(), line: None, claim: "D".into() },
         ];
         let f = |id: &str, s: &str| Followup { id: id.into(), status: s.into(), note: String::new() };
-        let fu = vec![f("a", "resolved"), f("b", "partial")];
+        let fu = vec![f("f:a", "resolved"), f("b", "partial")];
         let open = open_blockers(&prev, &fu);
         assert_eq!(open, vec!["이전 blocker 미해소: B (x)".to_string(), "이전 blocker 미해소: C (x)".to_string()]);
     }
