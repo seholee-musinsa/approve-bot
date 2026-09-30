@@ -218,6 +218,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         "deep": args.deep,
         "explored": outcome.explored,
         "omitted_files": outcome.omitted_files,
+        "findings": outcome.findings,
         "sha": args.sha,
         "model": args.model,
         "verdict": outcome.verdict,
