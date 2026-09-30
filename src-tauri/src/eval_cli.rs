@@ -142,6 +142,8 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         };
         // Same context the poller gathers.
         let changed = crate::diffprep::changed_paths(&diff);
+        let added = crate::diffprep::added_lines(&diff);
+        let triggers = crate::context::load_triggers(&config_dir()?, &format!("{owner}/{repo}"));
         // A pinned commit sees only the threads written before it; otherwise
         // later reviews that name the scored defects would leak the answers.
         let until = match &args.sha {
@@ -157,6 +159,8 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
                 base_ref: &pr.base.ref_name,
                 changed: &changed,
                 me: &me.login,
+                added: &added,
+                triggers: &triggers,
                 until: until.as_deref(),
             },
         )

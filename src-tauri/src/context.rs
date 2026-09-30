@@ -7,6 +7,68 @@
 //! of failing the review.
 
 use crate::github::{GitHubClient, InlineThreadComment, Review};
+use serde::Deserialize;
+use std::collections::HashMap;
+use std::path::Path;
+
+/// Bundled default for `rule-triggers.json` (see that file's `_comment`).
+const DEFAULT_TRIGGERS: &str = include_str!("../rule-triggers.json");
+const MAX_TRIGGERED_RULES: usize = 4;
+
+/// "Pitfall" rule that applies when a changed file under `path_prefixes`
+/// adds a line containing one of `added_contains`. Empty list = no condition.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Trigger {
+    pub rule: String,
+    #[serde(default)]
+    pub path_prefixes: Vec<String>,
+    #[serde(default)]
+    pub added_contains: Vec<String>,
+}
+
+/// Triggers for `owner/repo`: config-dir `rule-triggers.json` if present and
+/// valid, else the bundled default. Read per review, so edits apply live.
+pub fn load_triggers(config_dir: &Path, repo_full: &str) -> Vec<Trigger> {
+    let from_file = std::fs::read_to_string(config_dir.join("rule-triggers.json")).ok();
+    let parse = |s: &str| -> Option<Vec<Trigger>> {
+        let map: HashMap<String, serde_json::Value> = serde_json::from_str(s).ok()?;
+        serde_json::from_value(map.get(repo_full)?.clone()).ok()
+    };
+    from_file
+        .as_deref()
+        .and_then(parse)
+        .or_else(|| parse(DEFAULT_TRIGGERS))
+        .unwrap_or_default()
+}
+
+/// Rules whose trigger fires on this diff, with the first matching evidence
+/// (`path: 추가된 줄의 'needle'`) so the model knows why the rule is here.
+pub fn fired_rules(triggers: &[Trigger], added: &[(String, Vec<String>)]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for t in triggers {
+        if out.iter().any(|(r, _)| r == &t.rule) {
+            continue;
+        }
+        let hit = added.iter().find_map(|(path, lines)| {
+            if !t.path_prefixes.is_empty() && !t.path_prefixes.iter().any(|p| path.starts_with(p.as_str())) {
+                return None;
+            }
+            if t.added_contains.is_empty() {
+                return Some(format!("{path} 변경"));
+            }
+            t.added_contains.iter().find_map(|needle| {
+                lines
+                    .iter()
+                    .any(|l| l.contains(needle.as_str()))
+                    .then(|| format!("{path} 의 추가된 줄에 `{needle}`"))
+            })
+        });
+        if let Some(why) = hit {
+            out.push((t.rule.clone(), why));
+        }
+    }
+    out
+}
 
 const DOC_CAP: usize = 8_000;
 const DOCS_TOTAL_CAP: usize = 30_000;
@@ -29,6 +91,9 @@ pub struct Inputs<'a> {
     pub changed: &'a [String],
     /// The bot's own login, to label its earlier reviews.
     pub me: &'a str,
+    /// Added lines per changed file (`diffprep::added_lines`), for triggers.
+    pub added: &'a [(String, Vec<String>)],
+    pub triggers: &'a [Trigger],
     /// Drop reviews/comments written after this ISO-8601 UTC time. The eval
     /// sets it to the pinned commit's date so later reviews (which may name the
     /// very defects being scored) don't leak in. Production passes None.
@@ -112,6 +177,17 @@ async fn repo_docs(client: &GitHubClient, i: &Inputs<'_>) -> String {
         }
         picked += 1;
         out.push_str(&format!("\n--- {path} (변경 경로에 적용) ---\n{}\n", cap(&text, RULE_CAP)));
+    }
+    // Pitfall rules fired by what the diff adds (not path-scoped in the repo,
+    // so the loop above never picks them).
+    let fired = fired_rules(i.triggers, i.added);
+    for (rule, why) in fired.iter().take(MAX_TRIGGERED_RULES) {
+        if out.contains(&format!("--- {rule} ")) {
+            continue;
+        }
+        if let Ok(Some(text)) = client.get_file_at(i.owner, i.repo, rule, i.base_ref).await {
+            out.push_str(&format!("\n--- {rule} (함정 규칙 — {why}) ---\n{}\n", cap(&text, RULE_CAP)));
+        }
     }
     if out.is_empty() {
         out.push_str("(없음)\n");
@@ -250,6 +326,47 @@ fn glob_match(pat: &str, path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::github::GhUser;
+
+    fn t(rule: &str, prefixes: &[&str], needles: &[&str]) -> Trigger {
+        Trigger {
+            rule: rule.into(),
+            path_prefixes: prefixes.iter().map(|s| s.to_string()).collect(),
+            added_contains: needles.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn triggers_fire_on_added_lines_under_prefix() {
+        let triggers = vec![
+            t("mcds.md", &["layers/features/"], &["mcds:"]),
+            t("s3.md", &[], &["amazonaws.com"]),
+            t("ci.md", &[".github/workflows/"], &[]),
+        ];
+        let added = vec![
+            ("layers/features/x/A.tsx".to_string(), vec!["<span className=\"mcds:text-12\" />".to_string()]),
+            ("packages/mcds/B.tsx".to_string(), vec!["amazonaws.com/bucket".to_string()]),
+        ];
+        let fired = fired_rules(&triggers, &added);
+        assert_eq!(fired.len(), 2);
+        assert_eq!(fired[0].0, "mcds.md");
+        assert!(fired[0].1.contains("`mcds:`"));
+        assert_eq!(fired[1].0, "s3.md");
+    }
+
+    #[test]
+    fn trigger_needs_prefix_match() {
+        let triggers = vec![t("mcds.md", &["layers/features/"], &["mcds:"])];
+        let added = vec![("packages/mcds/A.tsx".to_string(), vec!["mcds:flex".to_string()])];
+        assert!(fired_rules(&triggers, &added).is_empty(), "mcds: inside packages/mcds is correct");
+    }
+
+    #[test]
+    fn bundled_triggers_parse_for_core_partner() {
+        let tmp = std::env::temp_dir().join("approve-bot-no-such-dir");
+        let ts = load_triggers(&tmp, "musinsa/core-partner-frontend");
+        assert!(ts.len() >= 10);
+        assert!(load_triggers(&tmp, "someone/else").is_empty());
+    }
 
     #[test]
     fn glob_matches_like_claude_rules() {
