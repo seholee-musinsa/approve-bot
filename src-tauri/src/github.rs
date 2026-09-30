@@ -356,6 +356,11 @@ impl GitHubClient {
         headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3.diff"));
         let resp = self.http.get(&url).headers(headers).send().await?;
         let status = resp.status();
+        // GitHub refuses the diff media type past 300 files (406). The files
+        // API still serves per-file patches (up to 3000 files), so rebuild it.
+        if status == StatusCode::NOT_ACCEPTABLE {
+            return self.diff_from_files(owner, repo, number).await;
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(anyhow!("get diff failed: {status} {body}"));
@@ -380,6 +385,51 @@ impl GitHubClient {
             return Err(anyhow!("compare diff failed: {status} {body}"));
         }
         Ok(resp.text().await?)
+    }
+
+    /// Unified diff rebuilt from `GET /pulls/{n}/files` (paginated). Files whose
+    /// patch GitHub leaves out (too large, binary) carry `PATCH_OMITTED_MARK`,
+    /// which `diffprep` treats as not reviewed, so the gate will not auto-approve.
+    pub async fn diff_from_files(&self, owner: &str, repo: &str, number: u64) -> Result<String> {
+        #[derive(Deserialize)]
+        struct F {
+            filename: String,
+            #[serde(default)]
+            previous_filename: Option<String>,
+            #[serde(default)]
+            status: String,
+            #[serde(default)]
+            patch: Option<String>,
+        }
+        let mut out = String::new();
+        for page in 1..=30 {
+            let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}");
+            let files: Vec<F> = self.get_json(&url).await?;
+            let n = files.len();
+            for f in files {
+                let old = f.previous_filename.as_deref().unwrap_or(&f.filename);
+                let (a, b) = match f.status.as_str() {
+                    "added" => ("/dev/null".to_string(), format!("b/{}", f.filename)),
+                    "removed" => (format!("a/{old}"), "/dev/null".to_string()),
+                    _ => (format!("a/{old}"), format!("b/{}", f.filename)),
+                };
+                out.push_str(&format!("diff --git a/{old} b/{}\n--- {a}\n+++ {b}\n", f.filename));
+                match f.patch {
+                    Some(p) => {
+                        out.push_str(&p);
+                        out.push('\n');
+                    }
+                    None => {
+                        out.push_str(crate::diffprep::PATCH_OMITTED_MARK);
+                        out.push('\n');
+                    }
+                }
+            }
+            if n < 100 {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// GET a JSON list, following nothing past the first page (`per_page=100`).

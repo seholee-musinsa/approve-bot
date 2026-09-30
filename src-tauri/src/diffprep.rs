@@ -65,6 +65,10 @@ impl Prepared {
     }
 }
 
+/// Line the files-API fallback writes when GitHub gives no patch for a file
+/// (too large or binary). Such a file counts as not reviewed.
+pub const PATCH_OMITTED_MARK: &str = "[patch omitted by GitHub]";
+
 /// Budget for the rendered hunks, in bytes. The prompt goes over stdin, so this
 /// is about keeping the model focused, not the OS argv limit.
 pub const DIFF_BUDGET: usize = 300_000;
@@ -73,6 +77,9 @@ pub fn prepare(diff: &str, budget: usize) -> Prepared {
     let mut files: Vec<FileDiff> = split_files(diff);
     for f in &mut files {
         f.skip = excluded_reason(&f.path, &f.raw).map(Skip::Excluded);
+        if f.skip.is_none() && f.raw.contains(PATCH_OMITTED_MARK) {
+            f.skip = Some(Skip::OverBudget);
+        }
     }
     // Spend the budget in priority order, but keep the original order for display.
     let mut order: Vec<usize> = (0..files.len()).filter(|&i| files[i].skip.is_none()).collect();
@@ -266,6 +273,14 @@ diff --git a/src/a.test.ts b/src/a.test.ts\n\
         let p = prepare(DIFF, budget);
         assert_eq!(p.omitted(), vec!["src/a.test.ts".to_string()]);
         assert!(p.render().contains("src/a.test.ts (+1 -0)  — ⚠️ 생략"));
+    }
+
+    #[test]
+    fn patch_omitted_by_github_counts_as_not_reviewed() {
+        let d = format!("diff --git a/src/huge.ts b/src/huge.ts\n--- a/src/huge.ts\n+++ b/src/huge.ts\n{PATCH_OMITTED_MARK}\n");
+        assert_eq!(prepare(&d, DIFF_BUDGET).omitted(), vec!["src/huge.ts".to_string()]);
+        let lock = format!("diff --git a/pnpm-lock.yaml b/pnpm-lock.yaml\n{PATCH_OMITTED_MARK}\n");
+        assert!(prepare(&lock, DIFF_BUDGET).omitted().is_empty(), "excluded files stay excluded");
     }
 
     #[test]

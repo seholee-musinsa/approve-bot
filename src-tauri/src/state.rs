@@ -88,6 +88,10 @@ pub struct AppState {
     pub activity: Mutex<VecDeque<ActivityEntry>>,
     pub poll_signal: Notify,
     pub gh_login_busy: Mutex<bool>,
+    /// `owner/repo#n` → head sha whose review failed before the model ran
+    /// (e.g. diff fetch). Skipped until the head moves, so one broken PR does
+    /// not retry and log every poll.
+    pub failed_heads: Mutex<std::collections::HashMap<String, String>>,
 }
 
 impl AppState {
@@ -102,6 +106,7 @@ impl AppState {
             activity: Mutex::new(activity),
             poll_signal: Notify::new(),
             gh_login_busy: Mutex::new(false),
+            failed_heads: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
