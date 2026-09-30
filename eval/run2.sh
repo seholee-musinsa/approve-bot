@@ -27,13 +27,16 @@ unset NODE_OPTIONS
 
 for f in eval/truth/*.json; do
   k=$(basename "$f" .json)
-  read -r repo pr sha <<<"$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['repo'],d['pr'],d['sha'])" "$f")"
+  read -r repo pr sha kind <<<"$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['repo'],d['pr'],d['sha'],d.get('kind',''))" "$f")"
+  # Escaped cases pin the PR head at merge, which is what the PR diff already
+  # is — and their base branch may be deleted, which breaks base...sha.
+  pin=(--sha "$sha"); [ "$kind" = escaped ] && pin=()
   url="https://github.com/$repo/pull/$pr"
   for i in $(seq "${SAMPLE_FROM:-1}" "$SAMPLES"); do
     out="$OUT/$k.s$i.json"
     if [ -s "$out" ]; then echo "skip  $LABEL/$k.s$i"; continue; fi
     echo ">>    $LABEL/$k.s$i"
-    if ! "$BIN" review-once --pr "$url" --sha "$sha" --guide "$GUIDE" >"$out" 2>"$OUT/$k.s$i.err"; then
+    if ! "$BIN" review-once --pr "$url" "${pin[@]}" --guide "$GUIDE" >"$out" 2>"$OUT/$k.s$i.err"; then
       echo "FAIL  $LABEL/$k.s$i (see $OUT/$k.s$i.err)"; rm -f "$out"
     fi
   done
