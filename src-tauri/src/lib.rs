@@ -9,6 +9,7 @@ mod github;
 mod poller;
 mod rereview;
 mod routing;
+mod trace;
 mod review;
 mod state;
 

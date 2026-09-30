@@ -40,6 +40,8 @@ struct Args {
     sha: Option<String>,
     deep: bool,
     print_prompt: bool,
+    no_second_pass: bool,
+    value_trace: bool,
     /// Earlier `review-once` output + the commit it reviewed → follow-up round.
     prev: Option<String>,
     prev_sha: Option<String>,
@@ -56,6 +58,8 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
         sha: None,
         deep: true,
         print_prompt: false,
+        no_second_pass: false,
+        value_trace: false,
         prev: None,
         prev_sha: None,
         model: None,
@@ -89,6 +93,12 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
             // Print the assembled prompt and exit, no model call.
             "--print-prompt" => {
                 a.print_prompt = true;
+            }
+            "--no-second-pass" => {
+                a.no_second_pass = true;
+            }
+            "--value-trace" => {
+                a.value_trace = true;
             }
             "--prev" => {
                 a.prev = Some(take(flags, &mut i, "--prev")?);
@@ -221,9 +231,22 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     let (routed_model, routed_thinking) = crate::routing::pick(&crate::config::AppConfig::default(), risk);
     let model = args.model.clone().unwrap_or(routed_model);
     let thinking = args.thinking.unwrap_or(routed_thinking);
+    let second = !args.no_second_pass && crate::routing::second_pass(&crate::config::AppConfig::default(), risk);
 
     if args.print_prompt {
-        return Ok(review::preview_prompt(&guide, &meta, &diff, args.deep));
+        if args.deep {
+            return Ok(review::preview_prompt_deep(
+                &guide,
+                &meta,
+                &diff,
+                &owner,
+                &repo,
+                number,
+                client.token(),
+                args.sha.as_deref(),
+            ));
+        }
+        return Ok(review::preview_prompt(&guide, &meta, &diff, false));
     }
 
     let token2 = client.token().to_string();
@@ -239,6 +262,8 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
             number,
             &token2,
             args.sha.as_deref(),
+            second,
+            args.value_trace,
         )
     } else {
         review::review_pr(&guide, &meta, &diff, &model, thinking)
@@ -270,6 +295,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         "model": model,
         "thinking": thinking,
         "risk": risk.label(),
+        "second_pass": second,
         "risk_why": risk_why,
         "verdict": outcome.verdict,
         "score": outcome.score,

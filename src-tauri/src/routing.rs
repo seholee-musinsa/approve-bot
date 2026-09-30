@@ -69,6 +69,11 @@ pub fn classify(diff: &str) -> (Risk, String) {
     (Risk::Normal, format!("추가 {added}줄"))
 }
 
+/// Whether this risk class gets the authorization/contract second pass.
+pub fn second_pass(cfg: &crate::config::AppConfig, risk: Risk) -> bool {
+    cfg.review_second_pass_enabled && risk == Risk::High
+}
+
 /// Model and thinking budget for a risk class under the current config.
 pub fn pick(cfg: &crate::config::AppConfig, risk: Risk) -> (String, u32) {
     if !cfg.review_routing_enabled {

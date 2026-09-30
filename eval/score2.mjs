@@ -25,9 +25,13 @@ const ROOT = new URL('..', import.meta.url).pathname;
 const P = (...s) => ROOT + s.join('/');
 const CLAUDE = process.env.CLAUDE_PATH || `${process.env.HOME}/.local/bin/claude`;
 
+// SPLIT=dev (cases without a split) | holdout | all (default). The held-out
+// batch was collected after the guide was tuned, so it is the honest check.
+const SPLIT = process.env.SPLIT || 'all';
 const cases = readdirSync(P('eval', 'truth'))
   .filter((f) => f.endsWith('.json'))
   .map((f) => ({ key: f.replace('.json', ''), ...JSON.parse(readFileSync(P('eval', 'truth', f), 'utf8')) }))
+  .filter((c) => SPLIT === 'all' || (SPLIT === 'holdout' ? c.split === 'holdout' : !c.split))
   .sort((a, b) => a.key.localeCompare(b.key));
 
 // ---- inputs -----------------------------------------------------------------
@@ -182,7 +186,7 @@ const ROWS = [
   ['비용 / 리뷰 ($)', 'cost_per_review'],
 ];
 
-let md = `\n## eval v2 — ${LABELS.join(' vs ')} — ${new Date().toISOString().slice(0, 10)}\n\n`;
+let md = `\n## eval v2 — ${LABELS.join(' vs ')} — split=${SPLIT} — ${new Date().toISOString().slice(0, 10)}\n\n`;
 md += `cases: ${cases.length} (defects ${cases.filter((c) => c.defects.length).length} · clean ${cases.filter((c) => !c.defects.length).length}) · judge=${JUDGE_MODEL}\n\n`;
 md += `| 지표 | ${LABELS.join(' | ')} |\n|---|${LABELS.map(() => '--:').join('|')}|\n`;
 for (const [name, key, pct] of ROWS) md += `| ${name} | ${LABELS.map((l) => fmt(M[l][key], pct)).join(' | ')} |\n`;
