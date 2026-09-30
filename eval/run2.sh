@@ -9,6 +9,7 @@
 #          "this code + this guide".
 # [guide]  default: src-tauri/review-guide.md
 # [samples] default: 2 (one sample can't tell a real gain from noise)
+# SAMPLE_FROM=<n> starts at sample n, so two shells can split the samples.
 #
 # Idempotent: an existing non-empty output is skipped, so reruns are cheap.
 set -uo pipefail
@@ -28,7 +29,7 @@ for f in eval/truth/*.json; do
   k=$(basename "$f" .json)
   read -r repo pr sha <<<"$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['repo'],d['pr'],d['sha'])" "$f")"
   url="https://github.com/$repo/pull/$pr"
-  for i in $(seq 1 "$SAMPLES"); do
+  for i in $(seq "${SAMPLE_FROM:-1}" "$SAMPLES"); do
     out="$OUT/$k.s$i.json"
     if [ -s "$out" ]; then echo "skip  $LABEL/$k.s$i"; continue; fi
     echo ">>    $LABEL/$k.s$i"
