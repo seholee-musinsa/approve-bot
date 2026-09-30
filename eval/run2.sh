@@ -10,6 +10,7 @@
 # [guide]  default: src-tauri/review-guide.md
 # [samples] default: 2 (one sample can't tell a real gain from noise)
 # SAMPLE_FROM=<n> starts at sample n, so two shells can split the samples.
+# EXTRA="--thinking 12000 --model claude-opus-5-5" passes flags through to review-once.
 #
 # Idempotent: an existing non-empty output is skipped, so reruns are cheap.
 set -uo pipefail
@@ -18,7 +19,7 @@ cd "$(dirname "$0")/.."   # repo root
 LABEL=${1:?usage: eval/run2.sh <label> [guide] [samples]}
 GUIDE=${2:-src-tauri/review-guide.md}
 SAMPLES=${3:-2}
-BIN=src-tauri/target/debug/approve-bot
+BIN=${BIN:-src-tauri/target/debug/approve-bot}
 OUT=eval/out2/$LABEL
 mkdir -p "$OUT"
 
@@ -36,7 +37,7 @@ for f in eval/truth/*.json; do
     out="$OUT/$k.s$i.json"
     if [ -s "$out" ]; then echo "skip  $LABEL/$k.s$i"; continue; fi
     echo ">>    $LABEL/$k.s$i"
-    if ! "$BIN" review-once --pr "$url" ${pin[@]+"${pin[@]}"} --guide "$GUIDE" >"$out" 2>"$OUT/$k.s$i.err"; then
+    if ! "$BIN" review-once --pr "$url" ${pin[@]+"${pin[@]}"} --guide "$GUIDE" ${EXTRA:-} >"$out" 2>"$OUT/$k.s$i.err"; then
       echo "FAIL  $LABEL/$k.s$i (see $OUT/$k.s$i.err)"; rm -f "$out"
     fi
   done

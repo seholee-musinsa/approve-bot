@@ -503,8 +503,10 @@ async fn handle_pr(
         );
         let diff_for_gate = diff.clone();
         let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);
-        let model = cfg.review_model.clone();
-        let tk = cfg.review_thinking_tokens;
+        let (risk, risk_why) = crate::routing::classify(&diff);
+        let (model, tk) = crate::routing::pick(cfg, risk);
+        // Shown in the activity log so a slow/expensive review can be traced to its route.
+        let route_str = format!(", {} {} ({risk_why})", risk.label(), model.trim_start_matches("claude-"));
         let deep = cfg.review_deep;
         let owner_s = owner.to_string();
         let repo_s = repo.to_string();
@@ -610,7 +612,7 @@ async fn handle_pr(
                             pr_title: Some(pr.title.clone()),
                             author: Some(pr.user.login.clone()),
                             url: Some(pr.html_url.clone()),
-                            message: format!("approved (리뷰 {score_str}/5{cost_str}{inline_str})"),
+                            message: format!("approved (리뷰 {score_str}/5{cost_str}{inline_str}{route_str})"),
                             detail: Some(outcome.body.clone()),
                         },
                     )
@@ -646,7 +648,7 @@ async fn handle_pr(
                             pr_title: Some(pr.title.clone()),
                             author: Some(pr.user.login.clone()),
                             url: Some(pr.html_url.clone()),
-                            message: format!("리뷰 코멘트 게시 (approve 보류: {why}{inline_str})"),
+                            message: format!("리뷰 코멘트 게시 (approve 보류: {why}{inline_str}{route_str})"),
                             detail: Some(outcome.body.clone()),
                         },
                     )

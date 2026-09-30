@@ -43,8 +43,9 @@ struct Args {
     /// Earlier `review-once` output + the commit it reviewed → follow-up round.
     prev: Option<String>,
     prev_sha: Option<String>,
-    model: String,
-    thinking: u32,
+    /// None = route by risk like the running bot.
+    model: Option<String>,
+    thinking: Option<u32>,
 }
 
 fn parse(flags: &[String]) -> anyhow::Result<Args> {
@@ -57,8 +58,8 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
         print_prompt: false,
         prev: None,
         prev_sha: None,
-        model: "claude-sonnet-5-5".into(),
-        thinking: 4000,
+        model: None,
+        thinking: None,
     };
     let mut i = 0;
     while i < flags.len() {
@@ -70,10 +71,10 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
                 a.guide = take(flags, &mut i, "--guide")?;
             }
             "--model" => {
-                a.model = take(flags, &mut i, "--model")?;
+                a.model = Some(take(flags, &mut i, "--model")?);
             }
             "--thinking" => {
-                a.thinking = take(flags, &mut i, "--thinking")?.parse()?;
+                a.thinking = Some(take(flags, &mut i, "--thinking")?.parse()?);
             }
             "--sha" => {
                 a.sha = Some(take(flags, &mut i, "--sha")?);
@@ -215,6 +216,12 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     // Build the PR meta block identically to poller.rs (capped body).
     let meta = format!("{}\n\n{context}", build_meta(&owner, &repo, &pr));
 
+    // Route like the running bot unless --model/--thinking pin it.
+    let (risk, risk_why) = crate::routing::classify(&diff);
+    let (routed_model, routed_thinking) = crate::routing::pick(&crate::config::AppConfig::default(), risk);
+    let model = args.model.clone().unwrap_or(routed_model);
+    let thinking = args.thinking.unwrap_or(routed_thinking);
+
     if args.print_prompt {
         return Ok(review::preview_prompt(&guide, &meta, &diff, args.deep));
     }
@@ -225,8 +232,8 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
             &guide,
             &meta,
             &diff,
-            &args.model,
-            args.thinking,
+            &model,
+            thinking,
             &owner,
             &repo,
             number,
@@ -234,7 +241,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
             args.sha.as_deref(),
         )
     } else {
-        review::review_pr(&guide, &meta, &diff, &args.model, args.thinking)
+        review::review_pr(&guide, &meta, &diff, &model, thinking)
     };
 
     // Emit a stable JSON shape the runner can parse.
@@ -260,7 +267,10 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
             .map(|r| crate::rereview::open_blockers(&r.prev, &outcome.followups))
             .unwrap_or_default(),
         "sha": args.sha,
-        "model": args.model,
+        "model": model,
+        "thinking": thinking,
+        "risk": risk.label(),
+        "risk_why": risk_why,
         "verdict": outcome.verdict,
         "score": outcome.score,
         "finished_cleanly": outcome.finished_cleanly,
@@ -343,8 +353,7 @@ mod tests {
     #[test]
     fn defaults_match_production() {
         let a = parse(&["--pr".into(), "x".into()]).unwrap();
-        assert_eq!(a.model, "claude-sonnet-5-5");
-        assert_eq!(a.thinking, 4000);
+        assert!(a.model.is_none() && a.thinking.is_none(), "routes by risk unless pinned");
         assert!(a.deep, "production runs deep by default");
         assert!(a.sha.is_none());
     }

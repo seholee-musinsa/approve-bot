@@ -8,6 +8,7 @@ mod gh_login;
 mod github;
 mod poller;
 mod rereview;
+mod routing;
 mod review;
 mod state;
 
