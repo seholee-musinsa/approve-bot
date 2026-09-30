@@ -192,6 +192,29 @@ pub fn preview_prompt(guide: &str, meta: &str, diff: &str, deep: bool) -> String
     build_prompt(guide, meta, &prepared.render(), deep)
 }
 
+/// Deep-mode `preview_prompt`: clones like a real review so the value-trace
+/// block shows up. Falls back to the diff-only preview when the clone fails.
+#[allow(clippy::too_many_arguments)]
+pub fn preview_prompt_deep(
+    guide: &str,
+    meta: &str,
+    diff: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+    at_sha: Option<&str>,
+) -> String {
+    let refspec = at_sha.map(str::to_string).unwrap_or_else(|| format!("pull/{number}/head"));
+    let Ok(cloned) = clone_ref(owner, repo, &refspec, token) else {
+        return preview_prompt(guide, meta, diff, false);
+    };
+    let trace = crate::trace::build(&cloned, &crate::diffprep::added_lines(diff));
+    let _ = std::fs::remove_dir_all(&cloned);
+    let meta = if trace.is_empty() { meta.to_string() } else { format!("{meta}\n\n{trace}") };
+    preview_prompt(guide, &meta, diff, true)
+}
+
 fn build_prompt(guide: &str, meta: &str, diff: &str, deep: bool) -> String {
     // The diff is untrusted: a literal closing tag inside it must not end the
     // data block early and turn the rest into "instructions".
@@ -722,7 +745,10 @@ pub fn review_pr_deep_at(
         }
     };
     let prepared = crate::diffprep::prepare(diff, crate::diffprep::DIFF_BUDGET);
-    let prompt = build_prompt(guide, meta, &prepared.render(), true);
+    // Value tracing needs the checkout, so it is built here, not by the caller.
+    let trace = crate::trace::build(&cloned, &crate::diffprep::added_lines(diff));
+    let meta = if trace.is_empty() { meta.to_string() } else { format!("{meta}\n\n{trace}") };
+    let prompt = build_prompt(guide, &meta, &prepared.render(), true);
     let mut outcome = run_claude(
         &prompt,
         model,

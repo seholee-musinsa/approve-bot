@@ -223,7 +223,19 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     let thinking = args.thinking.unwrap_or(routed_thinking);
 
     if args.print_prompt {
-        return Ok(review::preview_prompt(&guide, &meta, &diff, args.deep));
+        if args.deep {
+            return Ok(review::preview_prompt_deep(
+                &guide,
+                &meta,
+                &diff,
+                &owner,
+                &repo,
+                number,
+                client.token(),
+                args.sha.as_deref(),
+            ));
+        }
+        return Ok(review::preview_prompt(&guide, &meta, &diff, false));
     }
 
     let token2 = client.token().to_string();
