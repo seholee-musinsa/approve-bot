@@ -132,6 +132,28 @@ async fn build_round(
     })
 }
 
+/// Quote-block lines for the hold reasons code enforces regardless of the
+/// model's verdict (sensitive files, files the review could not see).
+fn gate_notes(sensitive: &[String], omitted: &[String]) -> String {
+    let mut out = String::new();
+    if !sensitive.is_empty() {
+        out.push_str(&format!(
+            "> ⚠️ **게이트**: 민감 파일 변경({}) — 자동 승인하지 않고 사람 승인으로 넘깁니다.\n",
+            sensitive.join(", ")
+        ));
+    }
+    if !omitted.is_empty() {
+        let shown: Vec<String> = omitted.iter().take(5).cloned().collect();
+        let more = if omitted.len() > 5 { format!(" 외 {}개", omitted.len() - 5) } else { String::new() };
+        out.push_str(&format!(
+            "> ⚠️ **게이트**: PR 이 커서 {}개 파일을 보지 못했습니다({}{more}) — 자동 승인하지 않습니다.\n",
+            omitted.len(),
+            shown.join(", ")
+        ));
+    }
+    out
+}
+
 /// Approve-gate verdict. Pure so every hold reason is testable.
 #[derive(Debug, PartialEq, Eq)]
 enum Gate {
@@ -575,19 +597,13 @@ async fn handle_pr(
             &outcome.omitted_files,
             cfg.min_approve_score,
         );
-        let body = match &decision {
-            Gate::HoldSensitive(files) => format!(
-                "> ⚠️ **게이트**: 민감 파일 변경({}) — 자동 승인하지 않고 사람 승인으로 넘깁니다.\n\n{}",
-                files.join(", "),
-                outcome.body
-            ),
-            Gate::HoldOmitted(files) => format!(
-                "> ⚠️ **게이트**: PR 이 커서 {}개 파일을 보지 못했습니다({}) — 자동 승인하지 않습니다.\n\n{}",
-                files.len(),
-                files.iter().take(5).cloned().collect::<Vec<_>>().join(", "),
-                outcome.body
-            ),
-            _ => outcome.body.clone(),
+        // Every code-side hold reason goes on top, not just the first one the
+        // gate hit, so the body's own verdict is not mistaken for the outcome.
+        let notes = gate_notes(&sensitive, &outcome.omitted_files);
+        let body = if notes.is_empty() || !outcome.finished_cleanly {
+            outcome.body.clone()
+        } else {
+            format!("{notes}\n{}", outcome.body)
         };
         // Posted to GitHub with the marker; the in-app detail keeps the clean body.
         // A failed run gets its own marker so the next commit is re-reviewed.
@@ -875,6 +891,16 @@ mod tests {
     fn gate_holds_when_files_were_not_reviewed() {
         let omitted = vec!["src/big.ts".to_string()];
         assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, 4.0), Gate::HoldOmitted(omitted));
+    }
+
+    #[test]
+    fn gate_notes_list_every_hold_reason() {
+        use super::gate_notes;
+        let omitted: Vec<String> = (0..7).map(|i| format!("f{i}.ts")).collect();
+        let n = gate_notes(&[".env".to_string()], &omitted);
+        assert!(n.contains("민감 파일 변경(.env)"));
+        assert!(n.contains("7개 파일을 보지 못했습니다(f0.ts, f1.ts, f2.ts, f3.ts, f4.ts 외 2개)"));
+        assert!(gate_notes(&[], &[]).is_empty());
     }
 
     #[test]
