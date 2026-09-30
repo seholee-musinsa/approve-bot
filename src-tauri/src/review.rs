@@ -635,7 +635,7 @@ mod tests {
         let guide = "## 리뷰 가이드\n- 버그/보안은 blocking. 스타일은 notes.";
         let meta = "Repository: acme/demo  PR #1\nAuthor: someone\nTitle: add helper\nBody:\n(none)";
         let diff = "diff --git a/util.ts b/util.ts\n--- a/util.ts\n+++ b/util.ts\n@@\n+export const add = (a: number, b: number) => a + b;\n";
-        let out = review_pr(guide, meta, diff, "claude-sonnet-5", 0);
+        let out = review_pr(guide, meta, diff, "claude-sonnet-5-5", 0);
         assert!(out.finished_cleanly, "engine should finish: {}", out.body);
         assert!(
             matches!(out.verdict.as_str(), "approve" | "comment" | "request_changes"),
@@ -665,7 +665,7 @@ mod tests {
             guide,
             meta,
             &diff,
-            "claude-sonnet-5",
+            "claude-sonnet-5-5",
             0,
             "musinsa",
             "core-partner-frontend",
