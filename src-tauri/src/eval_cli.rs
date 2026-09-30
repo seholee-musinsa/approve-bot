@@ -4,12 +4,14 @@
 //! (no prompt re-implementation, zero drift). Never launches the Tauri GUI.
 //!
 //! Usage:
-//!   approve-bot review-once --pr <url> [--guide <path>] [--deep]
-//!                           [--model <id>] [--thinking <n>]
+//!   approve-bot review-once --pr <url> [--guide <path>] [--sha <commit>]
+//!                           [--diff-only] [--model <id>] [--thinking <n>]
 //!
 //! `--guide` overrides the team guide (empty/omitted = the config-dir guide,
-//! same as the running bot). Diff-only by default for reproducibility; `--deep`
-//! clones the PR head and lets the model explore read-only.
+//! same as the running bot). Deep mode by default, like the running bot;
+//! `--diff-only` turns it off. `--sha` reviews that commit instead of the PR's
+//! current head (diff = `<base>...<sha>`), so a case can be pinned to the
+//! commit a human reviewed before the fixes landed.
 
 use crate::{auth, github, review};
 
@@ -35,6 +37,7 @@ pub fn maybe_run_headless() -> bool {
 struct Args {
     pr: String,
     guide: String,
+    sha: Option<String>,
     deep: bool,
     model: String,
     thinking: u32,
@@ -45,7 +48,8 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
     let mut a = Args {
         pr: String::new(),
         guide: String::new(),
-        deep: false,
+        sha: None,
+        deep: true,
         model: "claude-sonnet-5-5".into(),
         thinking: 4000,
     };
@@ -64,8 +68,15 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
             "--thinking" => {
                 a.thinking = take(flags, &mut i, "--thinking")?.parse()?;
             }
+            "--sha" => {
+                a.sha = Some(take(flags, &mut i, "--sha")?);
+            }
+            // Kept so older scripts still run; deep is the default now.
             "--deep" => {
                 a.deep = true;
+            }
+            "--diff-only" => {
+                a.deep = false;
             }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
@@ -119,7 +130,10 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     let (login, pr, diff) = rt.block_on(async {
         let (me, _) = client.get_user().await?;
         let pr = client.get_pull(&owner, &repo, number).await?;
-        let diff = client.get_pr_diff(&owner, &repo, number).await?;
+        let diff = match &args.sha {
+            Some(sha) => client.get_compare_diff(&owner, &repo, &pr.base.ref_name, sha).await?,
+            None => client.get_pr_diff(&owner, &repo, number).await?,
+        };
         anyhow::Ok((me.login, pr, diff))
     })?;
 
@@ -133,8 +147,17 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
 
     let token2 = client.token().to_string();
     let outcome = if args.deep {
-        review::review_pr_deep(
-            &guide, &meta, &diff, &args.model, args.thinking, &owner, &repo, number, &token2,
+        review::review_pr_deep_at(
+            &guide,
+            &meta,
+            &diff,
+            &args.model,
+            args.thinking,
+            &owner,
+            &repo,
+            number,
+            &token2,
+            args.sha.as_deref(),
         )
     } else {
         review::review_pr(&guide, &meta, &diff, &args.model, args.thinking)
@@ -154,6 +177,8 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         "number": number,
         "guide": if args.guide.is_empty() { "config-dir/default".into() } else { args.guide.clone() },
         "deep": args.deep,
+        "explored": outcome.explored,
+        "sha": args.sha,
         "model": args.model,
         "verdict": outcome.verdict,
         "score": outcome.score,
@@ -239,6 +264,15 @@ mod tests {
         let a = parse(&["--pr".into(), "x".into()]).unwrap();
         assert_eq!(a.model, "claude-sonnet-5-5");
         assert_eq!(a.thinking, 4000);
+        assert!(a.deep, "production runs deep by default");
+        assert!(a.sha.is_none());
+    }
+
+    #[test]
+    fn diff_only_and_sha_flags() {
+        let a = parse(&["--pr".into(), "x".into(), "--diff-only".into(), "--sha".into(), "abc".into()])
+            .unwrap();
         assert!(!a.deep);
+        assert_eq!(a.sha.as_deref(), Some("abc"));
     }
 }

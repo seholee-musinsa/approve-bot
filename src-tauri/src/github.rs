@@ -43,6 +43,15 @@ pub struct PullRequest {
     /// as having no description. Null when the author left it empty.
     #[serde(default)]
     pub body: Option<String>,
+    /// Target branch. Only the name is used (eval diffs a pinned commit against it).
+    #[serde(default)]
+    pub base: PrBase,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct PrBase {
+    #[serde(rename = "ref", default)]
+    pub ref_name: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -334,6 +343,22 @@ impl GitHubClient {
     /// Fetch a single PR's metadata (title/body/author). Used by the headless
     /// `review-once` eval subcommand, which reviews closed/merged PRs that the
     /// open-PR poller never lists.
+    /// Diff of a branch point `base...head` (three dots = since the merge base),
+    /// the same shape GitHub shows for a PR. Eval uses it to rebuild the diff a
+    /// reviewer saw at an earlier commit.
+    pub async fn get_compare_diff(&self, owner: &str, repo: &str, base: &str, head: &str) -> Result<String> {
+        let url = format!("{API}/repos/{owner}/{repo}/compare/{base}...{head}");
+        let mut headers = self.headers();
+        headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3.diff"));
+        let resp = self.http.get(&url).headers(headers).send().await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(anyhow!("compare diff failed: {status} {body}"));
+        }
+        Ok(resp.text().await?)
+    }
+
     pub async fn get_pull(&self, owner: &str, repo: &str, number: u64) -> Result<PullRequest> {
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}");
         let resp = self.http.get(&url).headers(self.headers()).send().await?;

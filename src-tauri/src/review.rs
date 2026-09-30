@@ -113,6 +113,9 @@ pub struct ReviewOutcome {
     /// False when the CLI/JSON was malformed — caller must NOT auto-approve.
     pub finished_cleanly: bool,
     pub cost_usd: Option<f64>,
+    /// True when the model actually ran on a checked-out tree (deep mode and
+    /// the clone succeeded). A silent clone fallback shows up as false.
+    pub explored: bool,
 }
 
 impl ReviewOutcome {
@@ -125,6 +128,7 @@ impl ReviewOutcome {
             inline: vec![],
             finished_cleanly: false,
             cost_usd: None,
+            explored: false,
         }
     }
 }
@@ -428,6 +432,7 @@ fn run_claude(
                 inline: filter_inline(v.inline_comments, diff),
                 finished_cleanly: true,
                 cost_usd: envelope.total_cost_usd,
+                explored: opts.cwd.is_some(),
             }
         }
         Err(e) => ReviewOutcome::fail_closed(format!("판정 파싱 실패: {e}")),
@@ -488,7 +493,29 @@ pub fn review_pr_deep(
     number: u64,
     token: &str,
 ) -> ReviewOutcome {
-    let cloned = match clone_pr_head(owner, repo, number, token) {
+    review_pr_deep_at(guide, meta, diff, model, thinking_tokens, owner, repo, number, token, None)
+}
+
+/// `review_pr_deep`, but checks out `at_sha` instead of the PR's current head.
+/// The eval uses it to review the commit a human reviewer saw, before fixes.
+#[allow(clippy::too_many_arguments)]
+pub fn review_pr_deep_at(
+    guide: &str,
+    meta: &str,
+    diff: &str,
+    model: &str,
+    thinking_tokens: u32,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    token: &str,
+    at_sha: Option<&str>,
+) -> ReviewOutcome {
+    let refspec = match at_sha {
+        Some(sha) => sha.to_string(),
+        None => format!("pull/{number}/head"),
+    };
+    let cloned = match clone_ref(owner, repo, &refspec, token) {
         Ok(dir) => dir,
         Err(e) => {
             eprintln!("[review] clone 실패 → diff-only 폴백: {e}");
@@ -516,7 +543,7 @@ pub fn review_pr_deep(
 /// Shallow-checkout a PR head into a fresh temp dir. Token is injected via
 /// `GIT_CONFIG_*` (http.extraHeader), never on argv, so it can't leak to `ps`.
 /// Returns the checkout dir; caller removes it.
-fn clone_pr_head(owner: &str, repo: &str, number: u64, token: &str) -> Result<std::path::PathBuf> {
+fn clone_ref(owner: &str, repo: &str, refspec: &str, token: &str) -> Result<std::path::PathBuf> {
     let dir = make_temp_dir()?;
     let repo_url = format!("https://github.com/{owner}/{repo}.git");
     let basic = base64_encode(format!("x-access-token:{token}").as_bytes());
@@ -543,7 +570,7 @@ fn clone_pr_head(owner: &str, repo: &str, number: u64, token: &str) -> Result<st
         git(&["init", "--quiet", dir.to_str().unwrap()], None)?;
         git(&["remote", "add", "origin", &repo_url], Some(&dir))?;
         git(
-            &["fetch", "--depth", "1", "origin", &format!("pull/{number}/head")],
+            &["fetch", "--depth", "1", "origin", refspec],
             Some(&dir),
         )?;
         git(&["checkout", "--quiet", "FETCH_HEAD"], Some(&dir))?;
