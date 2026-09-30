@@ -55,7 +55,7 @@ fn default_true() -> bool {
 }
 
 fn default_review_model() -> String {
-    "claude-sonnet-5".to_string()
+    "claude-sonnet-5-5".to_string()
 }
 
 fn default_min_score() -> f64 {

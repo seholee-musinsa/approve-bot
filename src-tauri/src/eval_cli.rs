@@ -46,7 +46,7 @@ fn parse(flags: &[String]) -> anyhow::Result<Args> {
         pr: String::new(),
         guide: String::new(),
         deep: false,
-        model: "claude-sonnet-5".into(),
+        model: "claude-sonnet-5-5".into(),
         thinking: 4000,
     };
     let mut i = 0;
@@ -237,7 +237,7 @@ mod tests {
     #[test]
     fn defaults_match_production() {
         let a = parse(&["--pr".into(), "x".into()]).unwrap();
-        assert_eq!(a.model, "claude-sonnet-5");
+        assert_eq!(a.model, "claude-sonnet-5-5");
         assert_eq!(a.thinking, 4000);
         assert!(!a.deep);
     }
