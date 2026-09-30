@@ -36,11 +36,13 @@ function caseDiff(c) {
   if (!existsSync(f)) {
     mkdirSync(P('eval', 'cache'), { recursive: true });
     const pr = JSON.parse(execFileSync('gh', ['api', `repos/${c.repo}/pulls/${c.pr}`], { encoding: 'utf8' }));
-    const diff = execFileSync(
-      'gh',
-      ['api', `repos/${c.repo}/compare/${pr.base.ref}...${c.sha}`, '-H', 'Accept: application/vnd.github.v3.diff'],
-      { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 },
-    );
+    // Escaped cases pin the merge-time head (= the PR diff); their base branch may be gone.
+    // Others diff from base.sha: the branch name moves, and main...sha is empty once merged.
+    const endpoint = c.kind === 'escaped' ? `repos/${c.repo}/pulls/${c.pr}` : `repos/${c.repo}/compare/${pr.base.sha}...${c.sha}`;
+    const diff = execFileSync('gh', ['api', endpoint, '-H', 'Accept: application/vnd.github.v3.diff'], {
+      encoding: 'utf8',
+      maxBuffer: 256 * 1024 * 1024,
+    });
     writeFileSync(f, diff);
   }
   const d = readFileSync(f, 'utf8');

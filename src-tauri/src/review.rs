@@ -96,9 +96,6 @@ pub fn sensitive_files(diff: &str) -> Vec<String> {
     out
 }
 
-/// Cap the diff we hand to the CLI so a huge PR can't blow past the OS argv
-/// limit (macOS ARG_MAX ~1MB). Truncation is flagged to the model.
-const MAX_DIFF_BYTES: usize = 250_000;
 
 /// Outcome of a review: the human body to post + the machine gate inputs.
 #[derive(Debug, Clone)]
@@ -116,6 +113,8 @@ pub struct ReviewOutcome {
     /// True when the model actually ran on a checked-out tree (deep mode and
     /// the clone succeeded). A silent clone fallback shows up as false.
     pub explored: bool,
+    /// Files the review did not see (diff budget). Non-empty = no auto-approve.
+    pub omitted_files: Vec<String>,
 }
 
 impl ReviewOutcome {
@@ -129,6 +128,7 @@ impl ReviewOutcome {
             finished_cleanly: false,
             cost_usd: None,
             explored: false,
+            omitted_files: vec![],
         }
     }
 }
@@ -172,20 +172,17 @@ pub fn load_guide(base_dir: &Path, guide_override: &str, login: &str) -> String 
     text.replace("{{GITHUB_LOGIN}}", login)
 }
 
+/// The exact prompt a review would send, without running the model. For
+/// `review-once --print-prompt`.
+pub fn preview_prompt(guide: &str, meta: &str, diff: &str, deep: bool) -> String {
+    let prepared = crate::diffprep::prepare(diff, crate::diffprep::DIFF_BUDGET);
+    build_prompt(guide, meta, &prepared.render(), deep)
+}
+
 fn build_prompt(guide: &str, meta: &str, diff: &str, deep: bool) -> String {
-    let diff = if diff.len() > MAX_DIFF_BYTES {
-        let mut cut = MAX_DIFF_BYTES;
-        while !diff.is_char_boundary(cut) {
-            cut -= 1;
-        }
-        format!(
-            "{}\n\n[... diff truncated at {} KB — 큰 PR 이라 이후 변경은 잘림 ...]",
-            &diff[..cut],
-            MAX_DIFF_BYTES / 1024
-        )
-    } else {
-        diff.to_string()
-    };
+    // The diff is untrusted: a literal closing tag inside it must not end the
+    // data block early and turn the rest into "instructions".
+    let diff = diff.replace("</pr_diff>", "<\\/pr_diff>");
     // Deep mode injects TOOL_NOTE so the model knows the PR head is checked out
     // and it may explore with read-only tools.
     let tool_note = if deep {
@@ -340,6 +337,61 @@ struct RunOpts<'a> {
 /// Spawn `claude -p`, parse the envelope + trailing verdict fence into an
 /// outcome. `diff` is used to drop inline comments that don't match a diff line.
 /// Blocking; call from `spawn_blocking`. Fails closed on any error.
+/// Wall-clock cap for one review. A hung `claude` used to block its thread
+/// forever and leave the PR unreviewed; now it fails closed and the gate holds.
+const CLAUDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Spawn `cmd`, write `input` to its stdin, and collect output, killing the
+/// child after `timeout`. Readers run on threads so a full pipe can't deadlock.
+fn run_with_timeout(
+    mut cmd: Command,
+    input: &str,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut stdin = child.stdin.take().ok_or_else(|| anyhow!("stdin 없음"))?;
+    let input = input.to_owned();
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(input.as_bytes());
+    });
+    let mut out_pipe = child.stdout.take().ok_or_else(|| anyhow!("stdout 없음"))?;
+    let mut err_pipe = child.stderr.take().ok_or_else(|| anyhow!("stderr 없음"))?;
+    let out_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = out_pipe.read_to_end(&mut b);
+        b
+    });
+    let err_reader = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        let _ = err_pipe.read_to_end(&mut b);
+        b
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if started.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(anyhow!("{}분 안에 끝나지 않아 중단", timeout.as_secs() / 60));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    };
+    let _ = writer.join();
+    Ok(std::process::Output {
+        status,
+        stdout: out_reader.join().unwrap_or_default(),
+        stderr: err_reader.join().unwrap_or_default(),
+    })
+}
+
 fn run_claude(
     prompt: &str,
     model: &str,
@@ -348,9 +400,10 @@ fn run_claude(
     opts: &RunOpts,
 ) -> ReviewOutcome {
     let mut cmd = Command::new(claude_bin());
+    // The prompt goes over stdin: argv is capped by the OS (ARG_MAX), and a big
+    // PR plus repo docs and review threads does not fit there.
     cmd.args([
         "-p",
-        prompt,
         "--output-format",
         "json",
         // Don't read the (untrusted) cloned repo's project/local settings.
@@ -384,7 +437,7 @@ fn run_claude(
     // corporate SSL interception (claude's own cert handling already works).
     cmd.env_remove("NODE_OPTIONS");
 
-    let output = match cmd.output() {
+    let output = match run_with_timeout(cmd, prompt, CLAUDE_TIMEOUT) {
         Ok(o) => o,
         Err(e) => return ReviewOutcome::fail_closed(format!("claude 실행 실패: {e}")),
     };
@@ -433,6 +486,7 @@ fn run_claude(
                 finished_cleanly: true,
                 cost_usd: envelope.total_cost_usd,
                 explored: opts.cwd.is_some(),
+                omitted_files: vec![],
             }
         }
         Err(e) => ReviewOutcome::fail_closed(format!("판정 파싱 실패: {e}")),
@@ -462,8 +516,9 @@ pub fn review_pr(
     model: &str,
     thinking_tokens: u32,
 ) -> ReviewOutcome {
-    let prompt = build_prompt(guide, meta, diff, false);
-    run_claude(
+    let prepared = crate::diffprep::prepare(diff, crate::diffprep::DIFF_BUDGET);
+    let prompt = build_prompt(guide, meta, &prepared.render(), false);
+    let mut outcome = run_claude(
         &prompt,
         model,
         thinking_tokens,
@@ -475,7 +530,9 @@ pub fn review_pr(
             extra_args: &[],
             scrub_env: false,
         },
-    )
+    );
+    outcome.omitted_files = prepared.omitted();
+    outcome
 }
 
 /// Deep review: trusted code clones the PR head into a temp dir, then the model
@@ -522,8 +579,9 @@ pub fn review_pr_deep_at(
             return review_pr(guide, meta, diff, model, thinking_tokens);
         }
     };
-    let prompt = build_prompt(guide, meta, diff, true);
-    let outcome = run_claude(
+    let prepared = crate::diffprep::prepare(diff, crate::diffprep::DIFF_BUDGET);
+    let prompt = build_prompt(guide, meta, &prepared.render(), true);
+    let mut outcome = run_claude(
         &prompt,
         model,
         thinking_tokens,
@@ -537,6 +595,7 @@ pub fn review_pr_deep_at(
         },
     );
     let _ = std::fs::remove_dir_all(&cloned); // best-effort cleanup
+    outcome.omitted_files = prepared.omitted();
     outcome
 }
 

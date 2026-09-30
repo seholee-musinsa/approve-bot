@@ -1,6 +1,8 @@
 mod auth;
 mod commands;
 mod config;
+mod context;
+mod diffprep;
 mod eval_cli;
 mod gh_login;
 mod github;

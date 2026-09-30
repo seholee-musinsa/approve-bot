@@ -11,3 +11,4 @@ scores2/
 cache/
 truth/*
 !truth/README.md
+quarantine/
