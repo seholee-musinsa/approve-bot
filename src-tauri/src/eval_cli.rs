@@ -137,7 +137,11 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         let (me, _) = client.get_user().await?;
         let pr = client.get_pull(&owner, &repo, number).await?;
         let diff = match &args.sha {
-            Some(sha) => client.get_compare_diff(&owner, &repo, &pr.base.ref_name, sha).await?,
+            Some(sha) => {
+                // The branch name moves: once the PR merges, main...sha is empty.
+                let base = if pr.base.sha.is_empty() { &pr.base.ref_name } else { &pr.base.sha };
+                client.get_compare_diff(&owner, &repo, base, sha).await?
+            },
             None => client.get_pr_diff(&owner, &repo, number).await?,
         };
         // Same context the poller gathers.
