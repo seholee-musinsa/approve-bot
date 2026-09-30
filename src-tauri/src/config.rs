@@ -48,6 +48,18 @@ pub struct AppConfig {
     /// merge bottleneck.
     #[serde(default = "default_true")]
     pub inline_comments_enabled: bool,
+    /// Pick model/thinking by PR risk (`routing::classify`). Off = always
+    /// `review_model` + `review_thinking_tokens`.
+    #[serde(default = "default_true")]
+    pub review_routing_enabled: bool,
+    /// Model for high-risk PRs (server/BFF, auth, routes, money, >600 added lines).
+    #[serde(default = "default_review_model_high")]
+    pub review_model_high: String,
+    #[serde(default = "default_thinking")]
+    pub review_thinking_high: u32,
+    /// Thinking budget for docs/tests-only PRs.
+    #[serde(default = "default_thinking_low")]
+    pub review_thinking_low: u32,
 }
 
 fn default_true() -> bool {
@@ -62,8 +74,17 @@ fn default_min_score() -> f64 {
     4.0
 }
 
+/// 12000 found slightly more than 4000 at the same cost in the eval.
 fn default_thinking() -> u32 {
+    12000
+}
+
+fn default_thinking_low() -> u32 {
     4000
+}
+
+fn default_review_model_high() -> String {
+    "claude-opus-5-5".to_string()
 }
 
 impl Default for AppConfig {
@@ -84,6 +105,10 @@ impl Default for AppConfig {
             review_deep: true,
             approve_only_after_review: true,
             inline_comments_enabled: true,
+            review_routing_enabled: true,
+            review_model_high: default_review_model_high(),
+            review_thinking_high: default_thinking(),
+            review_thinking_low: default_thinking_low(),
         }
     }
 }
