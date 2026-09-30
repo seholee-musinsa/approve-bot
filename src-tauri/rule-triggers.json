@@ -1,0 +1,138 @@
+{
+  "_comment": "레포별 '함정 규칙' 트리거. 변경 파일이 path_prefixes 중 하나로 시작하고(비우면 모든 파일), 그 파일의 추가된 줄에 added_contains 중 하나가 있으면(비우면 조건 없음) rule 파일을 base 브랜치에서 읽어 리뷰에 넣는다. 설정 폴더에 같은 이름 파일을 두면 이 기본값 대신 쓰고, 봇 재시작 없이 다음 리뷰부터 반영된다.",
+  "musinsa/core-partner-frontend": [
+    {
+      "rule": ".claude/rules/mcds-prefix-boundary.md",
+      "path_prefixes": [
+        "layers/features/",
+        "layers/apps/"
+      ],
+      "added_contains": [
+        "mcds:"
+      ]
+    },
+    {
+      "rule": ".claude/rules/antd-unlayered-cascade.md",
+      "path_prefixes": [
+        "layers/features/",
+        "layers/apps/"
+      ],
+      "added_contains": [
+        "<Radio",
+        "<Select",
+        "<Input",
+        "<TextField",
+        "<Checkbox",
+        "<Switch",
+        "<Tooltip",
+        "<Form.Item",
+        ".anticon",
+        "!opacity",
+        "!text-"
+      ]
+    },
+    {
+      "rule": ".claude/rules/s3-asset-url.md",
+      "path_prefixes": [],
+      "added_contains": [
+        "amazonaws.com",
+        "public-read",
+        "x-amz-acl",
+        "--acl",
+        "PutObjectCommand",
+        "msscdn.net"
+      ]
+    },
+    {
+      "rule": ".claude/rules/server-fetch-timeout-audit.md",
+      "path_prefixes": [
+        "layers/apps/curator/",
+        "layers/apis/curator/",
+        "packages/amplitude/"
+      ],
+      "added_contains": [
+        "fetch(",
+        "createHttpInstance",
+        "AbortSignal.timeout"
+      ]
+    },
+    {
+      "rule": ".claude/rules/ime-controlled-input.md",
+      "path_prefixes": [
+        "layers/features/"
+      ],
+      "added_contains": [
+        "Virtuoso",
+        "isComposing",
+        "compositionstart",
+        "onCompositionEnd",
+        "defaultValue="
+      ]
+    },
+    {
+      "rule": ".claude/rules/view-mode-inner-scroll.md",
+      "path_prefixes": [
+        "layers/features/products/"
+      ],
+      "added_contains": [
+        "overflow-y-auto",
+        "overflow-x-auto",
+        "scroll={{",
+        "pointer-events",
+        "Virtuoso"
+      ]
+    },
+    {
+      "rule": ".claude/rules/scrollbar-table-header-align.md",
+      "path_prefixes": [
+        "layers/features/"
+      ],
+      "added_contains": [
+        "overflow-y-auto",
+        "max-h-["
+      ]
+    },
+    {
+      "rule": ".claude/rules/form-required-validation.md",
+      "path_prefixes": [
+        "layers/features/products/"
+      ],
+      "added_contains": [
+        "required",
+        "superRefine",
+        "zodResolver"
+      ]
+    },
+    {
+      "rule": ".claude/rules/china-inspection-snapshot.md",
+      "path_prefixes": [
+        "layers/features/products/src/inspection/",
+        "layers/features/products/src/products/product-registration/sections/china"
+      ],
+      "added_contains": []
+    },
+    {
+      "rule": ".claude/rules/env-vars.md",
+      "path_prefixes": [],
+      "added_contains": [
+        "NEXT_PUBLIC_",
+        "process.env."
+      ]
+    },
+    {
+      "rule": ".claude/rules/i18n-resourcification.md",
+      "path_prefixes": [
+        "layers/apps/partner-portal/messages/",
+        "layers/apps/mamud/messages/"
+      ],
+      "added_contains": []
+    },
+    {
+      "rule": ".claude/rules/ci-affected-build.md",
+      "path_prefixes": [
+        ".github/workflows/"
+      ],
+      "added_contains": []
+    }
+  ]
+}

@@ -89,6 +89,22 @@ pub fn prepare(diff: &str, budget: usize) -> Prepared {
     Prepared { files }
 }
 
+/// Added lines per file (without the leading `+`), in diff order.
+pub fn added_lines(diff: &str) -> Vec<(String, Vec<String>)> {
+    split_files(diff)
+        .into_iter()
+        .map(|f| {
+            let added = f
+                .raw
+                .lines()
+                .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                .map(|l| l[1..].to_string())
+                .collect();
+            (f.path, added)
+        })
+        .collect()
+}
+
 /// Paths the PR touches, in diff order.
 pub fn changed_paths(diff: &str) -> Vec<String> {
     split_files(diff).into_iter().map(|f| f.path).collect()

@@ -430,6 +430,8 @@ async fn handle_pr(
             })
             .unwrap_or_else(|| "(none)".to_string());
         let changed = crate::diffprep::changed_paths(&diff);
+        let added = crate::diffprep::added_lines(&diff);
+        let triggers = crate::context::load_triggers(&state.config_dir, repo_full);
         let context = crate::context::gather(
             client,
             &crate::context::Inputs {
@@ -439,6 +441,8 @@ async fn handle_pr(
                 base_ref: &pr.base.ref_name,
                 changed: &changed,
                 me,
+                added: &added,
+                triggers: &triggers,
                 until: None,
             },
         )
