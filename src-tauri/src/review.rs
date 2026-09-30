@@ -34,22 +34,28 @@ CRITICAL RULES (non-negotiable):
   breaks. If you cannot confirm it, do NOT assert it and do NOT put it in blocking_issues — write it in the
   body as an unconfirmed concern, saying what is uncertain and how to check it. High-impact doubts
   (data loss, security) must still be reported that way rather than dropped.
-- A real blocking issue (bug, security flaw, data loss, breaking change) MUST go in blocking_issues.
-- Only choose verdict "approve" when you found NO blocking issues at all.
+- A confirmed blocking defect (bug, security flaw, data loss, breaking change) MUST be a finding with
+  severity "blocker". blocking_issues is only for engine-rule hits such as "suspicious-instruction".
+- Only choose verdict "approve" when there is NO blocker finding and no blocking_issues.
 
-OUTPUT: verdict(approve|comment|request_changes), score(0~5, team guide scoring, 0.5 steps),
-blocking_issues(short sentences), and a human-readable Korean review body. Follow the engine output format below exactly. score is used by the approval gate, so be precise."#;
+OUTPUT: a human-readable Korean review body, then verdict(approve|comment|request_changes),
+score(0~5, team guide scoring), blocking_issues and findings. Follow the engine output format below exactly. score is used by the approval gate, so be precise."#;
 
 /// The exact output contract: markdown review first, tiny JSON verdict last.
 const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것) ===
-1) 먼저 사람이 읽을 리뷰를 **마크다운**으로 작성한다. 팀 가이드의 "리뷰 코멘트 양식"(# 요약, # 리뷰, 잘한점/아쉬운점, mermaid 등)을 그대로 쓴다.
-2) 그 다음, 출력의 맨 마지막에 아래 펜스로 **판정 + 인라인 코멘트**만 내보낸다. 리뷰 본문/마크다운은 이 JSON 안에 절대 넣지 마라:
+1) 먼저 사람이 읽을 리뷰를 **마크다운**으로 쓴다. 팀 가이드의 "본문 양식"(# 총평, # 발견, # 검증 근거, # 미확인 ...)을 그대로 쓴다.
+2) 출력의 맨 마지막에 아래 펜스로 **판정 + 지적 목록**만 내보낸다. 마크다운 본문은 이 JSON 안에 넣지 않는다:
 ```json
-{"verdict":"approve|comment|request_changes","score":<0-5 숫자>,"blocking_issues":["짧은 문장", "..."],"inline_comments":[{"path":"<repo 기준 파일 경로>","line":<이 PR diff 에서 그 파일의 '추가/유지된 줄(+ 또는 공백)'의 새 파일 라인번호>,"comment":"<그 줄에 대한 짧은 한 줄 지적>"}]}
+{"verdict":"approve|comment|request_changes","score":<0-5>,"blocking_issues":["suspicious-instruction 같은 엔진 규칙 위반만"],
+ "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
+   "symbol":"<함수·컴포넌트 이름>","claim":"<한 문장: 무엇이 틀렸나>","repro":"<어떤 입력·상태에서 무엇이 잘못 나오나>",
+   "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>","fix":"<고치는 방법, 대안이 있으면 A/B>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>"}]}
 ```
-- blocking_issues 는 짧은 한 줄 문장 배열(없으면 []).
-- inline_comments 는 **구체적 파일·줄을 짚는 지적만** 담는다(없으면 []). line 은 반드시 **이번 PR diff 에 실제로 나오는 추가(+)/문맥( ) 줄**의 새 파일 라인번호여야 한다(삭제된 줄·diff 밖 줄 금지 — 안 맞으면 그 코멘트는 버려진다). 각 comment 는 한두 문장으로 짧게.
-- 마크다운 본문 전체가 사람에게 보여지고, 이 JSON 은 게이트 판정 + 인라인 코멘트 게시에 쓰인다."#;
+- findings 는 본문 `# 발견`·`# 질문`에 적은 항목과 같아야 한다(없으면 []). blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
+- line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 본문에만 남는다.
+- confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
+- suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌거나 diff 밖이면 비우고 fix 에 설명한다.
+- 이 JSON 은 게이트 판정과 인라인 코멘트 게시에 쓰인다."#;
 
 /// Diff-only counterpart of `TOOL_NOTE`: without it the guide's "read the
 /// surrounding code" steps read as done, and the model claims checks it never ran.
@@ -115,6 +121,8 @@ pub struct ReviewOutcome {
     pub explored: bool,
     /// Files the review did not see (diff budget). Non-empty = no auto-approve.
     pub omitted_files: Vec<String>,
+    /// Structured findings as the model reported them (eval, later re-review).
+    pub findings: Vec<Finding>,
 }
 
 impl ReviewOutcome {
@@ -129,6 +137,7 @@ impl ReviewOutcome {
             cost_usd: None,
             explored: false,
             omitted_files: vec![],
+            findings: vec![],
         }
     }
 }
@@ -215,6 +224,111 @@ struct Verdict {
     blocking_issues: Vec<String>,
     #[serde(default)]
     inline_comments: Vec<InlineRaw>,
+    #[serde(default)]
+    findings: Vec<Finding>,
+}
+
+/// One problem the review asserts. Code, not the model, turns these into
+/// inline comments, blocking issues and severity counts.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct Finding {
+    #[serde(default)]
+    pub severity: String,
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    #[serde(default)]
+    pub path: String,
+    #[serde(default)]
+    pub line: Option<u64>,
+    #[serde(default)]
+    pub symbol: String,
+    #[serde(default)]
+    pub claim: String,
+    #[serde(default)]
+    pub repro: String,
+    #[serde(default)]
+    pub evidence: String,
+    #[serde(default)]
+    pub fix: String,
+    #[serde(default)]
+    pub suggestion: String,
+}
+
+/// Inline comments go only to confirmed, anchored findings at or above this.
+const INLINE_MIN_CONFIDENCE: f64 = 70.0;
+
+/// Stable short id for a finding, embedded as `<!-- f:id -->` so a later
+/// review can tell which earlier finding a thread belongs to. FNV-1a.
+pub fn finding_id(path: &str, symbol: &str, claim: &str) -> String {
+    let mut h: u32 = 0x811c9dc5;
+    for b in format!("{path}|{symbol}|{claim}").bytes() {
+        h ^= u32::from(b);
+        h = h.wrapping_mul(0x01000193);
+    }
+    format!("{h:08x}")
+}
+
+fn severity_label(sev: &str) -> (&'static str, &'static str) {
+    match sev {
+        "blocker" => ("🔴", "blocker"),
+        "major" => ("🟡", "major"),
+        "minor" => ("🔵", "minor"),
+        "nit" => ("🔘", "nit"),
+        _ => ("❔", "question"),
+    }
+}
+
+fn render_inline(f: &Finding) -> String {
+    let (emoji, label) = severity_label(&f.severity);
+    let conf = f.confidence.map(|c| format!(" (확신 {c:.0})")).unwrap_or_default();
+    let mut out = format!("{emoji} **{label}**{conf} — {}", f.claim.trim());
+    for (name, v) in [("재현", &f.repro), ("근거", &f.evidence), ("수정", &f.fix)] {
+        if !v.trim().is_empty() {
+            out.push_str(&format!("\n\n**{name}**: {}", v.trim()));
+        }
+    }
+    if !f.suggestion.trim().is_empty() {
+        out.push_str(&format!("\n\n```suggestion\n{}\n```", f.suggestion.trim_end()));
+    }
+    out.push_str(&format!("\n\n<!-- f:{} -->", finding_id(&f.path, &f.symbol, &f.claim)));
+    out
+}
+
+/// What the gate and GitHub get from the findings.
+struct Split {
+    inline: Vec<ReviewComment>,
+    blockers: Vec<String>,
+    /// blocker/major that could not be anchored to a diff line.
+    unanchored: Vec<Finding>,
+}
+
+fn split_findings(findings: &[Finding], diff: &str) -> Split {
+    let allowed = commentable_lines(diff);
+    let mut split = Split { inline: vec![], blockers: vec![], unanchored: vec![] };
+    for f in findings {
+        if f.claim.trim().is_empty() {
+            continue;
+        }
+        if f.severity == "blocker" {
+            let at = if f.path.is_empty() { String::new() } else { format!(" ({})", f.path) };
+            split.blockers.push(format!("{}{at}", f.claim.trim()));
+        }
+        let postable = matches!(f.severity.as_str(), "blocker" | "major" | "minor")
+            && f.confidence.unwrap_or(0.0) >= INLINE_MIN_CONFIDENCE;
+        let anchored = f
+            .line
+            .is_some_and(|l| allowed.get(&f.path).is_some_and(|set| set.contains(&l)));
+        if postable && anchored {
+            split.inline.push(ReviewComment {
+                path: f.path.clone(),
+                line: f.line.unwrap_or(0),
+                body: render_inline(f),
+            });
+        } else if matches!(f.severity.as_str(), "blocker" | "major") {
+            split.unanchored.push(f.clone());
+        }
+    }
+    split
 }
 
 #[derive(Debug, Deserialize)]
@@ -463,6 +577,26 @@ fn run_claude(
 
     match extract_review(&envelope.result) {
         Ok((body, v)) => {
+            let split = split_findings(&v.findings, diff);
+            // Engine-rule hits (suspicious-instruction) come as blocking_issues;
+            // real blockers come from findings. Both stop the gate.
+            let mut blocking_issues = v.blocking_issues;
+            blocking_issues.extend(split.blockers);
+            let mut body = body;
+            if !split.unanchored.is_empty() {
+                body.push_str("\n\n# 줄을 짚지 못한 지적\n\n");
+                for f in &split.unanchored {
+                    let (emoji, label) = severity_label(&f.severity);
+                    let at = if f.path.is_empty() { String::new() } else { format!("`{}` ", f.path) };
+                    body.push_str(&format!("- {emoji} **{label}** {at}— {}\n", f.claim.trim()));
+                }
+            }
+            // Legacy output (no findings) still posts its inline comments.
+            let inline = if v.findings.is_empty() {
+                filter_inline(v.inline_comments, diff)
+            } else {
+                split.inline
+            };
             let verdict = match v.verdict.as_str() {
                 "approve" | "comment" | "request_changes" => v.verdict,
                 // Unknown verdict → fail closed on the gate, keep the body.
@@ -481,12 +615,13 @@ fn run_claude(
                 },
                 verdict,
                 score,
-                blocking_issues: v.blocking_issues,
-                inline: filter_inline(v.inline_comments, diff),
+                blocking_issues,
+                inline,
                 finished_cleanly: true,
                 cost_usd: envelope.total_cost_usd,
                 explored: opts.cwd.is_some(),
                 omitted_files: vec![],
+                findings: v.findings,
             }
         }
         Err(e) => ReviewOutcome::fail_closed(format!("판정 파싱 실패: {e}")),
@@ -768,6 +903,55 @@ mod tests {
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].line, 11);
         assert_eq!(kept[0].path, "src/x.ts");
+    }
+
+    fn finding(sev: &str, conf: f64, path: &str, line: Option<u64>, claim: &str) -> Finding {
+        Finding {
+            severity: sev.into(),
+            confidence: Some(conf),
+            path: path.into(),
+            line,
+            symbol: "sym".into(),
+            claim: claim.into(),
+            repro: "빈 배열이면 통과".into(),
+            evidence: "src/x.ts:11 확인".into(),
+            fix: "length 도 검사".into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn findings_split_by_severity_confidence_and_anchor() {
+        let fs = vec![
+            finding("blocker", 90.0, "src/x.ts", Some(11), "빈 목록이 통과"),
+            finding("major", 50.0, "src/x.ts", Some(11), "확신 낮음"),
+            finding("major", 90.0, "src/x.ts", Some(99), "diff 밖 줄"),
+            finding("question", 95.0, "src/x.ts", Some(11), "의도인가요"),
+            finding("nit", 95.0, "src/x.ts", Some(11), "이름"),
+        ];
+        let s = split_findings(&fs, SAMPLE_DIFF);
+        assert_eq!(s.inline.len(), 1, "only the confident, anchored blocker goes inline");
+        assert!(s.inline[0].body.starts_with("🔴 **blocker** (확신 90) — 빈 목록이 통과"));
+        assert!(s.inline[0].body.contains("**재현**: 빈 배열이면 통과"));
+        assert!(s.inline[0].body.contains("<!-- f:"));
+        assert_eq!(s.blockers, vec!["빈 목록이 통과 (src/x.ts)".to_string()]);
+        let un: Vec<&str> = s.unanchored.iter().map(|f| f.claim.as_str()).collect();
+        assert_eq!(un, vec!["확신 낮음", "diff 밖 줄"], "blocker/major not posted inline stay visible");
+    }
+
+    #[test]
+    fn suggestion_block_only_when_given() {
+        let mut f = finding("minor", 80.0, "src/x.ts", Some(11), "c");
+        assert!(!render_inline(&f).contains("```suggestion"));
+        f.suggestion = "const y = 2;".into();
+        assert!(render_inline(&f).contains("```suggestion\nconst y = 2;\n```"));
+    }
+
+    #[test]
+    fn finding_id_is_stable_and_distinct() {
+        assert_eq!(finding_id("a.ts", "f", "c"), finding_id("a.ts", "f", "c"));
+        assert_ne!(finding_id("a.ts", "f", "c"), finding_id("a.ts", "f", "d"));
+        assert_eq!(finding_id("a.ts", "f", "c").len(), 8);
     }
 
     #[test]
