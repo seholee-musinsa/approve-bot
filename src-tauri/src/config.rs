@@ -64,6 +64,10 @@ pub struct AppConfig {
     /// review's "safe" calls on authorization and API contracts.
     #[serde(default = "default_true")]
     pub review_second_pass_enabled: bool,
+    /// Inject the value-trace block (grep of constants/query keys the PR
+    /// touches). Off: it showed no recall gain in the eval.
+    #[serde(default)]
+    pub review_value_trace_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -114,6 +118,7 @@ impl Default for AppConfig {
             review_thinking_high: default_thinking(),
             review_thinking_low: default_thinking_low(),
             review_second_pass_enabled: true,
+            review_value_trace_enabled: false,
         }
     }
 }

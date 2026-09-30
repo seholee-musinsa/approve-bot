@@ -814,6 +814,7 @@ pub fn review_pr_deep_at(
     token: &str,
     at_sha: Option<&str>,
     second_pass: bool,
+    value_trace: bool,
 ) -> ReviewOutcome {
     let refspec = match at_sha {
         Some(sha) => sha.to_string(),
@@ -828,7 +829,12 @@ pub fn review_pr_deep_at(
     };
     let prepared = crate::diffprep::prepare(diff, crate::diffprep::DIFF_BUDGET);
     // Value tracing needs the checkout, so it is built here, not by the caller.
-    let trace = crate::trace::build(&cloned, &crate::diffprep::added_lines(diff));
+    // Off by default: no measurable recall gain on either eval split (2026-09-30).
+    let trace = if value_trace {
+        crate::trace::build(&cloned, &crate::diffprep::added_lines(diff))
+    } else {
+        String::new()
+    };
     let meta = if trace.is_empty() { meta.to_string() } else { format!("{meta}\n\n{trace}") };
     let rendered = prepared.render();
     let prompt = build_prompt(guide, &meta, &rendered, true);
@@ -1184,6 +1190,7 @@ mod tests {
             5188,
             &token,
             None,
+            false,
             false,
         );
         assert!(out.finished_cleanly, "engine should finish: {}", out.body);

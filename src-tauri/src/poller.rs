@@ -506,6 +506,7 @@ async fn handle_pr(
         let (risk, risk_why) = crate::routing::classify(&diff);
         let (model, tk) = crate::routing::pick(cfg, risk);
         let second = crate::routing::second_pass(cfg, risk);
+        let trace = cfg.review_value_trace_enabled;
         // Shown in the activity log so a slow/expensive review can be traced to its route.
         let route_str = format!(", {} {} ({risk_why})", risk.label(), model.trim_start_matches("claude-"));
         let deep = cfg.review_deep;
@@ -518,7 +519,7 @@ async fn handle_pr(
         let outcome = match tokio::task::spawn_blocking(move || {
             if deep {
                 crate::review::review_pr_deep_at(
-                    &guide, &meta, &diff, &model, tk, &owner_s, &repo_s, number, &token, None, second,
+                    &guide, &meta, &diff, &model, tk, &owner_s, &repo_s, number, &token, None, second, trace,
                 )
             } else {
                 crate::review::review_pr(&guide, &meta, &diff, &model, tk)
