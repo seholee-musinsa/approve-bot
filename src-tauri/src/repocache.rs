@@ -251,6 +251,7 @@ impl Default for Policy {
 
 impl Policy {
     /// No waiting, for tests.
+    #[cfg(test)]
     pub fn instant() -> Self {
         Self { backoff: vec![Duration::ZERO; 3], rate_limit_wait: Duration::ZERO, max_passes: 6 }
     }

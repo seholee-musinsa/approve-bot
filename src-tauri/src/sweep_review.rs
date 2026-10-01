@@ -71,7 +71,7 @@ pub fn candidates_for(slice: &Slice, files: &[FileStat], w: &Weights, k: usize) 
                 why.push(format!("TODO·FIXME {}개", m.todos));
             }
             if !f.violations.is_empty() {
-                let mut rules: Vec<&str> = f.violations.iter().map(|v| v.rule).collect();
+                let mut rules: Vec<&str> = f.violations.iter().map(|v| v.rule.as_str()).collect();
                 rules.dedup();
                 why.push(format!("규칙 위반 {}({}줄)", rules.join("·"), f.violations.len()));
             }
@@ -858,7 +858,7 @@ mod tests {
         let mut a = stat("layers/features/a/src/a.tsx", 1500, 30);
         a.markers = Markers { suppressions: 2, any_casts: 0, todos: 1 };
         let mut b = stat("layers/features/a/src/b.tsx", 100, 0);
-        b.violations = vec![Violation { rule: "mcds-prefix", line: 3 }];
+        b.violations = vec![Violation { rule: "mcds-prefix".into(), line: 3 }];
         let quiet = stat("layers/features/a/src/q.ts", 40, 0);
         let files = vec![a, b, quiet];
         let slice = Slice { name: "s".into(), files: files.iter().map(|f| f.path.clone()).collect(), lines: 1640, score: 0.0 };
