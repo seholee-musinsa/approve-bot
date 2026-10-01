@@ -266,9 +266,28 @@ fn merge_small(mut pieces: Vec<Slice>, max_lines: usize) -> Vec<Slice> {
     out
 }
 
-/// Highest score first; ties by name so the order is stable between runs.
-pub fn rank(mut slices: Vec<Slice>) -> Vec<Slice> {
-    slices.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal).then(a.name.cmp(&b.name)));
+/// How slices are ordered. A day's cost grows with the lines a slice holds, so
+/// `Density` (score per 1,000 lines) is the value per unit of work, while `Sum`
+/// favours big slices simply because they hold more files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RankBy {
+    Sum,
+    Density,
+}
+
+/// Score per 1,000 lines. Slices under 1,000 lines count as 1,000 so a tiny slice
+/// with one hit does not outrank real hot spots.
+pub fn density(s: &Slice) -> f64 {
+    s.score / (s.lines.max(1000) as f64) * 1000.0
+}
+
+/// Highest first; ties by name so the order is stable between runs.
+pub fn rank(mut slices: Vec<Slice>, by: RankBy) -> Vec<Slice> {
+    let key = |s: &Slice| match by {
+        RankBy::Sum => s.score,
+        RankBy::Density => density(s),
+    };
+    slices.sort_by(|a, b| key(b).partial_cmp(&key(a)).unwrap_or(std::cmp::Ordering::Equal).then(a.name.cmp(&b.name)));
     slices
 }
 
@@ -305,6 +324,95 @@ pub fn scan_checkout(root: &Path, churn: &HashMap<String, u32>) -> anyhow::Resul
     Ok(out)
 }
 
+/// How many tickets the static findings alone would make, before any model
+/// judgement. An upper bound: the model review and the confidence filter only
+/// remove candidates. Counted three ways so the grouping rule can be chosen
+/// from numbers rather than guessed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Volume {
+    /// Files with at least one candidate (a rule hit, a marker, or >= BIG_FILE_LINES).
+    pub candidate_files: usize,
+    pub rule_files: usize,
+    pub rule_kinds: usize,
+    pub suppression_files: usize,
+    pub any_files: usize,
+    pub todo_files: usize,
+    pub big_files: usize,
+    /// One ticket per candidate file.
+    pub by_file: usize,
+    /// rule and debt grouped by kind (cut into tickets of at most `max_files`
+    /// files), split one ticket per big file.
+    pub by_kind: usize,
+    /// One ticket per slice that holds a candidate.
+    pub by_slice: usize,
+    /// Like `by_kind`, but grouped inside each slice. A day reads one slice, so
+    /// this is what the daily volume actually adds up to.
+    pub by_kind_in_slice: usize,
+}
+
+fn tickets_for(files: usize, max_files: usize) -> usize {
+    files.div_ceil(max_files.max(1))
+}
+
+pub fn volume(files: &[FileStat], slices: &[Slice], max_files: usize) -> Volume {
+    let mut v = Volume::default();
+    let mut rules: Vec<&str> = Vec::new();
+    let mut candidate: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for f in files {
+        let is_big = f.lines >= BIG_FILE_LINES;
+        let has_marker = f.markers.suppressions + f.markers.any_casts + f.markers.todos > 0;
+        if !f.violations.is_empty() {
+            v.rule_files += 1;
+            for x in &f.violations {
+                if !rules.contains(&x.rule) {
+                    rules.push(x.rule);
+                }
+            }
+        }
+        v.suppression_files += (f.markers.suppressions > 0) as usize;
+        v.any_files += (f.markers.any_casts > 0) as usize;
+        v.todo_files += (f.markers.todos > 0) as usize;
+        v.big_files += is_big as usize;
+        if !f.violations.is_empty() || has_marker || is_big {
+            candidate.insert(f.path.as_str());
+        }
+    }
+    v.rule_kinds = rules.len();
+    v.candidate_files = candidate.len();
+    v.by_file = candidate.len();
+    v.by_kind = tickets_for(v.rule_files, max_files)
+        + tickets_for(v.suppression_files, max_files)
+        + tickets_for(v.any_files, max_files)
+        + tickets_for(v.todo_files, max_files)
+        + v.big_files;
+    v.by_slice = slices.iter().filter(|s| s.files.iter().any(|p| candidate.contains(p.as_str()))).count();
+    let by_path: std::collections::HashMap<&str, &FileStat> = files.iter().map(|f| (f.path.as_str(), f)).collect();
+    for sl in slices {
+        let (mut rule, mut sup, mut any, mut todo, mut big) = (0, 0, 0, 0, 0);
+        for f in sl.files.iter().filter_map(|p| by_path.get(p.as_str())) {
+            rule += (!f.violations.is_empty()) as usize;
+            sup += (f.markers.suppressions > 0) as usize;
+            any += (f.markers.any_casts > 0) as usize;
+            todo += (f.markers.todos > 0) as usize;
+            big += (f.lines >= BIG_FILE_LINES) as usize;
+        }
+        v.by_kind_in_slice += tickets_for(rule, max_files) + tickets_for(sup, max_files) + tickets_for(any, max_files) + tickets_for(todo, max_files) + big;
+    }
+    v
+}
+
+fn volume_report(v: &Volume, max_files: usize) -> String {
+    format!(
+        "\n정적 후보 규모(모델 판단 전의 상한)\n\
+         | 후보 | 파일 수 |\n|---|--:|\n\
+         | 규칙 위반 | {} |\n| suppression(eslint-disable 등) | {} |\n| as any | {} |\n| TODO·FIXME | {} |\n| {}줄 이상 큰 파일 | {} |\n| 후보가 하나라도 있는 파일 | {} |\n\n\
+         티켓 수 환산(묶음 방식별)\n| 묶음 방식 | 티켓 수 |\n|---|--:|\n\
+         | 파일 단위 | {} |\n| 종류별, 전체를 한 번에 묶음(종류마다 최대 {max_files}개 파일씩, 큰 파일은 하나씩) | {} |\n| 종류별, 그날 읽은 조각 안에서 묶음(실제 하루 생성량의 합) | {} |\n| 조각 단위 | {} |\n",
+        v.rule_files, v.suppression_files, v.any_files, v.todo_files, BIG_FILE_LINES, v.big_files, v.candidate_files,
+        v.by_file, v.by_kind, v.by_kind_in_slice, v.by_slice
+    )
+}
+
 /// A merged slice is named after every directory in it; the report shows the
 /// first two and how many more.
 fn short_name(name: &str) -> String {
@@ -331,9 +439,9 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
         let parts: Vec<String> = by_rule.iter().map(|(r, n)| format!("{r} {n}")).collect();
         s.push_str(&format!("규칙 위반(줄 수): {}\n", parts.join(" · ")));
     }
-    s.push_str(&format!("\n위험 점수 상위 조각 {top}개\n| # | 조각 | 줄 | 파일 | 점수 |\n|--:|---|--:|--:|--:|\n"));
+    s.push_str(&format!("\n위험 점수 상위 조각 {top}개\n| # | 조각 | 줄 | 파일 | 점수 | 천 줄당 |\n|--:|---|--:|--:|--:|--:|\n"));
     for (i, sl) in slices.iter().take(top).enumerate() {
-        s.push_str(&format!("| {} | {} | {} | {} | {:.0} |\n", i + 1, short_name(&sl.name), sl.lines, sl.files.len(), sl.score));
+        s.push_str(&format!("| {} | {} | {} | {} | {:.0} | {:.1} |\n", i + 1, short_name(&sl.name), sl.lines, sl.files.len(), sl.score, density(sl)));
     }
     let mut hot: Vec<&FileStat> = files.iter().collect();
     hot.sort_by(|a, b| score(b, w).partial_cmp(&score(a, w)).unwrap_or(std::cmp::Ordering::Equal).then(a.path.cmp(&b.path)));
@@ -345,11 +453,15 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
     s
 }
 
-/// `approve-bot sweep-once --local <dir> [--days 90] [--top 12]`
+/// `approve-bot sweep-once --local <dir> [--days 90] [--top 12] [--max-lines 25000] [--max-files 10] [--rank density|sum]`
 pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut local = String::new();
     let mut days: u32 = 90;
     let mut top: usize = 12;
+    let mut max_lines: usize = SLICE_MAX_LINES;
+    let mut max_files: usize = 10;
+    // Value per unit of work: a day's cost grows with the lines a slice holds.
+    let mut by = RankBy::Density;
     let mut i = 0;
     while i < flags.len() {
         let name = flags[i].as_str();
@@ -361,6 +473,15 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             "--local" => local = value(&mut i)?,
             "--days" => days = value(&mut i)?.parse()?,
             "--top" => top = value(&mut i)?.parse()?,
+            "--max-lines" => max_lines = value(&mut i)?.parse()?,
+            "--max-files" => max_files = value(&mut i)?.parse()?,
+            "--rank" => {
+                by = match value(&mut i)?.as_str() {
+                    "sum" => RankBy::Sum,
+                    "density" => RankBy::Density,
+                    other => return Err(anyhow::anyhow!("--rank must be sum or density, got {other}")),
+                }
+            }
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
         i += 1;
@@ -372,8 +493,10 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let w = Weights::default();
     let churn = churn_by_path(root, days)?;
     let files = scan_checkout(root, &churn)?;
-    let slices = rank(pack_slices(&files, &w, SLICE_MAX_LINES));
-    Ok(report(&files, &slices, &w, top))
+    let slices = rank(pack_slices(&files, &w, max_lines), by);
+    let mut out = report(&files, &slices, &w, top);
+    out.push_str(&volume_report(&volume(&files, &slices, max_files), max_files));
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -478,13 +601,51 @@ mod tests {
     fn one_file_over_the_limit_is_its_own_slice_and_ranking_is_stable() {
         let w = Weights::default();
         let files = vec![stat("layers/services/p/src/huge.ts", 5000, 3), stat("layers/services/p/src/small.ts", 10, 0)];
-        let slices = rank(pack_slices(&files, &w, 1000));
+        let slices = rank(pack_slices(&files, &w, 1000), RankBy::Sum);
         assert!(slices.iter().any(|s| s.name == "layers/services/p/src/huge.ts" && s.files.len() == 1));
-        let again = rank(pack_slices(&files, &w, 1000));
+        let again = rank(pack_slices(&files, &w, 1000), RankBy::Sum);
         let a: Vec<&str> = slices.iter().map(|s| s.name.as_str()).collect();
         let b: Vec<&str> = again.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(a, b);
         assert!(slices[0].score >= slices[slices.len() - 1].score);
+    }
+
+    #[test]
+    fn density_ranks_a_small_hot_slice_above_a_big_mild_one() {
+        let big = Slice { name: "big".into(), files: vec![], lines: 20_000, score: 400.0 };
+        let small = Slice { name: "small".into(), files: vec![], lines: 5_000, score: 200.0 };
+        let tiny = Slice { name: "tiny".into(), files: vec![], lines: 100, score: 30.0 };
+        let by_sum: Vec<String> = rank(vec![big.clone(), small.clone(), tiny.clone()], RankBy::Sum).into_iter().map(|s| s.name).collect();
+        assert_eq!(by_sum, vec!["big", "small", "tiny"]);
+        let by_density: Vec<String> = rank(vec![big, small, tiny], RankBy::Density).into_iter().map(|s| s.name).collect();
+        assert_eq!(by_density, vec!["small", "tiny", "big"], "tiny counts as 1,000 lines: 30/1000*1000 = 30 > big's 20");
+    }
+
+    #[test]
+    fn volume_counts_tickets_three_ways() {
+        let w = Weights::default();
+        let mut a = stat("layers/features/a/src/a.tsx", 100, 0);
+        a.violations = vec![Violation { rule: "mcds-prefix", line: 1 }];
+        let mut b = stat("layers/features/a/src/b.tsx", 100, 0);
+        b.violations = vec![Violation { rule: "mcds-prefix", line: 2 }];
+        b.markers = Markers { suppressions: 1, any_casts: 0, todos: 2 };
+        let big = stat("layers/features/z/src/big.ts", 900, 0);
+        let quiet = stat("layers/features/z/src/quiet.ts", 50, 0);
+        let files = vec![a, b, big, quiet];
+        let slices = pack_slices(&files, &w, 25_000);
+        let v = volume(&files, &slices, 10);
+        assert_eq!((v.rule_files, v.rule_kinds, v.suppression_files, v.todo_files, v.big_files), (2, 1, 1, 1, 1));
+        assert_eq!(v.candidate_files, 3, "the quiet file is not a candidate");
+        assert_eq!(v.by_file, 3);
+        // rule 2 files -> 1, suppression 1 -> 1, todo 1 -> 1, any 0 -> 0, big 1 -> 1
+        assert_eq!(v.by_kind, 4);
+        assert_eq!(v.by_slice, 1, "two small slices of the same layer are merged into one");
+        // A kind with more files than the cap is cut into several tickets.
+        assert_eq!(volume(&files, &slices, 1).by_kind, 2 + 1 + 1 + 1);
+        // All four files land in one slice here, so grouping inside the slice
+        // gives the same count as grouping the whole repo.
+        assert_eq!(v.by_kind_in_slice, v.by_kind);
+        assert_eq!(volume(&[], &[], 10), Volume::default());
     }
 
     #[test]
@@ -500,7 +661,7 @@ mod tests {
         let mut f = stat("layers/features/a/src/x.tsx", 900, 12);
         f.violations = vec![Violation { rule: "mcds-prefix", line: 3 }];
         let files = vec![f];
-        let slices = rank(pack_slices(&files, &w, 1000));
+        let slices = rank(pack_slices(&files, &w, 1000), RankBy::Sum);
         let r = report(&files, &slices, &w, 5);
         assert!(r.contains("소스 1개 · 900줄 · 조각 1개"), "{r}");
         assert!(r.contains("mcds-prefix 1"), "{r}");
