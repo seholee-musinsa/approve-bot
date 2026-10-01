@@ -29,7 +29,7 @@ pub struct Markers {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Violation {
-    pub rule: &'static str,
+    pub rule: String,
     pub line: usize,
 }
 
@@ -56,36 +56,106 @@ pub fn is_source(path: &str) -> bool {
     !SKIP.iter().any(|s| path.contains(s)) && !path.starts_with("dist/") && !path.starts_with(".next/")
 }
 
-fn layer_rank(path: &str) -> Option<u8> {
-    ["layers/apis/", "layers/services/", "layers/features/", "layers/apps/"]
-        .iter()
-        .position(|p| path.starts_with(p))
-        .map(|i| i as u8)
+/// Repo-specific rules, read from `sweep-rules.json` in the config dir. What a
+/// layer is called, which package prefix a layer exports under or which text is
+/// forbidden belongs to one repo, so none of it is in this public code: with no
+/// file the sweep still counts markers and sizes, it just finds no rule hits.
+///
+/// ```json
+/// {
+///   "exclude_paths": ["some/generated/**"],
+///   "layers": [{"path": "src/lib/", "rank": 0},
+///              {"path": "src/ui/", "rank": 1, "import_prefix": "@acme/ui-"}],
+///   "forbidden": [{"id": "no-s3-origin", "contains": ["amazonaws.com"], "unless_contains": ["ecr"]},
+///                 {"id": "prefix-only-in-ds", "paths": ["src/ui/"], "class_token": "ds:"}]
+/// }
+/// ```
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Rules {
+    #[serde(default)]
+    pub exclude_paths: Vec<String>,
+    #[serde(default)]
+    pub layers: Vec<Layer>,
+    #[serde(default)]
+    pub forbidden: Vec<Forbidden>,
 }
 
-fn import_rank(line: &str) -> Option<u8> {
-    let from = line.split("from '").nth(1).or_else(|| line.split("from \"").nth(1))?;
-    // `services-` is also a shared-package prefix, so only the unambiguous
-    // layers count: `features-` and `apps-` exist only as layers.
-    if from.starts_with("@musinsa/features-") {
-        Some(2)
-    } else if from.starts_with("@musinsa/apps-") {
-        Some(3)
-    } else {
-        None
+/// A layer: files under `path` belong to it. A higher `rank` may import a lower
+/// one but not the other way round. `import_prefix` is the package prefix the
+/// layer is imported by; leave it out when that prefix is shared with other code
+/// (then nothing is flagged for imports of it, rather than guessing).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct Layer {
+    pub path: String,
+    pub rank: u8,
+    #[serde(default)]
+    pub import_prefix: Option<String>,
+}
+
+/// Text that must not appear. `paths` limits where it applies (empty: everywhere).
+/// `class_token` matches only a whole class-name token that starts with it.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct Forbidden {
+    pub id: String,
+    #[serde(default)]
+    pub paths: Vec<String>,
+    #[serde(default)]
+    pub contains: Vec<String>,
+    #[serde(default)]
+    pub unless_contains: Vec<String>,
+    #[serde(default)]
+    pub class_token: Option<String>,
+}
+
+impl Rules {
+    pub fn checks_nothing(&self) -> bool {
+        self.layers.is_empty() && self.forbidden.is_empty()
     }
 }
 
-/// A class name token that starts with `mcds:` (the prefix is for packages/mcds only).
-fn has_mcds_prefix(line: &str) -> bool {
-    line.match_indices("mcds:").any(|(i, _)| {
+/// Read the rules file; a missing or broken file means no rules.
+pub fn load_rules(config_dir: &Path) -> Rules {
+    std::fs::read_to_string(config_dir.join("sweep-rules.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Rules>(&t).ok())
+        .unwrap_or_default()
+}
+
+fn layer_of<'a>(path: &str, layers: &'a [Layer]) -> Option<&'a Layer> {
+    layers.iter().filter(|l| path.starts_with(l.path.as_str())).max_by_key(|l| l.path.len())
+}
+
+/// The rank of the layer a line imports from, when the import prefix says so.
+fn import_rank(line: &str, layers: &[Layer]) -> Option<u8> {
+    let from = line.split("from '").nth(1).or_else(|| line.split("from \"").nth(1))?;
+    layers
+        .iter()
+        .find(|l| l.import_prefix.as_deref().is_some_and(|p| !p.is_empty() && from.starts_with(p)))
+        .map(|l| l.rank)
+}
+
+/// A class-name token that starts with `token`.
+fn has_class_token(line: &str, token: &str) -> bool {
+    line.match_indices(token).any(|(i, _)| {
         i == 0 || matches!(line.as_bytes()[i - 1], b' ' | b'"' | b'\'' | b'`')
     })
 }
 
-pub fn scan_file(path: &str, content: &str) -> (usize, Markers, Vec<Violation>) {
-    let in_service_app = path.starts_with("layers/features/") || path.starts_with("layers/apps/");
-    let rank = layer_rank(path);
+fn forbidden_hit(f: &Forbidden, line: &str) -> bool {
+    if let Some(t) = f.class_token.as_deref().filter(|t| !t.is_empty()) {
+        return has_class_token(line, t);
+    }
+    f.contains.iter().any(|c| !c.is_empty() && line.contains(c.as_str()))
+        && !f.unless_contains.iter().any(|u| !u.is_empty() && line.contains(u.as_str()))
+}
+
+pub fn scan_file(path: &str, content: &str, rules: &Rules) -> (usize, Markers, Vec<Violation>) {
+    let rank = layer_of(path, &rules.layers).map(|l| l.rank);
+    let applicable: Vec<&Forbidden> = rules
+        .forbidden
+        .iter()
+        .filter(|f| f.paths.is_empty() || f.paths.iter().any(|p| path.starts_with(p.as_str())))
+        .collect();
     let mut m = Markers::default();
     let mut v = Vec::new();
     let mut lines = 0;
@@ -101,18 +171,14 @@ pub fn scan_file(path: &str, content: &str) -> (usize, Markers, Vec<Violation>) 
         if line.contains("TODO") || line.contains("FIXME") {
             m.todos += 1;
         }
-        if in_service_app && has_mcds_prefix(line) {
-            v.push(Violation { rule: "mcds-prefix", line: n });
+        for f in &applicable {
+            if forbidden_hit(f, line) {
+                v.push(Violation { rule: f.id.clone(), line: n });
+            }
         }
-        if line.contains("amazonaws.com") && !line.contains("dkr.ecr") {
-            v.push(Violation { rule: "s3-origin", line: n });
-        }
-        if line.contains("public-read") || line.contains("x-amz-acl") {
-            v.push(Violation { rule: "public-acl", line: n });
-        }
-        if let (Some(r), Some(imp)) = (rank, import_rank(line)) {
+        if let (Some(r), Some(imp)) = (rank, import_rank(line, &rules.layers)) {
             if imp > r {
-                v.push(Violation { rule: "upward-import", line: n });
+                v.push(Violation { rule: "upward-import".into(), line: n });
             }
         }
     }
@@ -312,34 +378,17 @@ pub fn churn_by_path(root: &Path, days: u32) -> anyhow::Result<HashMap<String, u
     Ok(m)
 }
 
-/// Paths the sweep must not read, from `sweep-rules.json` in the config dir
-/// (`{"exclude_paths": ["layers/apis/**/*.api.ts"]}`). What counts as generated
-/// or out of scope is specific to a repo, so it lives in the user's config and
-/// not in this public code. A missing or unreadable file means no exclusions.
-pub fn load_exclude_paths(config_dir: &Path) -> Vec<String> {
-    #[derive(serde::Deserialize, Default)]
-    struct Rules {
-        #[serde(default)]
-        exclude_paths: Vec<String>,
-    }
-    std::fs::read_to_string(config_dir.join("sweep-rules.json"))
-        .ok()
-        .and_then(|t| serde_json::from_str::<Rules>(&t).ok())
-        .map(|r| r.exclude_paths)
-        .unwrap_or_default()
-}
-
 fn is_excluded(path: &str, globs: &[String]) -> bool {
     globs.iter().any(|g| crate::context::glob_match(g, path))
 }
 
 /// Scan the tracked source files of a checkout.
-pub fn scan_checkout(root: &Path, churn: &HashMap<String, u32>, exclude: &[String]) -> anyhow::Result<Vec<FileStat>> {
+pub fn scan_checkout(root: &Path, churn: &HashMap<String, u32>, rules: &Rules) -> anyhow::Result<Vec<FileStat>> {
     let listed = git(root, &["ls-files", "-z"])?;
     let mut out = Vec::new();
-    for path in listed.split('\0').filter(|p| !p.is_empty() && is_source(p) && !is_excluded(p, exclude)) {
+    for path in listed.split('\0').filter(|p| !p.is_empty() && is_source(p) && !is_excluded(p, &rules.exclude_paths)) {
         let Ok(content) = std::fs::read_to_string(root.join(path)) else { continue };
-        let (lines, markers, violations) = scan_file(path, &content);
+        let (lines, markers, violations) = scan_file(path, &content, rules);
         out.push(FileStat { path: path.to_string(), lines, markers, violations, churn: churn.get(path).copied().unwrap_or(0) });
     }
     Ok(out)
@@ -377,7 +426,7 @@ fn tickets_for(files: usize, max_files: usize) -> usize {
 
 pub fn volume(files: &[FileStat], slices: &[Slice], max_files: usize) -> Volume {
     let mut v = Volume::default();
-    let mut rules: Vec<&str> = Vec::new();
+    let mut rules: Vec<String> = Vec::new();
     let mut candidate: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for f in files {
         let is_big = f.lines >= BIG_FILE_LINES;
@@ -386,7 +435,7 @@ pub fn volume(files: &[FileStat], slices: &[Slice], max_files: usize) -> Volume 
             v.rule_files += 1;
             for x in &f.violations {
                 if !rules.contains(&x.rule) {
-                    rules.push(x.rule);
+                    rules.push(x.rule.clone());
                 }
             }
         }
@@ -451,7 +500,7 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
     let mut by_rule: BTreeMap<&str, usize> = BTreeMap::new();
     for f in files {
         for v in &f.violations {
-            *by_rule.entry(v.rule).or_default() += 1;
+            *by_rule.entry(v.rule.as_str()).or_default() += 1;
         }
     }
     if by_rule.is_empty() {
@@ -541,16 +590,18 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     }
     let w = Weights::default();
     let mut notes = String::new();
-    if let Ok(dir) = crate::eval_cli::config_dir() {
-        exclude.extend(load_exclude_paths(&dir));
+    let mut rules = crate::eval_cli::config_dir().map(|d| load_rules(&d)).unwrap_or_default();
+    rules.exclude_paths.extend(exclude);
+    if rules.checks_nothing() {
+        notes.push_str("규칙 파일(설정 폴더의 sweep-rules.json)에 규칙 위반 검사가 없어 마커와 크기만 본다\n");
     }
-    if !exclude.is_empty() {
-        notes.push_str(&format!("제외 경로 {}개: {}\n", exclude.len(), exclude.join(", ")));
+    if !rules.exclude_paths.is_empty() {
+        notes.push_str(&format!("제외 경로 {}개: {}\n", rules.exclude_paths.len(), rules.exclude_paths.join(", ")));
     }
     let (files, checkout, commit) = if repo.is_empty() {
         let root = PathBuf::from(&local);
         let commit = git(&root, &["rev-parse", "HEAD"]).map(|c| c.trim().to_string()).unwrap_or_else(|_| "local".into());
-        (scan_checkout(&root, &churn_by_path(&root, days)?, &exclude)?, root, commit)
+        (scan_checkout(&root, &churn_by_path(&root, days)?, &rules)?, root, commit)
     } else {
         let (owner, name) = crate::github::split_repo(&repo)?;
         let root = match &cache_root {
@@ -564,7 +615,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
         }
         let (text, mut synced) = refresh_cache(owner, name, &dir)?;
         notes.push_str(&text);
-        let scan = |d: &Path| -> anyhow::Result<Vec<FileStat>> { scan_checkout(d, &churn_by_path(d, days)?, &exclude) };
+        let scan = |d: &Path| -> anyhow::Result<Vec<FileStat>> { scan_checkout(d, &churn_by_path(d, days)?, &rules) };
         let files = match scan(&dir) {
             Ok(f) => f,
             // The sync was clean but the history cannot be read: the cache is
@@ -686,6 +737,18 @@ fn refresh_cache(owner: &str, name: &str, dir: &Path) -> anyhow::Result<(String,
 mod tests {
     use super::*;
 
+    fn test_rules() -> Rules {
+        serde_json::from_str(
+            r#"{"layers":[{"path":"layers/apis/","rank":0},{"path":"layers/services/","rank":1},
+                          {"path":"layers/features/","rank":2,"import_prefix":"@musinsa/features-"},
+                          {"path":"layers/apps/","rank":3,"import_prefix":"@musinsa/apps-"}],
+                "forbidden":[{"id":"mcds-prefix","paths":["layers/features/","layers/apps/"],"class_token":"mcds:"},
+                             {"id":"s3-origin","contains":["amazonaws.com"],"unless_contains":["dkr.ecr"]},
+                             {"id":"public-acl","contains":["public-read","x-amz-acl"]}]}"#,
+        )
+        .unwrap()
+    }
+
     fn stat(path: &str, lines: usize, churn: u32) -> FileStat {
         FileStat { path: path.into(), lines, markers: Markers::default(), violations: vec![], churn }
     }
@@ -711,7 +774,7 @@ mod tests {
     #[test]
     fn counts_markers_without_counting_plain_notes() {
         let src = "// NOTE: not debt\n// TODO: later\nconst a = x as any;\n// eslint-disable-next-line\n// biome-ignore lint: why\n// FIXME y\n";
-        let (lines, m, v) = scan_file("layers/features/a/src/x.ts", src);
+        let (lines, m, v) = scan_file("layers/features/a/src/x.ts", src, &test_rules());
         assert_eq!(lines, 6);
         assert_eq!(m, Markers { suppressions: 2, any_casts: 1, todos: 2 });
         assert!(v.is_empty());
@@ -720,27 +783,27 @@ mod tests {
     #[test]
     fn flags_each_text_matchable_rule_where_it_applies() {
         let class = "<span className=\"flex mcds:bg-blue-95\" />\n";
-        let (_, _, v) = scan_file("layers/features/a/src/X.tsx", class);
-        assert_eq!(v, vec![Violation { rule: "mcds-prefix", line: 1 }]);
+        let (_, _, v) = scan_file("layers/features/a/src/X.tsx", class, &test_rules());
+        assert_eq!(v, vec![Violation { rule: "mcds-prefix".into(), line: 1 }]);
         // The prefix is the package's own convention, so it is fine there.
-        assert!(scan_file("packages/mcds/src/Tag.tsx", class).2.is_empty());
+        assert!(scan_file("packages/mcds/src/Tag.tsx", class, &test_rules()).2.is_empty());
         // `mcds:` inside another token is not a class.
-        assert!(scan_file("layers/features/a/src/X.tsx", "const k = 'xmcds:y';\n").2.is_empty());
+        assert!(scan_file("layers/features/a/src/X.tsx", "const k = 'xmcds:y';\n", &test_rules()).2.is_empty());
 
-        let (_, _, v) = scan_file("layers/apps/a/src/x.ts", "const u = 'https://b.s3.ap-northeast-2.amazonaws.com/k';\nconst a = { ACL: 'public-read' };\n");
-        let rules: Vec<&str> = v.iter().map(|x| x.rule).collect();
+        let (_, _, v) = scan_file("layers/apps/a/src/x.ts", "const u = 'https://b.s3.ap-northeast-2.amazonaws.com/k';\nconst a = { ACL: 'public-read' };\n", &test_rules());
+        let rules: Vec<&str> = v.iter().map(|x| x.rule.as_str()).collect();
         assert_eq!(rules, vec!["s3-origin", "public-acl"]);
-        assert!(scan_file("a.ts", "image: 1.dkr.ecr.amazonaws.com/x\n").2.is_empty(), "ECR is a registry, not S3");
+        assert!(scan_file("a.ts", "image: 1.dkr.ecr.amazonaws.com/x\n", &test_rules()).2.is_empty(), "ECR is a registry, not S3");
     }
 
     #[test]
     fn a_lower_layer_importing_a_higher_one_is_flagged_but_not_the_reverse() {
         let up = "import { A } from '@musinsa/features-curator';\n";
-        assert_eq!(scan_file("layers/services/curator/src/s.ts", up).2, vec![Violation { rule: "upward-import", line: 1 }]);
-        assert_eq!(scan_file("layers/apis/curator/src/a.ts", "import x from '@musinsa/apps-curator';\n").2.len(), 1);
-        assert!(scan_file("layers/apps/curator/src/a.ts", up).2.is_empty(), "apps may use features");
-        assert!(scan_file("layers/features/a/src/a.ts", "import { x } from '@musinsa/apis-mamud';\n").2.is_empty(), "type and schema imports are common, not a rule hit");
-        assert!(scan_file("packages/x/src/a.ts", up).2.is_empty(), "packages have no layer");
+        assert_eq!(scan_file("layers/services/curator/src/s.ts", up, &test_rules()).2, vec![Violation { rule: "upward-import".into(), line: 1 }]);
+        assert_eq!(scan_file("layers/apis/curator/src/a.ts", "import x from '@musinsa/apps-curator';\n", &test_rules()).2.len(), 1);
+        assert!(scan_file("layers/apps/curator/src/a.ts", up, &test_rules()).2.is_empty(), "apps may use features");
+        assert!(scan_file("layers/features/a/src/a.ts", "import { x } from '@musinsa/apis-mamud';\n", &test_rules()).2.is_empty(), "type and schema imports are common, not a rule hit");
+        assert!(scan_file("packages/x/src/a.ts", up, &test_rules()).2.is_empty(), "packages have no layer");
     }
 
     #[test]
@@ -750,7 +813,7 @@ mod tests {
         let big_quiet = stat("layers/features/a/src/b.ts", 2000, 0);
         let big_hot = stat("layers/features/a/src/c.ts", 2000, 40);
         let mut bad = stat("layers/features/a/src/d.ts", 100, 0);
-        bad.violations = vec![Violation { rule: "mcds-prefix", line: 1 }];
+        bad.violations = vec![Violation { rule: "mcds-prefix".into(), line: 1 }];
         assert!(score(&small_quiet, &w) < 0.01);
         assert!(score(&big_hot, &w) > score(&big_quiet, &w));
         assert!(score(&big_quiet, &w) > score(&small_quiet, &w));
@@ -808,9 +871,9 @@ mod tests {
     fn volume_counts_tickets_three_ways() {
         let w = Weights::default();
         let mut a = stat("layers/features/a/src/a.tsx", 100, 0);
-        a.violations = vec![Violation { rule: "mcds-prefix", line: 1 }];
+        a.violations = vec![Violation { rule: "mcds-prefix".into(), line: 1 }];
         let mut b = stat("layers/features/a/src/b.tsx", 100, 0);
-        b.violations = vec![Violation { rule: "mcds-prefix", line: 2 }];
+        b.violations = vec![Violation { rule: "mcds-prefix".into(), line: 2 }];
         b.markers = Markers { suppressions: 1, any_casts: 0, todos: 2 };
         let big = stat("layers/features/z/src/big.ts", 900, 0);
         let quiet = stat("layers/features/z/src/quiet.ts", 50, 0);
@@ -832,17 +895,52 @@ mod tests {
     }
 
     #[test]
-    fn exclude_paths_come_from_the_config_file_and_match_as_globs() {
+    fn rules_come_from_the_config_file_and_a_missing_or_broken_file_means_none() {
         let dir = std::env::temp_dir().join(format!("sweeprules-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         std::fs::create_dir_all(&dir).unwrap();
-        assert!(load_exclude_paths(&dir).is_empty(), "no file means no exclusions");
-        std::fs::write(dir.join("sweep-rules.json"), r#"{"exclude_paths":["layers/apis/**/*.api.ts","docs/**"],"other":1}"#).unwrap();
-        let g = load_exclude_paths(&dir);
-        assert_eq!(g, vec!["layers/apis/**/*.api.ts".to_string(), "docs/**".to_string()]);
-        assert!(is_excluded("layers/apis/cpid/src/getX.api.ts", &g));
-        assert!(!is_excluded("layers/apis/cpid/src/httpClient.ts", &g));
+        let none = load_rules(&dir);
+        assert!(none.checks_nothing() && none.exclude_paths.is_empty(), "no file: no rules");
+        std::fs::write(
+            dir.join("sweep-rules.json"),
+            r#"{"exclude_paths":["gen/**/*.api.ts","docs/**"],"layers":[{"path":"a/","rank":0},{"path":"b/","rank":1,"import_prefix":"@x/b-"}],"forbidden":[{"id":"no-foo","contains":["foo"]}],"other":1}"#,
+        )
+        .unwrap();
+        let r = load_rules(&dir);
+        assert_eq!(r.exclude_paths, vec!["gen/**/*.api.ts".to_string(), "docs/**".to_string()]);
+        assert_eq!((r.layers.len(), r.forbidden.len()), (2, 1));
+        assert!(!r.checks_nothing());
+        assert!(is_excluded("gen/x/getX.api.ts", &r.exclude_paths) && !is_excluded("gen/x/http.ts", &r.exclude_paths));
         std::fs::write(dir.join("sweep-rules.json"), "not json").unwrap();
-        assert!(load_exclude_paths(&dir).is_empty(), "a broken file is ignored, not fatal");
+        assert!(load_rules(&dir).checks_nothing(), "a broken file is ignored, not fatal");
+    }
+
+    #[test]
+    fn with_no_rules_only_markers_and_sizes_are_counted() {
+        let src = "const a = x as any; // TODO later\n<span className=\"mcds:flex\" />\nconst u = 'b.amazonaws.com';\n";
+        let (lines, m, v) = scan_file("layers/features/a/src/x.tsx", src, &Rules::default());
+        assert_eq!((lines, m.any_casts, m.todos), (3, 1, 1));
+        assert!(v.is_empty(), "no rules file, no rule hits: {v:?}");
+    }
+
+    #[test]
+    fn the_rule_engine_knows_nothing_about_one_repo() {
+        // A made-up repo: other names, a longest-prefix layer match, a path-limited rule.
+        let rules: Rules = serde_json::from_str(
+            r#"{"layers":[{"path":"src/","rank":0},{"path":"src/ui/","rank":1,"import_prefix":"@acme/ui-"}],
+                "forbidden":[{"id":"no-secret-url","paths":["src/ui/"],"contains":["internal.acme.io"]},
+                             {"id":"ds-prefix","paths":["src/ui/"],"class_token":"ds:"}]}"#,
+        )
+        .unwrap();
+        // src/core imports the ui package: a lower layer reaching up.
+        let (_, _, v) = scan_file("src/core/a.ts", "import { B } from '@acme/ui-button';\n", &rules);
+        assert_eq!(v, vec![Violation { rule: "upward-import".into(), line: 1 }]);
+        // The longest matching layer wins, so src/ui/ is rank 1 and may import ui packages.
+        assert!(scan_file("src/ui/a.ts", "import { B } from '@acme/ui-button';\n", &rules).2.is_empty());
+        // A rule limited to src/ui/ does not fire elsewhere.
+        assert_eq!(scan_file("src/ui/a.ts", "fetch('https://internal.acme.io/x')\n", &rules).2.len(), 1);
+        assert!(scan_file("src/core/a.ts", "fetch('https://internal.acme.io/x')\n", &rules).2.is_empty());
+        assert_eq!(scan_file("src/ui/a.tsx", "<i className=\"flex ds:bg\" />\n", &rules).2.len(), 1);
+        assert!(scan_file("src/ui/a.tsx", "const k = 'xds:y';\n", &rules).2.is_empty(), "inside another token is not a class");
     }
 
     #[test]
@@ -867,7 +965,7 @@ mod tests {
     fn report_lists_rule_counts_slices_and_files() {
         let w = Weights::default();
         let mut f = stat("layers/features/a/src/x.tsx", 900, 12);
-        f.violations = vec![Violation { rule: "mcds-prefix", line: 3 }];
+        f.violations = vec![Violation { rule: "mcds-prefix".into(), line: 3 }];
         let files = vec![f];
         let slices = rank(pack_slices(&files, &w, 1000), RankBy::Sum);
         let r = report(&files, &slices, &w, 5);
