@@ -63,7 +63,7 @@ pub fn prev_findings(comments: &[InlineThreadComment], me: &str) -> Vec<PrevFind
             id,
             severity,
             path: c.path.clone(),
-            line: c.line.or(c.original_line),
+            line: if c.subject_type.as_deref() == Some("file") { None } else { c.line.or(c.original_line) },
             claim,
         });
     }
@@ -162,7 +162,18 @@ mod tests {
             body: body.into(),
             in_reply_to_id: reply.then_some(1),
             created_at: None,
+            subject_type: None,
         }
+    }
+
+    #[test]
+    fn a_file_level_finding_has_no_line_even_though_github_reports_line_1() {
+        let mut root = c("me", "🟡 **major** (확신 90) — 권한 확인 없음\n\n<!-- f:cafe0001 -->", false);
+        root.line = Some(1);
+        root.subject_type = Some("file".into());
+        let prev = prev_findings(&[root], "me");
+        assert_eq!(prev.len(), 1);
+        assert_eq!(prev[0].line, None);
     }
 
     #[test]

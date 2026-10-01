@@ -91,6 +91,10 @@ pub struct InlineThreadComment {
     pub in_reply_to_id: Option<u64>,
     #[serde(default)]
     pub created_at: Option<String>,
+    /// `file` for a whole-file comment. GitHub reports such a comment at line 1,
+    /// which is not where the problem is.
+    #[serde(default)]
+    pub subject_type: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +108,14 @@ pub struct RateLimit {
 pub struct ReviewComment {
     pub path: String,
     pub line: u64,
+    pub body: String,
+}
+
+/// A review comment on a whole file (no line) — for a finding that could not be
+/// pinned to a diff line.
+#[derive(Debug, Clone)]
+pub struct FileComment {
+    pub path: String,
     pub body: String,
 }
 
@@ -281,6 +293,32 @@ impl GitHubClient {
         comments: &[ReviewComment],
     ) -> Result<()> {
         self.submit_review(owner, repo, number, "COMMENT", Some(body), comments).await
+    }
+
+    /// Post a file-level comment. The reviews API has no such comment, so it goes
+    /// on its own after the review is submitted; it still opens a resolvable thread.
+    pub async fn post_file_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        commit_id: &str,
+        c: &FileComment,
+    ) -> Result<()> {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments");
+        let payload = serde_json::json!({
+            "body": c.body,
+            "commit_id": commit_id,
+            "path": c.path,
+            "subject_type": "file",
+        });
+        let resp = self.http.post(&url).headers(self.headers()).json(&payload).send().await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(anyhow!("file comment failed: {status} {b}"))
     }
 
     /// Submit a review. Inline `comments` reference diff lines; if GitHub rejects

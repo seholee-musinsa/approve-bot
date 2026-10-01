@@ -412,6 +412,7 @@ mod tests {
                 body: "null 처리 빠짐".into(),
                 in_reply_to_id: None,
                 created_at: None,
+                subject_type: None,
             },
             InlineThreadComment {
                 id: 0,
@@ -422,6 +423,7 @@ mod tests {
                 body: "수정: abc123".into(),
                 in_reply_to_id: Some(1),
                 created_at: None,
+                subject_type: None,
             },
         ];
         let r = render_threads(&reviews, &inline, "bot-me");

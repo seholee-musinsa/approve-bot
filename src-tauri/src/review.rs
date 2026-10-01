@@ -10,7 +10,7 @@
 //! JSON drives the approve/comment gate. Anything malformed fails closed
 //! (score 0 → comment, never auto-approve).
 
-use crate::github::ReviewComment;
+use crate::github::{FileComment, ReviewComment};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
@@ -115,6 +115,9 @@ pub struct ReviewOutcome {
     pub blocking_issues: Vec<String>,
     /// Inline line comments, already filtered to lines that exist in the diff.
     pub inline: Vec<ReviewComment>,
+    /// Confident blocker/major findings whose line is not in the diff, posted
+    /// as file-level threads so they can be resolved and followed up.
+    pub file_comments: Vec<FileComment>,
     /// False when the CLI/JSON was malformed — caller must NOT auto-approve.
     pub finished_cleanly: bool,
     pub cost_usd: Option<f64>,
@@ -145,6 +148,7 @@ impl ReviewOutcome {
             explored: false,
             omitted_files: vec![],
             continued: false,
+            file_comments: vec![],
             findings: vec![],
             followups: vec![],
         }
@@ -251,6 +255,26 @@ fn second_pass_guide(first: &ReviewOutcome) -> String {
 /// Fold the second pass into the first review: new findings, inline comments
 /// and blockers are added (repeats by id or line dropped), its body becomes a
 /// section, costs add up. A failed second pass only leaves a note.
+/// Add the other pass's file-level comments, skipping a finding the first
+/// review already posted (same `f:` id) on a line or on a file.
+fn merge_file_comments(first: &mut ReviewOutcome, extra: Vec<FileComment>) {
+    let mut seen: Vec<String> = first
+        .file_comments
+        .iter()
+        .map(|c| c.body.as_str())
+        .chain(first.inline.iter().map(|c| c.body.as_str()))
+        .filter_map(crate::rereview::marker_id)
+        .collect();
+    for c in extra {
+        let id = crate::rereview::marker_id(&c.body);
+        if id.as_ref().is_some_and(|i| seen.contains(i)) {
+            continue;
+        }
+        seen.extend(id);
+        first.file_comments.push(c);
+    }
+}
+
 fn merge_second_pass(first: &mut ReviewOutcome, second: ReviewOutcome) {
     first.cost_usd = match (first.cost_usd, second.cost_usd) {
         (Some(a), Some(b)) => Some(a + b),
@@ -274,6 +298,7 @@ fn merge_second_pass(first: &mut ReviewOutcome, second: ReviewOutcome) {
         .collect();
     let new_blockers = new_findings.iter().filter(|f| f.severity == "blocker").count();
     first.inline.extend(second.inline.into_iter().filter(|c| !taken.contains(&(c.path.clone(), c.line))));
+    merge_file_comments(first, second.file_comments);
     // Engine-rule hits (suspicious-instruction) from the second pass count too.
     first.blocking_issues.extend(second.blocking_issues);
     if new_blockers > 0 {
@@ -446,6 +471,7 @@ fn render_inline(f: &Finding) -> String {
 /// What the gate and GitHub get from the findings.
 struct Split {
     inline: Vec<ReviewComment>,
+    file_level: Vec<FileComment>,
     blockers: Vec<String>,
     /// blocker/major that could not be anchored to a diff line.
     unanchored: Vec<Finding>,
@@ -453,7 +479,7 @@ struct Split {
 
 fn split_findings(findings: &[Finding], diff: &str) -> Split {
     let allowed = commentable_lines(diff);
-    let mut split = Split { inline: vec![], blockers: vec![], unanchored: vec![] };
+    let mut split = Split { inline: vec![], file_level: vec![], blockers: vec![], unanchored: vec![] };
     for f in findings {
         if f.claim.trim().is_empty() {
             continue;
@@ -478,6 +504,10 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
                 body: render_inline(f),
             });
         } else if matches!(f.severity.as_str(), "blocker" | "major") {
+            // Still listed in the body, so a failed file comment loses nothing.
+            if postable && allowed.contains_key(&f.path) {
+                split.file_level.push(FileComment { path: f.path.clone(), body: render_inline(f) });
+            }
             split.unanchored.push(f.clone());
         }
     }
@@ -774,7 +804,8 @@ fn run_claude(
                 cost_usd: envelope.total_cost_usd,
                 explored: opts.cwd.is_some(),
                 omitted_files: vec![],
-            continued: false,
+                continued: false,
+                file_comments: split.file_level,
                 findings: v.findings,
                 followups: v.followups,
             }
@@ -938,6 +969,7 @@ fn merge_continuation(first: &mut ReviewOutcome, extra: ReviewOutcome, round: us
         .filter(|f| !known.contains(&finding_id(&f.path, &f.symbol, &f.claim)))
         .collect();
     first.inline.extend(extra.inline.into_iter().filter(|c| !taken.contains(&(c.path.clone(), c.line))));
+    merge_file_comments(first, extra.file_comments);
     first.blocking_issues.extend(extra.blocking_issues);
     first.score = first.score.min(extra.score);
     if first.verdict == "approve" && extra.verdict != "approve" {
@@ -1170,6 +1202,7 @@ mod tests {
             explored: true,
             omitted_files: vec![],
             continued: false,
+            file_comments: vec![],
             findings,
             followups: vec![],
         }
@@ -1246,6 +1279,42 @@ mod tests {
         assert!(!render_inline(&f).contains("```suggestion"));
         f.suggestion = "const y = 2;".into();
         assert!(render_inline(&f).contains("```suggestion\nconst y = 2;\n```"));
+    }
+
+    #[test]
+    fn confident_findings_off_the_diff_lines_become_file_threads_and_stay_in_the_body() {
+        let fs = vec![
+            finding("blocker", 90.0, "src/x.ts", Some(99), "줄이 diff 밖인 blocker"),
+            finding("major", 90.0, "src/x.ts", None, "줄 없는 major"),
+            finding("major", 50.0, "src/x.ts", None, "확신 낮은 major"),
+            finding("major", 90.0, "src/other.ts", None, "diff 에 없는 파일"),
+            finding("minor", 90.0, "src/x.ts", None, "줄 없는 minor"),
+            finding("major", 90.0, "src/x.ts", Some(11), "줄이 맞는 major"),
+        ];
+        let s = split_findings(&fs, SAMPLE_DIFF);
+        let files: Vec<&str> = s.file_level.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(files, vec!["src/x.ts", "src/x.ts"], "only the two confident, in-diff, line-less blocker/major");
+        assert!(s.file_level[0].body.contains("줄이 diff 밖인 blocker") && s.file_level[0].body.contains("<!-- f:"));
+        assert_eq!(s.inline.len(), 1, "the anchored one stays a line comment");
+        let un: Vec<&str> = s.unanchored.iter().map(|f| f.claim.as_str()).collect();
+        assert!(un.contains(&"줄이 diff 밖인 blocker") && un.contains(&"줄 없는 major"), "still listed in the body: {un:?}");
+    }
+
+    #[test]
+    fn file_comments_from_another_pass_are_deduped_by_finding_id() {
+        let f = finding("major", 90.0, "src/x.ts", None, "권한 확인 없음");
+        let body = render_inline(&f);
+        let mut first = outcome(vec![], vec![]);
+        first.file_comments = vec![FileComment { path: "src/x.ts".into(), body: body.clone() }];
+        let other = finding("major", 90.0, "src/y.ts", None, "다른 지적");
+        merge_file_comments(
+            &mut first,
+            vec![
+                FileComment { path: "src/x.ts".into(), body },
+                FileComment { path: "src/y.ts".into(), body: render_inline(&other) },
+            ],
+        );
+        assert_eq!(first.file_comments.len(), 2, "the repeat is dropped, the new one is added");
     }
 
     #[test]

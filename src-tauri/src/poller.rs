@@ -159,6 +159,26 @@ fn gate_notes(sensitive: &[String], omitted: &[String], continued: bool) -> Stri
     out
 }
 
+/// File-level threads for findings that could not be pinned to a line. Posted
+/// after the review itself; a failure is logged and leaves the body's own list
+/// of the finding in place. Returns how many landed.
+async fn post_file_comments(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr: &PullRequest,
+    comments: &[crate::github::FileComment],
+) -> usize {
+    let mut posted = 0;
+    for c in comments {
+        match client.post_file_comment(owner, repo, pr.number, &pr.head.sha, c).await {
+            Ok(()) => posted += 1,
+            Err(e) => warn!("파일 단위 코멘트 실패 {repo}#{} {}: {e}", pr.number, c.path),
+        }
+    }
+    posted
+}
+
 /// Approve-gate verdict. Pure so every hold reason is testable.
 #[derive(Debug, PartialEq, Eq)]
 enum Gate {
@@ -596,6 +616,9 @@ async fn handle_pr(
             outcome
                 .inline
                 .retain(|c| !r.prev.iter().any(|p| c.body.contains(&format!("<!-- f:{} -->", p.id))));
+            outcome
+                .file_comments
+                .retain(|c| !r.prev.iter().any(|p| c.body.contains(&format!("<!-- f:{} -->", p.id))));
         }
         // Code-side policy the model can't talk its way past: sensitive files
         // always go to a human (the #4022-style ".env-only PR got 5/5" case).
@@ -628,7 +651,9 @@ async fn handle_pr(
         } else {
             &[]
         };
-        let inline_str = if inline.is_empty() {
+        let file_comments: &[crate::github::FileComment] =
+            if cfg.inline_comments_enabled { &outcome.file_comments } else { &[] };
+        let mut inline_str = if inline.is_empty() {
             String::new()
         } else {
             format!(", 인라인 {}건", inline.len())
@@ -645,6 +670,10 @@ async fn handle_pr(
                 .await
             {
                 Ok(()) => {
+                    let n = post_file_comments(client, owner, repo, pr, file_comments).await;
+                    if n > 0 {
+                        inline_str.push_str(&format!(", 파일 스레드 {n}건"));
+                    }
                     push_and_emit(
                         app,
                         state,
@@ -681,6 +710,10 @@ async fn handle_pr(
                 .await
             {
                 Ok(()) => {
+                    let n = post_file_comments(client, owner, repo, pr, file_comments).await;
+                    if n > 0 {
+                        inline_str.push_str(&format!(", 파일 스레드 {n}건"));
+                    }
                     push_and_emit(
                         app,
                         state,
