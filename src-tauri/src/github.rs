@@ -77,6 +77,9 @@ pub struct Review {
 /// One inline review comment as GitHub returns it (only the fields we feed the reviewer).
 #[derive(Debug, Clone, Deserialize)]
 pub struct InlineThreadComment {
+    /// Replies point at their thread root through `in_reply_to_id`.
+    #[serde(default)]
+    pub id: u64,
     pub user: GhUser,
     pub path: String,
     #[serde(default)]
@@ -483,6 +486,15 @@ impl GitHubClient {
     /// Inline review comments (people and bots), oldest first.
     pub async fn list_review_comments(&self, owner: &str, repo: &str, number: u64) -> Result<Vec<InlineThreadComment>> {
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100");
+        self.get_json(&url).await
+    }
+
+    /// Most recently updated closed PRs (merged or not), newest first.
+    pub async fn list_recent_closed_pulls(&self, owner: &str, repo: &str, limit: usize) -> Result<Vec<PullRequest>> {
+        let per_page = limit.clamp(1, 100);
+        let url = format!(
+            "{API}/repos/{owner}/{repo}/pulls?state=closed&per_page={per_page}&sort=updated&direction=desc"
+        );
         self.get_json(&url).await
     }
 

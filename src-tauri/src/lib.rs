@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod diffprep;
 mod eval_cli;
+mod feedback;
 mod gh_login;
 mod github;
 mod poller;
