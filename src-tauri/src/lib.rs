@@ -9,6 +9,7 @@ mod gh_login;
 mod github;
 mod layout;
 mod poller;
+mod repocache;
 mod rereview;
 mod routing;
 mod trace;

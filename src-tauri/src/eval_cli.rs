@@ -361,7 +361,7 @@ fn build_meta(owner: &str, repo: &str, pr: &github::PullRequest) -> String {
 
 /// The app config dir (same one the GUI uses), so `--guide ""` resolves the
 /// live bot's guide. Falls back to the OS config dir convention.
-fn config_dir() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn config_dir() -> anyhow::Result<std::path::PathBuf> {
     let base = dirs_config_dir().ok_or_else(|| anyhow::anyhow!("no config dir"))?;
     Ok(base.join("com.approvebot.app"))
 }
