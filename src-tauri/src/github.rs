@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
+use std::time::Duration;
 
 const API: &str = "https://api.github.com";
 const UA: &str = "approve-bot/0.1.0";
@@ -128,6 +129,8 @@ impl GitHubClient {
     pub fn new(token: String) -> Self {
         Self {
             http: Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(60))
                 .build()
                 .expect("failed to build reqwest client"),
             token,
@@ -158,6 +161,25 @@ impl GitHubClient {
         h
     }
 
+    /// 읽기 요청 전용 재시도. 연결·시간 초과와 502/503/504 만 두 번까지 다시 시도한다.
+    /// 쓰기(POST)는 중복 게시 위험이 있어 이 경로를 쓰지 않는다.
+    async fn send_get(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
+        let mut attempt = 0u32;
+        loop {
+            let this = req
+                .try_clone()
+                .ok_or_else(|| anyhow!("request not cloneable"))?;
+            match this.send().await {
+                Ok(r) if is_transient_status(r.status()) && attempt < 2 => {}
+                Ok(r) => return Ok(r),
+                Err(e) if (e.is_connect() || e.is_timeout()) && attempt < 2 => {}
+                Err(e) => return Err(e.into()),
+            }
+            attempt += 1;
+            tokio::time::sleep(retry_delay(attempt)).await;
+        }
+    }
+
     fn extract_rate(headers: &reqwest::header::HeaderMap) -> RateLimit {
         let parse =
             |name: &str| -> Option<u64> { headers.get(name)?.to_str().ok()?.parse().ok() };
@@ -170,10 +192,11 @@ impl GitHubClient {
     pub async fn get_user(&self) -> Result<(GhUser, RateLimit)> {
         let url = format!("{API}/user");
         let resp = self
-            .http
-            .get(&url)
-            .headers(self.headers())
-            .send()
+            .send_get(
+                self.http
+                    .get(&url)
+                    .headers(self.headers())
+            )
             .await?;
         let rate = Self::extract_rate(resp.headers());
         let status = resp.status();
@@ -194,10 +217,11 @@ impl GitHubClient {
             "{API}/repos/{owner}/{repo}/pulls?state=open&per_page=100&sort=created&direction=desc"
         );
         let resp = self
-            .http
-            .get(&url)
-            .headers(self.headers())
-            .send()
+            .send_get(
+                self.http
+                    .get(&url)
+                    .headers(self.headers())
+            )
             .await?;
         let rate = Self::extract_rate(resp.headers());
         let status = resp.status();
@@ -220,10 +244,11 @@ impl GitHubClient {
     ) -> Result<Vec<Review>> {
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100");
         let resp = self
-            .http
-            .get(&url)
-            .headers(self.headers())
-            .send()
+            .send_get(
+                self.http
+                    .get(&url)
+                    .headers(self.headers())
+            )
             .await?;
         if !resp.status().is_success() {
             let s = resp.status();
@@ -242,14 +267,15 @@ impl GitHubClient {
         let q_param = format!("{q} in:login type:user");
         let url = format!("{API}/search/users");
         let resp = self
-            .http
-            .get(&url)
-            .headers(self.headers())
+            .send_get(
+                self.http
+                    .get(&url)
+                    .headers(self.headers())
             .query(&[
                 ("q", q_param.as_str()),
                 ("per_page", &limit.to_string()),
             ])
-            .send()
+            )
             .await?;
         let status = resp.status();
         if !status.is_success() {
@@ -603,4 +629,57 @@ pub fn split_repo(full: &str) -> Result<(&str, &str)> {
         return Err(anyhow!("invalid repo `{full}`: too many slashes"));
     }
     Ok((owner, repo))
+}
+
+fn is_transient_status(s: StatusCode) -> bool {
+    matches!(s.as_u16(), 502 | 503 | 504)
+}
+
+fn retry_delay(attempt: u32) -> Duration {
+    Duration::from_millis(500 * u64::from(attempt))
+}
+
+#[cfg(test)]
+mod resilience_tests {
+    use super::*;
+
+    #[test]
+    fn transient_statuses() {
+        assert!(is_transient_status(StatusCode::BAD_GATEWAY));
+        assert!(is_transient_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_transient_status(StatusCode::GATEWAY_TIMEOUT));
+        assert!(!is_transient_status(StatusCode::NOT_FOUND));
+        assert!(!is_transient_status(StatusCode::FORBIDDEN));
+    }
+
+    #[test]
+    fn delay_grows() {
+        assert!(retry_delay(2) > retry_delay(1));
+    }
+
+    #[tokio::test]
+    async fn retries_502_then_ok() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            for i in 0..3 {
+                let (mut sock, _) = l.accept().await.unwrap();
+                let mut buf = [0u8; 2048];
+                let _ = sock.read(&mut buf).await;
+                let resp = if i < 2 {
+                    "HTTP/1.1 502 Bad Gateway\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok"
+                };
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        let c = GitHubClient::new("t".into());
+        let r = c
+            .send_get(c.http.get(format!("http://{addr}/")))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
 }

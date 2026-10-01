@@ -308,7 +308,7 @@ pub async fn try_connect(app: &AppHandle, state: &Arc<AppState>) {
         }
         Err(e) => {
             let status =
-                ConnectionStatus::disconnected(format!("GitHub auth check failed: {e}"));
+                ConnectionStatus::disconnected(format!("GitHub auth check failed: {e:#}"));
             *state.status.lock().await = status.clone();
             let _ = app.emit(STATUS_EVENT, &status);
             warn!(error = %e, "connect failed");
@@ -371,7 +371,7 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
                         pr_title: None,
                         author: None,
                         url: None,
-                        message: format!("list pulls failed: {e}"),
+                        message: format!("list pulls failed: {e:#}"),
                         detail: None,
                     },
                 )
@@ -439,7 +439,7 @@ async fn handle_pr(
                     pr_title: Some(pr.title.clone()),
                     author: Some(pr.user.login.clone()),
                     url: Some(pr.html_url.clone()),
-                    message: format!("list reviews failed: {e}"),
+                    message: format!("list reviews failed: {e:#}"),
                     detail: None,
                 },
             )
@@ -518,7 +518,7 @@ async fn handle_pr(
                 push_and_emit(
                     app,
                     state,
-                    err_entry(repo_full, pr, format!("get diff failed (새 커밋까지 재시도 안 함): {e}")),
+                    err_entry(repo_full, pr, format!("get diff failed (새 커밋까지 재시도 안 함): {e:#}")),
                 )
                 .await;
                 return;
@@ -595,7 +595,7 @@ async fn handle_pr(
         {
             Ok(o) => o,
             Err(e) => {
-                push_and_emit(app, state, err_entry(repo_full, pr, format!("review task failed: {e}")))
+                push_and_emit(app, state, err_entry(repo_full, pr, format!("review task failed: {e:#}")))
                     .await;
                 return;
             }
@@ -697,7 +697,7 @@ async fn handle_pr(
                     }
                 }
                 Err(e) => {
-                    push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e}")))
+                    push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e:#}")))
                         .await;
                 }
             }
@@ -732,7 +732,7 @@ async fn handle_pr(
                     .await;
                 }
                 Err(e) => {
-                    push_and_emit(app, state, err_entry(repo_full, pr, format!("comment failed: {e}")))
+                    push_and_emit(app, state, err_entry(repo_full, pr, format!("comment failed: {e:#}")))
                         .await;
                 }
             }
@@ -769,7 +769,7 @@ async fn handle_pr(
             }
         }
         Err(e) => {
-            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e}"))).await;
+            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e:#}"))).await;
         }
     }
 }
@@ -815,7 +815,7 @@ async fn approve_only(
             }
         }
         Err(e) => {
-            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e}")))
+            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e:#}")))
                 .await;
         }
     }
