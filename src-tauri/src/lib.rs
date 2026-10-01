@@ -14,6 +14,7 @@ mod routing;
 mod trace;
 mod review;
 mod state;
+mod sweep;
 
 use std::sync::Arc;
 use tauri::Manager;

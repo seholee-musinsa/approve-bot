@@ -31,6 +31,18 @@ pub fn maybe_run_headless() -> bool {
             }
         }
     }
+    if args.first().map(String::as_str) == Some("sweep-once") {
+        match crate::sweep::run_cli(&args[1..]) {
+            Ok(report) => {
+                println!("{report}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("sweep-once failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(String::as_str) != Some("review-once") {
         return false;
     }
