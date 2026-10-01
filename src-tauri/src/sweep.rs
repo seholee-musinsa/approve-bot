@@ -10,7 +10,7 @@
 //! repo, so it is not meant to be committed (public repo).
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// A file this long is a split candidate on its own.
@@ -454,8 +454,12 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
 }
 
 /// `approve-bot sweep-once --local <dir> [--days 90] [--top 12] [--max-lines 25000] [--max-files 10] [--rank density|sum]`
+/// `approve-bot sweep-once --repo owner/name [--cache-dir <dir>] [--clear-cache] ...` reads an app-owned cache clone (kept fresh, see `repocache`) instead of a local folder.
 pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut local = String::new();
+    let mut repo = String::new();
+    let mut cache_root: Option<String> = None;
+    let mut clear_cache = false;
     let mut days: u32 = 90;
     let mut top: usize = 12;
     let mut max_lines: usize = SLICE_MAX_LINES;
@@ -471,6 +475,9 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
         };
         match name {
             "--local" => local = value(&mut i)?,
+            "--repo" => repo = value(&mut i)?,
+            "--cache-dir" => cache_root = Some(value(&mut i)?),
+            "--clear-cache" => clear_cache = true,
             "--days" => days = value(&mut i)?.parse()?,
             "--top" => top = value(&mut i)?.parse()?,
             "--max-lines" => max_lines = value(&mut i)?.parse()?,
@@ -486,17 +493,82 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
         }
         i += 1;
     }
-    if local.is_empty() {
-        return Err(anyhow::anyhow!("--local <checkout dir> is required (cloning a repo comes in a later step)"));
+    if !repo.is_empty() && !local.is_empty() {
+        return Err(anyhow::anyhow!("--repo and --local cannot be used together"));
     }
-    let root = Path::new(&local);
+    if repo.is_empty() && local.is_empty() {
+        return Err(anyhow::anyhow!("--repo owner/name or --local <checkout dir> is required"));
+    }
     let w = Weights::default();
-    let churn = churn_by_path(root, days)?;
-    let files = scan_checkout(root, &churn)?;
+    let mut notes = String::new();
+    let files = if repo.is_empty() {
+        let root = Path::new(&local);
+        scan_checkout(root, &churn_by_path(root, days)?)?
+    } else {
+        let (owner, name) = crate::github::split_repo(&repo)?;
+        let root = match &cache_root {
+            Some(d) => PathBuf::from(d),
+            None => crate::eval_cli::config_dir()?.join("sweep"),
+        };
+        let dir = crate::repocache::cache_dir(&root, owner, name);
+        if clear_cache {
+            crate::repocache::clear(&dir);
+            return Ok(format!("캐시를 지웠다: {}", dir.display()));
+        }
+        notes.push_str(&refresh_cache(owner, name, &dir)?);
+        let scan = |d: &Path| -> anyhow::Result<Vec<FileStat>> { scan_checkout(d, &churn_by_path(d, days)?) };
+        match scan(&dir) {
+            Ok(f) => f,
+            // The sync was clean but the history cannot be read: the cache is
+            // damaged somewhere the sync did not look. Rebuild it once.
+            Err(e) if crate::repocache::is_corruption(&e.to_string()) => {
+                notes.push_str("이력을 읽지 못해(캐시 손상) 캐시를 지우고 다시 받는다\n");
+                crate::repocache::clear(&dir);
+                notes.push_str(&refresh_cache(owner, name, &dir)?);
+                scan(&dir)?
+            }
+            Err(e) => return Err(e),
+        }
+    };
     let slices = rank(pack_slices(&files, &w, max_lines), by);
-    let mut out = report(&files, &slices, &w, top);
+    let mut out = notes;
+    out.push_str(&report(&files, &slices, &w, top));
     out.push_str(&volume_report(&volume(&files, &slices, max_files), max_files));
     Ok(out)
+}
+
+/// Bring the cache clone of `owner/name` up to date and describe what happened:
+/// every failed attempt with its cause and the fix tried, then the result.
+fn refresh_cache(owner: &str, name: &str, dir: &Path) -> anyhow::Result<String> {
+    use crate::repocache::{self, Policy, RealGit};
+    let token = crate::auth::fetch_gh_token().map_err(|e| anyhow::anyhow!("GitHub 토큰을 얻지 못함(gh 로그인 필요): {e}"))?;
+    let git = RealGit::new(Some(token.clone()));
+    let url = format!("https://github.com/{owner}/{name}.git");
+    let again = || crate::auth::fetch_gh_token().ok();
+    let started = std::time::Instant::now();
+    let mut log = Vec::new();
+    let result = repocache::sync(&git, dir, &url, &Policy::default(), &again, Some(&token), &mut log);
+    let mut text = String::new();
+    for a in &log {
+        text.push_str(&format!("갱신 시도 {} ({}): 원인 {} → {} [{}]\n", a.n, a.step, a.failure.label(), a.action, a.detail));
+    }
+    match result {
+        Ok(ok) => {
+            let mb = repocache::dir_size(dir) as f64 / 1_048_576.0;
+            text.push_str(&format!(
+                "캐시 {} · 기본 브랜치 {} · 기준 커밋 {} · {} {:.1}초 · 용량 {:.0}MB{}\n",
+                dir.display(),
+                ok.branch,
+                ok.commit.chars().take(8).collect::<String>(),
+                if ok.cloned { "처음 클론" } else { "갱신" },
+                started.elapsed().as_secs_f64(),
+                mb,
+                if ok.shallow { " · ⚠️ 얕은 클론이라 변경 빈도가 0으로 나온다" } else { "" },
+            ));
+            Ok(text)
+        }
+        Err(e) => Err(anyhow::anyhow!("{text}{e}")),
+    }
 }
 
 #[cfg(test)]
