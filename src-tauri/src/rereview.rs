@@ -70,7 +70,7 @@ pub fn prev_findings(comments: &[InlineThreadComment], me: &str) -> Vec<PrevFind
     out
 }
 
-fn marker_id(body: &str) -> Option<String> {
+pub(crate) fn marker_id(body: &str) -> Option<String> {
     let start = body.find("<!-- f:")? + "<!-- f:".len();
     let rest = &body[start..];
     let end = rest.find(" -->")?;
@@ -154,6 +154,7 @@ mod tests {
 
     fn c(login: &str, body: &str, reply: bool) -> InlineThreadComment {
         InlineThreadComment {
+            id: 0,
             user: GhUser { login: login.into() },
             path: "src/a.ts".into(),
             line: Some(10),

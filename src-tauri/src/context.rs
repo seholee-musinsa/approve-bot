@@ -404,6 +404,7 @@ mod tests {
         ];
         let inline = vec![
             InlineThreadComment {
+                id: 0,
                 user: GhUser { login: "reviewer".into() },
                 path: "src/a.ts".into(),
                 line: Some(12),
@@ -413,6 +414,7 @@ mod tests {
                 created_at: None,
             },
             InlineThreadComment {
+                id: 0,
                 user: GhUser { login: "author".into() },
                 path: "src/a.ts".into(),
                 line: None,

@@ -19,6 +19,18 @@ use crate::{auth, github, review};
 /// return `true` (caller must exit without starting Tauri). Otherwise `false`.
 pub fn maybe_run_headless() -> bool {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("feedback") {
+        match crate::feedback::run_cli(&args[1..]) {
+            Ok(report) => {
+                println!("{report}");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("feedback failed: {e:#}");
+                std::process::exit(1);
+            }
+        }
+    }
     if args.first().map(String::as_str) != Some("review-once") {
         return false;
     }

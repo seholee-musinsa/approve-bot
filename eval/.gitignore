@@ -12,3 +12,6 @@ cache/
 truth/*
 !truth/README.md
 quarantine/
+
+# eval 실행 로그에는 사내 PR URL 이 찍힌다
+run-*.log
