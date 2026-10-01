@@ -49,12 +49,13 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것) ===
 {"verdict":"approve|comment|request_changes","score":<0-5>,"blocking_issues":["suspicious-instruction 같은 엔진 규칙 위반만"],
  "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
    "symbol":"<함수·컴포넌트 이름>","claim":"<한 문장: 무엇이 틀렸나>","repro":"<어떤 입력·상태에서 무엇이 잘못 나오나>",
-   "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>","fix":"<고치는 방법, 대안이 있으면 A/B>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>"}]}
+   "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>","fix":"<고치는 방법, 대안이 있으면 A/B>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>","fix_code":"<선택: 여러 줄 수정 후 코드>"}]}
 ```
 - findings 는 본문 `# 발견`·`# 질문`에 적은 항목과 같아야 한다(없으면 []). blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 본문에만 남는다.
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
-- suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌거나 diff 밖이면 비우고 fix 에 설명한다.
+- suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌거나 diff 밖이면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다(일반 코드 블록으로 달린다).
+- major·minor 는 fix·suggestion·fix_code 중 하나가 있어야 인라인으로 달린다. 고치는 방법을 모르면 question 으로 내린다.
 - 재리뷰 블록이 있으면 JSON 에 `"followups":[{"id":"<이전 지적 f:id>","status":"resolved|partial|unresolved|wont_fix|withdrawn","note":"<근거 한 줄>"}]` 를 이전 지적마다 하나씩 넣는다.
 - 이 JSON 은 게이트 판정과 인라인 코멘트 게시에 쓰인다."#;
 
@@ -377,6 +378,18 @@ pub struct Finding {
     pub fix: String,
     #[serde(default)]
     pub suggestion: String,
+    /// Multi-line corrected code. Rendered as a plain code block, not a
+    /// GitHub `suggestion` (which can only replace the anchored line).
+    #[serde(default)]
+    pub fix_code: String,
+}
+
+impl Finding {
+    fn has_fix(&self) -> bool {
+        [&self.fix, &self.suggestion, &self.fix_code]
+            .iter()
+            .any(|v| !v.trim().is_empty())
+    }
 }
 
 /// Inline comments go only to confirmed, anchored findings at or above this.
@@ -414,6 +427,8 @@ fn render_inline(f: &Finding) -> String {
     }
     if !f.suggestion.trim().is_empty() {
         out.push_str(&format!("\n\n```suggestion\n{}\n```", f.suggestion.trim_end()));
+    } else if !f.fix_code.trim().is_empty() {
+        out.push_str(&format!("\n\n```\n{}\n```", f.fix_code.trim_end()));
     }
     out.push_str(&format!("\n\n<!-- f:{} -->", finding_id(&f.path, &f.symbol, &f.claim)));
     out
@@ -439,7 +454,11 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
             split.blockers.push(format!("{}{at}", f.claim.trim()));
         }
         let postable = matches!(f.severity.as_str(), "blocker" | "major" | "minor")
-            && f.confidence.unwrap_or(0.0) >= INLINE_MIN_CONFIDENCE;
+            && f.confidence.unwrap_or(0.0) >= INLINE_MIN_CONFIDENCE
+            // A blocker is always posted; lesser findings need a way to fix
+            // them. Recent human threads show fixes attached get applied far
+            // more often than bare complaints.
+            && (f.severity == "blocker" || f.has_fix());
         let anchored = f
             .line
             .is_some_and(|l| allowed.get(&f.path).is_some_and(|set| set.contains(&l)));
@@ -1111,6 +1130,34 @@ mod tests {
         assert!(!render_inline(&f).contains("```suggestion"));
         f.suggestion = "const y = 2;".into();
         assert!(render_inline(&f).contains("```suggestion\nconst y = 2;\n```"));
+    }
+
+    #[test]
+    fn fix_code_renders_as_plain_block_and_suggestion_wins() {
+        let mut f = finding("minor", 80.0, "src/x.ts", Some(11), "c");
+        f.fix_code = "if (!a?.length) return;\nrun(a);".into();
+        let body = render_inline(&f);
+        assert!(body.contains("```\nif (!a?.length) return;\nrun(a);\n```"));
+        assert!(!body.contains("```suggestion"));
+        f.suggestion = "const y = 2;".into();
+        let body = render_inline(&f);
+        assert!(body.contains("```suggestion\nconst y = 2;\n```"));
+        assert!(!body.contains("run(a);"), "one block only");
+    }
+
+    #[test]
+    fn major_minor_without_fix_stay_out_of_inline() {
+        let mut bare = finding("minor", 90.0, "src/x.ts", Some(11), "고칠 방법 없음");
+        bare.fix = "  ".into();
+        let mut bare_major = finding("major", 90.0, "src/x.ts", Some(11), "방법 없는 major");
+        bare_major.fix = String::new();
+        let mut bare_blocker = finding("blocker", 90.0, "src/x.ts", Some(11), "방법 없는 blocker");
+        bare_blocker.fix = String::new();
+        let s = split_findings(&[bare, bare_major, bare_blocker], SAMPLE_DIFF);
+        assert_eq!(s.inline.len(), 1, "only the blocker is posted without a fix");
+        assert!(s.inline[0].body.contains("방법 없는 blocker"));
+        let un: Vec<&str> = s.unanchored.iter().map(|f| f.claim.as_str()).collect();
+        assert_eq!(un, vec!["방법 없는 major"], "a bare major stays visible in the body");
     }
 
     #[test]
