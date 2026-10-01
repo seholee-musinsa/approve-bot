@@ -7,6 +7,7 @@ mod eval_cli;
 mod feedback;
 mod gh_login;
 mod github;
+mod layout;
 mod poller;
 mod rereview;
 mod routing;

@@ -424,7 +424,9 @@ fn render_inline(f: &Finding) -> String {
     let (emoji, label) = severity_label(&f.severity);
     let conf = f.confidence.map(|c| format!(" (확신 {c:.0})")).unwrap_or_default();
     let mut out = format!("{emoji} **{label}**{conf} — {}", f.claim.trim());
-    for (name, v) in [("재현", &f.repro), ("근거", &f.evidence), ("수정", &f.fix)] {
+    // What breaks and how to fix it stay open; where it was verified is one
+    // click away, so the thread reads as a short comment rather than a report.
+    for (name, v) in [("재현", &f.repro), ("수정", &f.fix)] {
         if !v.trim().is_empty() {
             out.push_str(&format!("\n\n**{name}**: {}", v.trim()));
         }
@@ -433,6 +435,9 @@ fn render_inline(f: &Finding) -> String {
         out.push_str(&format!("\n\n```suggestion\n{}\n```", f.suggestion.trim_end()));
     } else if !f.fix_code.trim().is_empty() {
         out.push_str(&format!("\n\n```\n{}\n```", f.fix_code.trim_end()));
+    }
+    if !f.evidence.trim().is_empty() {
+        out.push_str(&format!("\n\n<details>\n<summary>근거</summary>\n\n{}\n\n</details>", f.evidence.trim()));
     }
     out.push_str(&format!("\n\n<!-- f:{} -->", finding_id(&f.path, &f.symbol, &f.claim)));
     out
@@ -1241,6 +1246,24 @@ mod tests {
         assert!(!render_inline(&f).contains("```suggestion"));
         f.suggestion = "const y = 2;".into();
         assert!(render_inline(&f).contains("```suggestion\nconst y = 2;\n```"));
+    }
+
+    #[test]
+    fn inline_comment_leads_with_claim_repro_fix_and_folds_the_evidence() {
+        let mut f = finding("major", 85.0, "src/x.ts", Some(11), "빈 목록이 통과");
+        f.fix_code = "if (!a?.length) return;".into();
+        let body = render_inline(&f);
+        let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} missing in {body}"));
+        assert!(at("빈 목록이 통과") < at("**재현**"));
+        assert!(at("**재현**") < at("**수정**"));
+        assert!(at("**수정**") < at("if (!a?.length) return;"));
+        assert!(at("if (!a?.length) return;") < at("<summary>근거</summary>"));
+        assert!(at("<summary>근거</summary>") < at("<!-- f:"));
+        assert!(body.contains("<summary>근거</summary>\n\nsrc/x.ts:11 확인\n\n</details>"));
+        assert!(!body.contains("**근거**"), "no longer an open paragraph");
+        // No evidence, no empty fold.
+        f.evidence = String::new();
+        assert!(!render_inline(&f).contains("<details>"));
     }
 
     #[test]
