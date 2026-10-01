@@ -297,6 +297,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         "deep": args.deep,
         "explored": outcome.explored,
         "omitted_files": outcome.omitted_files,
+        "continued": outcome.continued,
         "findings": outcome.findings,
         "followups": outcome.followups,
         "open_prev_blockers": round

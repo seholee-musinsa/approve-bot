@@ -134,7 +134,7 @@ async fn build_round(
 
 /// Quote-block lines for the hold reasons code enforces regardless of the
 /// model's verdict (sensitive files, files the review could not see).
-fn gate_notes(sensitive: &[String], omitted: &[String]) -> String {
+fn gate_notes(sensitive: &[String], omitted: &[String], continued: bool) -> String {
     let mut out = String::new();
     if !sensitive.is_empty() {
         out.push_str(&format!(
@@ -151,6 +151,11 @@ fn gate_notes(sensitive: &[String], omitted: &[String]) -> String {
             shown.join(", ")
         ));
     }
+    if continued {
+        out.push_str(
+            "> ⚠️ **게이트**: PR 이 커서 남은 파일을 따로 이어서 리뷰했습니다 — 큰 PR 은 놓치는 결함이 많아 자동 승인하지 않고 사람 승인으로 넘깁니다.\n",
+        );
+    }
     out
 }
 
@@ -162,6 +167,7 @@ enum Gate {
     HoldBlocking,
     HoldSensitive(Vec<String>),
     HoldOmitted(Vec<String>),
+    HoldContinued,
     HoldVerdict,
     HoldScore,
 }
@@ -174,6 +180,7 @@ impl Gate {
             Gate::HoldBlocking => format!("blocking {blocking}건"),
             Gate::HoldSensitive(files) => format!("민감 파일 {}건", files.len()),
             Gate::HoldOmitted(files) => format!("미검토 파일 {}건", files.len()),
+            Gate::HoldContinued => "대형 PR(이어서 리뷰)".to_string(),
             Gate::HoldVerdict => "판정이 approve 아님".to_string(),
             Gate::HoldScore => format!("점수 {score}/5 < {min:.1}"),
         }
@@ -190,6 +197,7 @@ fn gate(
     blocking: usize,
     sensitive: &[String],
     omitted: &[String],
+    continued: bool,
     min_score: f64,
 ) -> Gate {
     if !finished_cleanly {
@@ -201,6 +209,10 @@ fn gate(
     } else if !omitted.is_empty() {
         // Approving files nobody read would be a blind approve.
         Gate::HoldOmitted(omitted.to_vec())
+    } else if continued {
+        // Review quality drops on big PRs (recall ~8% above 150KB in eval), so
+        // even a fully read one is left to a human.
+        Gate::HoldContinued
     } else if verdict != "approve" {
         Gate::HoldVerdict
     } else if score < min_score {
@@ -595,11 +607,12 @@ async fn handle_pr(
             outcome.blocking_issues.len(),
             &sensitive,
             &outcome.omitted_files,
+            outcome.continued,
             cfg.min_approve_score,
         );
         // Every code-side hold reason goes on top, not just the first one the
         // gate hit, so the body's own verdict is not mistaken for the outcome.
-        let notes = gate_notes(&sensitive, &outcome.omitted_files);
+        let notes = gate_notes(&sensitive, &outcome.omitted_files, outcome.continued);
         let body = if notes.is_empty() || !outcome.finished_cleanly {
             outcome.body.clone()
         } else {
@@ -878,36 +891,46 @@ mod tests {
 
     #[test]
     fn gate_rejects_approve_with_blocking_issues() {
-        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], 4.0), Gate::HoldBlocking);
+        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], false, 4.0), Gate::HoldBlocking);
     }
 
     #[test]
     fn gate_holds_sensitive_files() {
         let files = vec![".env.production".to_string()];
-        assert_eq!(gate(true, "approve", 5.0, 0, &files, &[], 4.0), Gate::HoldSensitive(files));
+        assert_eq!(gate(true, "approve", 5.0, 0, &files, &[], false, 4.0), Gate::HoldSensitive(files));
     }
 
     #[test]
     fn gate_holds_when_files_were_not_reviewed() {
         let omitted = vec!["src/big.ts".to_string()];
-        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, 4.0), Gate::HoldOmitted(omitted));
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, false, 4.0), Gate::HoldOmitted(omitted));
     }
 
     #[test]
     fn gate_notes_list_every_hold_reason() {
         use super::gate_notes;
         let omitted: Vec<String> = (0..7).map(|i| format!("f{i}.ts")).collect();
-        let n = gate_notes(&[".env".to_string()], &omitted);
+        let n = gate_notes(&[".env".to_string()], &omitted, false);
         assert!(n.contains("민감 파일 변경(.env)"));
         assert!(n.contains("7개 파일을 보지 못했습니다(f0.ts, f1.ts, f2.ts, f3.ts, f4.ts 외 2개)"));
-        assert!(gate_notes(&[], &[]).is_empty());
+        assert!(gate_notes(&[], &[], false).is_empty());
+        assert!(gate_notes(&[], &[], true).contains("이어서 리뷰했습니다"));
+    }
+
+    #[test]
+    fn continued_review_is_held_even_when_everything_else_passes() {
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &[], true, 4.0), Gate::HoldContinued);
+        // Higher-priority holds still win, so the reason shown is the first one hit.
+        let omitted = vec!["src/big.ts".to_string()];
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, true, 4.0), Gate::HoldOmitted(omitted));
+        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], true, 4.0), Gate::HoldBlocking);
     }
 
     #[test]
     fn gate_approves_only_when_all_hold() {
-        assert_eq!(gate(true, "approve", 4.0, 0, &[], &[], 4.0), Gate::Approve);
-        assert_eq!(gate(false, "approve", 5.0, 0, &[], &[], 4.0), Gate::HoldUnfinished);
-        assert_eq!(gate(true, "comment", 5.0, 0, &[], &[], 4.0), Gate::HoldVerdict);
-        assert_eq!(gate(true, "approve", 3.5, 0, &[], &[], 4.0), Gate::HoldScore);
+        assert_eq!(gate(true, "approve", 4.0, 0, &[], &[], false, 4.0), Gate::Approve);
+        assert_eq!(gate(false, "approve", 5.0, 0, &[], &[], false, 4.0), Gate::HoldUnfinished);
+        assert_eq!(gate(true, "comment", 5.0, 0, &[], &[], false, 4.0), Gate::HoldVerdict);
+        assert_eq!(gate(true, "approve", 3.5, 0, &[], &[], false, 4.0), Gate::HoldScore);
     }
 }

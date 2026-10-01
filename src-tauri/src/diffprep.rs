@@ -96,6 +96,21 @@ pub fn prepare(diff: &str, budget: usize) -> Prepared {
     Prepared { files }
 }
 
+/// The raw diff of just these files, in diff order. Used to review what an
+/// earlier pass could not fit into its budget.
+pub fn subset(diff: &str, paths: &[String]) -> String {
+    split_files(diff)
+        .into_iter()
+        .filter(|f| paths.contains(&f.path))
+        .map(|f| f.raw)
+        .collect()
+}
+
+/// Paths of files whose hunks are in the prompt (not excluded, not over budget).
+pub fn reviewed_paths(prepared: &Prepared) -> Vec<String> {
+    prepared.files.iter().filter(|f| f.skip.is_none()).map(|f| f.path.clone()).collect()
+}
+
 /// Added lines per file (without the leading `+`), in diff order.
 pub fn added_lines(diff: &str) -> Vec<(String, Vec<String>)> {
     split_files(diff)
@@ -243,6 +258,27 @@ diff --git a/src/a.test.ts b/src/a.test.ts\n\
 @@ -1 +1,2 @@\n\
 \x20x\n\
 +y\n";
+
+    #[test]
+    fn omitted_files_fit_a_second_pass_via_subset() {
+        // Budget fits the source file (~203) but not the test file after it (~146).
+        let one = prepare(DIFF, 220);
+        let omitted = one.omitted();
+        assert_eq!(omitted.len(), 1, "{omitted:?}");
+        // Reviewing only the omitted file now fits, and only that file is in it.
+        let rest = subset(DIFF, &omitted);
+        assert!(rest.contains(&format!("diff --git a/{0} b/{0}", omitted[0])));
+        let two = prepare(&rest, 220);
+        assert_eq!(reviewed_paths(&two), omitted);
+        assert!(two.omitted().is_empty());
+    }
+
+    #[test]
+    fn subset_of_nothing_is_empty_and_never_loops() {
+        assert!(subset(DIFF, &[]).is_empty());
+        let none = prepare("", 220);
+        assert!(reviewed_paths(&none).is_empty());
+    }
 
     #[test]
     fn numbers_right_side_lines() {
