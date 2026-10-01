@@ -123,6 +123,9 @@ pub struct ReviewOutcome {
     pub explored: bool,
     /// Files the review did not see (diff budget). Non-empty = no auto-approve.
     pub omitted_files: Vec<String>,
+    /// True when files past the budget got follow-on passes. Such a PR is big,
+    /// so the gate keeps it for a human even though every file was read.
+    pub continued: bool,
     /// Structured findings as the model reported them (eval, later re-review).
     pub findings: Vec<Finding>,
     /// Status of each earlier finding on a follow-up round (empty on round 1).
@@ -141,6 +144,7 @@ impl ReviewOutcome {
             cost_usd: None,
             explored: false,
             omitted_files: vec![],
+            continued: false,
             findings: vec![],
             followups: vec![],
         }
@@ -765,6 +769,7 @@ fn run_claude(
                 cost_usd: envelope.total_cost_usd,
                 explored: opts.cwd.is_some(),
                 omitted_files: vec![],
+            continued: false,
                 findings: v.findings,
                 followups: v.followups,
             }
@@ -871,9 +876,76 @@ pub fn review_pr_deep_at(
         let second = run_claude(&prompt2, model, thinking_tokens, diff, &opts);
         merge_second_pass(&mut outcome, second);
     }
+    // Files the first pass could not fit are reviewed in follow-on passes on the
+    // same checkout, so a big PR is covered instead of held for a human.
+    let mut omitted = prepared.omitted();
+    for round in 1..=MAX_CONTINUATIONS {
+        if omitted.is_empty() || !outcome.finished_cleanly {
+            break;
+        }
+        let rest = crate::diffprep::subset(diff, &omitted);
+        let next = crate::diffprep::prepare(&rest, crate::diffprep::DIFF_BUDGET);
+        if crate::diffprep::reviewed_paths(&next).is_empty() {
+            break; // what is left cannot fit even alone (or GitHub sent no patch)
+        }
+        outcome.continued = true;
+        let meta2 = format!("{meta}\n\n{CONTINUATION_NOTE}");
+        let prompt2 = build_prompt(guide, &meta2, &next.render(), true);
+        let extra = run_claude(&prompt2, model, thinking_tokens, diff, &opts);
+        let ok = extra.finished_cleanly;
+        merge_continuation(&mut outcome, extra, round);
+        if !ok {
+            break; // the files stay omitted, so the gate still holds
+        }
+        omitted = next.omitted();
+    }
     let _ = std::fs::remove_dir_all(&cloned); // best-effort cleanup
-    outcome.omitted_files = prepared.omitted();
+    outcome.omitted_files = omitted;
     outcome
+}
+
+/// Extra passes over files an earlier pass left out for budget. Each costs one
+/// more model run, so the count is capped.
+const MAX_CONTINUATIONS: usize = 2;
+
+const CONTINUATION_NOTE: &str = "=== 추가 리뷰 ===\n앞선 리뷰가 diff 예산 때문에 보지 못한 파일만 이 호출의 diff 에 들어 있다. \
+이 파일들만 판단하고, PR 전체 총평·점수는 이 파일들 기준으로 쓴다. 앞선 리뷰와 같은 지적을 되풀이하지 않는다.";
+
+/// Fold a follow-on pass (a review of the files the first pass could not see)
+/// into the first review. Unlike the authorization re-check, this is a full
+/// review of other files, so its verdict and score count toward the gate.
+fn merge_continuation(first: &mut ReviewOutcome, extra: ReviewOutcome, round: usize) {
+    first.cost_usd = match (first.cost_usd, extra.cost_usd) {
+        (Some(a), Some(b)) => Some(a + b),
+        (a, b) => a.or(b),
+    };
+    if !extra.finished_cleanly {
+        first.body.push_str(&format!(
+            "\n\n# 추가 리뷰 ({round})\n\n(남은 파일 리뷰가 정상 완료되지 않아 해당 파일은 보지 못했습니다.)\n"
+        ));
+        return;
+    }
+    let known: Vec<String> = first.findings.iter().map(|f| finding_id(&f.path, &f.symbol, &f.claim)).collect();
+    let taken: Vec<(String, u64)> = first.inline.iter().map(|c| (c.path.clone(), c.line)).collect();
+    let new_findings: Vec<Finding> = extra
+        .findings
+        .into_iter()
+        .filter(|f| !known.contains(&finding_id(&f.path, &f.symbol, &f.claim)))
+        .collect();
+    first.inline.extend(extra.inline.into_iter().filter(|c| !taken.contains(&(c.path.clone(), c.line))));
+    first.blocking_issues.extend(extra.blocking_issues);
+    first.score = first.score.min(extra.score);
+    if first.verdict == "approve" && extra.verdict != "approve" {
+        first.verdict = extra.verdict.clone();
+    }
+    if new_findings.iter().any(|f| f.severity == "blocker") {
+        first.score = first.score.min(3.0);
+        if first.verdict == "approve" {
+            first.verdict = "comment".into();
+        }
+    }
+    first.findings.extend(new_findings);
+    first.body.push_str(&format!("\n\n# 추가 리뷰 ({round}) — 앞선 리뷰가 보지 못한 파일\n\n{}\n", extra.body.trim()));
 }
 
 /// Shallow-checkout a PR head into a fresh temp dir. Token is injected via
@@ -1092,6 +1164,7 @@ mod tests {
             cost_usd: Some(0.5),
             explored: true,
             omitted_files: vec![],
+            continued: false,
             findings,
             followups: vec![],
         }
@@ -1113,6 +1186,44 @@ mod tests {
         assert_eq!(first.inline.len(), 1);
         assert!(first.body.contains("# 권한·계약 재점검\n\n- ❌ 권한"));
         assert_eq!(first.cost_usd, Some(1.0));
+    }
+
+    #[test]
+    fn continuation_counts_toward_the_gate_and_adds_findings() {
+        let known = finding("minor", 80.0, "src/a.ts", Some(11), "이미 지적");
+        let mut first = outcome(vec![known.clone()], vec![]);
+        let mut extra = outcome(
+            vec![known, finding("blocker", 90.0, "src/b.ts", Some(12), "b 에서 권한 확인 없음")],
+            vec![ReviewComment { path: "src/b.ts".into(), line: 12, body: "b".into() }],
+        );
+        extra.score = 3.5;
+        extra.cost_usd = Some(0.7);
+        merge_continuation(&mut first, extra, 1);
+        assert_eq!(first.findings.len(), 2, "the repeated finding is dropped");
+        assert_eq!(first.verdict, "comment");
+        assert!(first.score <= 3.0);
+        assert_eq!(first.inline.len(), 1);
+        assert!(first.body.contains("# 추가 리뷰 (1)"));
+        assert_eq!(first.cost_usd, Some(1.2));
+    }
+
+    #[test]
+    fn clean_continuation_with_a_lower_score_pulls_the_score_down() {
+        let mut first = outcome(vec![], vec![]);
+        let mut extra = outcome(vec![], vec![]);
+        extra.score = 3.5;
+        extra.verdict = "comment".into();
+        merge_continuation(&mut first, extra, 1);
+        assert_eq!((first.verdict.as_str(), first.score), ("comment", 3.5));
+    }
+
+    #[test]
+    fn failed_continuation_only_leaves_a_note() {
+        let mut first = outcome(vec![], vec![]);
+        merge_continuation(&mut first, ReviewOutcome::fail_closed("boom"), 2);
+        assert_eq!(first.verdict, "approve");
+        assert!(first.blocking_issues.is_empty());
+        assert!(first.body.contains("# 추가 리뷰 (2)") && first.body.contains("보지 못했습니다"));
     }
 
     #[test]
