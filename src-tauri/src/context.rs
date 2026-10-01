@@ -275,7 +275,7 @@ fn cap(s: &str, n: usize) -> String {
 }
 
 /// `paths:` list from a markdown file's YAML frontmatter.
-fn frontmatter_paths(text: &str) -> Vec<String> {
+pub(crate) fn frontmatter_paths(text: &str) -> Vec<String> {
     let mut lines = text.lines();
     if lines.next().map(str::trim) != Some("---") {
         return vec![];
@@ -303,7 +303,7 @@ fn frontmatter_paths(text: &str) -> Vec<String> {
 }
 
 /// Minimal glob: `**` spans directories, `*` stays within one, `?` is one char.
-fn glob_match(pat: &str, path: &str) -> bool {
+pub(crate) fn glob_match(pat: &str, path: &str) -> bool {
     fn go(p: &[u8], s: &[u8]) -> bool {
         match p.first() {
             None => s.is_empty(),

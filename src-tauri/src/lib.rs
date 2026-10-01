@@ -16,6 +16,7 @@ mod trace;
 mod review;
 mod state;
 mod sweep;
+mod sweep_review;
 
 use std::sync::Arc;
 use tauri::Manager;

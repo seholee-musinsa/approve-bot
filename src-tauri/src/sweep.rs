@@ -312,11 +312,32 @@ pub fn churn_by_path(root: &Path, days: u32) -> anyhow::Result<HashMap<String, u
     Ok(m)
 }
 
+/// Paths the sweep must not read, from `sweep-rules.json` in the config dir
+/// (`{"exclude_paths": ["layers/apis/**/*.api.ts"]}`). What counts as generated
+/// or out of scope is specific to a repo, so it lives in the user's config and
+/// not in this public code. A missing or unreadable file means no exclusions.
+pub fn load_exclude_paths(config_dir: &Path) -> Vec<String> {
+    #[derive(serde::Deserialize, Default)]
+    struct Rules {
+        #[serde(default)]
+        exclude_paths: Vec<String>,
+    }
+    std::fs::read_to_string(config_dir.join("sweep-rules.json"))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Rules>(&t).ok())
+        .map(|r| r.exclude_paths)
+        .unwrap_or_default()
+}
+
+fn is_excluded(path: &str, globs: &[String]) -> bool {
+    globs.iter().any(|g| crate::context::glob_match(g, path))
+}
+
 /// Scan the tracked source files of a checkout.
-pub fn scan_checkout(root: &Path, churn: &HashMap<String, u32>) -> anyhow::Result<Vec<FileStat>> {
+pub fn scan_checkout(root: &Path, churn: &HashMap<String, u32>, exclude: &[String]) -> anyhow::Result<Vec<FileStat>> {
     let listed = git(root, &["ls-files", "-z"])?;
     let mut out = Vec::new();
-    for path in listed.split('\0').filter(|p| !p.is_empty() && is_source(p)) {
+    for path in listed.split('\0').filter(|p| !p.is_empty() && is_source(p) && !is_excluded(p, exclude)) {
         let Ok(content) = std::fs::read_to_string(root.join(path)) else { continue };
         let (lines, markers, violations) = scan_file(path, &content);
         out.push(FileStat { path: path.to_string(), lines, markers, violations, churn: churn.get(path).copied().unwrap_or(0) });
@@ -455,6 +476,8 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
 
 /// `approve-bot sweep-once --local <dir> [--days 90] [--top 12] [--max-lines 25000] [--max-files 10] [--rank density|sum]`
 /// `approve-bot sweep-once --repo owner/name [--cache-dir <dir>] [--clear-cache] ...` reads an app-owned cache clone (kept fresh, see `repocache`) instead of a local folder.
+/// `--exclude <glob>` (repeatable) and `sweep-rules.json` in the config dir keep paths out of the sweep.
+/// `--slice <rank|name part> --dry-run [--model m] [--thinking n] [--max-candidates n]` has the model read that slice and prints ticket drafts (nothing is written anywhere); `--print-prompt` shows the prompt without calling the model.
 pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut local = String::new();
     let mut repo = String::new();
@@ -466,6 +489,13 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut max_files: usize = 10;
     // Value per unit of work: a day's cost grows with the lines a slice holds.
     let mut by = RankBy::Density;
+    let mut slice_sel: Option<String> = None;
+    let mut dry_run = false;
+    let mut print_prompt = false;
+    let mut model: Option<String> = None;
+    let mut thinking: Option<u32> = None;
+    let mut max_candidates: usize = crate::sweep_review::MAX_CANDIDATE_FILES;
+    let mut exclude: Vec<String> = Vec::new();
     let mut i = 0;
     while i < flags.len() {
         let name = flags[i].as_str();
@@ -482,6 +512,13 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             "--top" => top = value(&mut i)?.parse()?,
             "--max-lines" => max_lines = value(&mut i)?.parse()?,
             "--max-files" => max_files = value(&mut i)?.parse()?,
+            "--slice" => slice_sel = Some(value(&mut i)?),
+            "--dry-run" => dry_run = true,
+            "--print-prompt" => print_prompt = true,
+            "--model" => model = Some(value(&mut i)?),
+            "--thinking" => thinking = Some(value(&mut i)?.parse()?),
+            "--max-candidates" => max_candidates = value(&mut i)?.parse()?,
+            "--exclude" => exclude.push(value(&mut i)?),
             "--rank" => {
                 by = match value(&mut i)?.as_str() {
                     "sum" => RankBy::Sum,
@@ -499,11 +536,21 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     if repo.is_empty() && local.is_empty() {
         return Err(anyhow::anyhow!("--repo owner/name or --local <checkout dir> is required"));
     }
+    if slice_sel.is_some() && !dry_run && !print_prompt {
+        return Err(anyhow::anyhow!("--slice needs --dry-run (it reads and drafts, nothing is written anywhere) or --print-prompt"));
+    }
     let w = Weights::default();
     let mut notes = String::new();
-    let files = if repo.is_empty() {
-        let root = Path::new(&local);
-        scan_checkout(root, &churn_by_path(root, days)?)?
+    if let Ok(dir) = crate::eval_cli::config_dir() {
+        exclude.extend(load_exclude_paths(&dir));
+    }
+    if !exclude.is_empty() {
+        notes.push_str(&format!("제외 경로 {}개: {}\n", exclude.len(), exclude.join(", ")));
+    }
+    let (files, checkout, commit) = if repo.is_empty() {
+        let root = PathBuf::from(&local);
+        let commit = git(&root, &["rev-parse", "HEAD"]).map(|c| c.trim().to_string()).unwrap_or_else(|_| "local".into());
+        (scan_checkout(&root, &churn_by_path(&root, days)?, &exclude)?, root, commit)
     } else {
         let (owner, name) = crate::github::split_repo(&repo)?;
         let root = match &cache_root {
@@ -515,31 +562,95 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             crate::repocache::clear(&dir);
             return Ok(format!("캐시를 지웠다: {}", dir.display()));
         }
-        notes.push_str(&refresh_cache(owner, name, &dir)?);
-        let scan = |d: &Path| -> anyhow::Result<Vec<FileStat>> { scan_checkout(d, &churn_by_path(d, days)?) };
-        match scan(&dir) {
+        let (text, mut synced) = refresh_cache(owner, name, &dir)?;
+        notes.push_str(&text);
+        let scan = |d: &Path| -> anyhow::Result<Vec<FileStat>> { scan_checkout(d, &churn_by_path(d, days)?, &exclude) };
+        let files = match scan(&dir) {
             Ok(f) => f,
             // The sync was clean but the history cannot be read: the cache is
             // damaged somewhere the sync did not look. Rebuild it once.
             Err(e) if crate::repocache::is_corruption(&e.to_string()) => {
                 notes.push_str("이력을 읽지 못해(캐시 손상) 캐시를 지우고 다시 받는다\n");
                 crate::repocache::clear(&dir);
-                notes.push_str(&refresh_cache(owner, name, &dir)?);
+                let (text, again) = refresh_cache(owner, name, &dir)?;
+                notes.push_str(&text);
+                synced = again;
                 scan(&dir)?
             }
             Err(e) => return Err(e),
-        }
+        };
+        (files, dir, synced.commit)
     };
     let slices = rank(pack_slices(&files, &w, max_lines), by);
+    if let Some(sel) = &slice_sel {
+        let slice = pick_slice(&slices, sel)?;
+        return review_slice(&notes, slice, &files, &w, &checkout, &commit, max_candidates, max_files, print_prompt, model, thinking);
+    }
     let mut out = notes;
     out.push_str(&report(&files, &slices, &w, top));
     out.push_str(&volume_report(&volume(&files, &slices, max_files), max_files));
     Ok(out)
 }
 
+/// A slice by rank (1 = the top one) or by a part of its name.
+pub fn pick_slice<'a>(slices: &'a [Slice], sel: &str) -> anyhow::Result<&'a Slice> {
+    if let Ok(n) = sel.trim().parse::<usize>() {
+        return slices
+            .get(n.wrapping_sub(1))
+            .ok_or_else(|| anyhow::anyhow!("--slice {n}: only {} slices", slices.len()));
+    }
+    slices
+        .iter()
+        .find(|s| s.name.contains(sel))
+        .ok_or_else(|| anyhow::anyhow!("--slice {sel}: no slice has that in its name"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn review_slice(
+    notes: &str,
+    slice: &Slice,
+    files: &[FileStat],
+    w: &Weights,
+    checkout: &Path,
+    commit: &str,
+    max_candidates: usize,
+    max_files: usize,
+    print_prompt: bool,
+    model: Option<String>,
+    thinking: Option<u32>,
+) -> anyhow::Result<String> {
+    use crate::sweep_review as sr;
+    let lines: std::collections::HashMap<&str, usize> = files.iter().map(|f| (f.path.as_str(), f.lines)).collect();
+    let input = sr::SliceInput {
+        name: slice.name.clone(),
+        commit: commit.to_string(),
+        files: slice.files.iter().map(|p| (p.clone(), lines.get(p.as_str()).copied().unwrap_or(0))).collect(),
+        candidates: sr::candidates_for(slice, files, w, max_candidates),
+    };
+    let docs = sr::collect_rule_docs(checkout, &slice.files);
+    let prompt = sr::build_prompt(&input, &docs);
+    if print_prompt {
+        return Ok(format!("{notes}{prompt}\n\n(프롬프트 {}자 · 모델은 호출하지 않았다)\n", prompt.chars().count()));
+    }
+    let cfg = crate::config::AppConfig::default();
+    let model = model.unwrap_or(cfg.review_model);
+    let thinking = thinking.unwrap_or(cfg.review_thinking_tokens);
+    let run = sr::run_model(&prompt, &model, thinking, checkout);
+    let set: std::collections::BTreeSet<String> = slice.files.iter().cloned().collect();
+    let outcome = sr::evaluate(run, checkout, &set, max_files);
+    Ok(format!(
+        "{notes}조각 {} · 파일 {}개 · {}줄 · 모델 {model} · 생각 예산 {thinking} · 프롬프트 {}자\n{}",
+        slice.name,
+        slice.files.len(),
+        slice.lines,
+        prompt.chars().count(),
+        sr::report(&input, &outcome)
+    ))
+}
+
 /// Bring the cache clone of `owner/name` up to date and describe what happened:
 /// every failed attempt with its cause and the fix tried, then the result.
-fn refresh_cache(owner: &str, name: &str, dir: &Path) -> anyhow::Result<String> {
+fn refresh_cache(owner: &str, name: &str, dir: &Path) -> anyhow::Result<(String, crate::repocache::SyncOk)> {
     use crate::repocache::{self, Policy, RealGit};
     let token = crate::auth::fetch_gh_token().map_err(|e| anyhow::anyhow!("GitHub 토큰을 얻지 못함(gh 로그인 필요): {e}"))?;
     let git = RealGit::new(Some(token.clone()));
@@ -565,7 +676,7 @@ fn refresh_cache(owner: &str, name: &str, dir: &Path) -> anyhow::Result<String> 
                 mb,
                 if ok.shallow { " · ⚠️ 얕은 클론이라 변경 빈도가 0으로 나온다" } else { "" },
             ));
-            Ok(text)
+            Ok((text, ok))
         }
         Err(e) => Err(anyhow::anyhow!("{text}{e}")),
     }
@@ -718,6 +829,31 @@ mod tests {
         // gives the same count as grouping the whole repo.
         assert_eq!(v.by_kind_in_slice, v.by_kind);
         assert_eq!(volume(&[], &[], 10), Volume::default());
+    }
+
+    #[test]
+    fn exclude_paths_come_from_the_config_file_and_match_as_globs() {
+        let dir = std::env::temp_dir().join(format!("sweeprules-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(load_exclude_paths(&dir).is_empty(), "no file means no exclusions");
+        std::fs::write(dir.join("sweep-rules.json"), r#"{"exclude_paths":["layers/apis/**/*.api.ts","docs/**"],"other":1}"#).unwrap();
+        let g = load_exclude_paths(&dir);
+        assert_eq!(g, vec!["layers/apis/**/*.api.ts".to_string(), "docs/**".to_string()]);
+        assert!(is_excluded("layers/apis/cpid/src/getX.api.ts", &g));
+        assert!(!is_excluded("layers/apis/cpid/src/httpClient.ts", &g));
+        std::fs::write(dir.join("sweep-rules.json"), "not json").unwrap();
+        assert!(load_exclude_paths(&dir).is_empty(), "a broken file is ignored, not fatal");
+    }
+
+    #[test]
+    fn a_slice_is_picked_by_rank_or_by_part_of_its_name() {
+        let mk = |n: &str| Slice { name: n.into(), files: vec![], lines: 0, score: 0.0 };
+        let slices = vec![mk("layers/apis/cpid"), mk("layers/features/mamud/src/asset")];
+        assert_eq!(pick_slice(&slices, "1").unwrap().name, "layers/apis/cpid");
+        assert_eq!(pick_slice(&slices, " 2 ").unwrap().name, "layers/features/mamud/src/asset");
+        assert_eq!(pick_slice(&slices, "mamud").unwrap().name, "layers/features/mamud/src/asset");
+        assert!(pick_slice(&slices, "0").is_err() && pick_slice(&slices, "3").is_err());
+        assert!(pick_slice(&slices, "nope").is_err());
     }
 
     #[test]
