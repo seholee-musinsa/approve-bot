@@ -612,8 +612,8 @@ fn extract_review(result: &str) -> Result<(String, Verdict)> {
 }
 
 /// Read-only tool set the model may use in deep mode (no Bash/Write/network).
-const READ_ONLY_TOOLS: &str = "Read,Grep,Glob";
-const DENIED_TOOLS: &str = "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task";
+pub(crate) const READ_ONLY_TOOLS: &str = "Read,Grep,Glob";
+pub(crate) const DENIED_TOOLS: &str = "Bash,Write,Edit,NotebookEdit,WebFetch,WebSearch,Task";
 const TOOL_NOTE: &str = r#"=== 실행 환경 ===
 이 PR 의 head 가 현재 작업 디렉토리에 체크아웃되어 있습니다.
 Read/Grep/Glob 도구로 변경 파일은 물론 주변 코드·소비처·컨벤션 문서를 직접 열람해 검증하세요.
@@ -636,11 +636,11 @@ struct RunOpts<'a> {
 /// Blocking; call from `spawn_blocking`. Fails closed on any error.
 /// Wall-clock cap for one review. A hung `claude` used to block its thread
 /// forever and leave the PR unreviewed; now it fails closed and the gate holds.
-const CLAUDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+pub(crate) const CLAUDE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20 * 60);
 
 /// Spawn `cmd`, write `input` to its stdin, and collect output, killing the
 /// child after `timeout`. Readers run on threads so a full pipe can't deadlock.
-fn run_with_timeout(
+pub(crate) fn run_with_timeout(
     mut cmd: Command,
     input: &str,
     timeout: std::time::Duration,
@@ -814,7 +814,7 @@ fn run_claude(
     }
 }
 
-fn is_secret_env(key: &str) -> bool {
+pub(crate) fn is_secret_env(key: &str) -> bool {
     let k = key.to_ascii_uppercase();
     k.starts_with("GH_")
         || k == "GITHUB_TOKEN"
