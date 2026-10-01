@@ -9,6 +9,7 @@
 #          "this code + this guide".
 # [guide]  default: src-tauri/review-guide.md
 # [samples] default: 2 (one sample can't tell a real gain from noise)
+# SPLIT=dev|holdout|holdout2|all limits the cases (same meaning as in score2.mjs).
 # SAMPLE_FROM=<n> starts at sample n, so two shells can split the samples.
 # EXTRA="--thinking 12000 --model claude-opus-5-5" passes flags through to review-once.
 #
@@ -28,7 +29,8 @@ unset NODE_OPTIONS
 
 for f in eval/truth/*.json; do
   k=$(basename "$f" .json)
-  read -r repo pr sha kind <<<"$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['repo'],d['pr'],d['sha'],d.get('kind',''))" "$f")"
+  read -r repo pr sha kind split <<<"$(python3 -c "import json,sys;d=json.load(open(sys.argv[1]));print(d['repo'],d['pr'],d['sha'],d.get('kind',''),d.get('split','dev'))" "$f")"
+  [ -n "${SPLIT:-}" ] && [ "$SPLIT" != all ] && [ "$split" != "$SPLIT" ] && continue
   # Escaped cases pin the PR head at merge, which is what the PR diff already
   # is — and their base branch may be deleted, which breaks base...sha.
   pin=(--sha "$sha"); [ "$kind" = escaped ] && pin=()
