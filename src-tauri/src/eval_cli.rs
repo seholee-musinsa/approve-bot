@@ -298,6 +298,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
         "explored": outcome.explored,
         "omitted_files": outcome.omitted_files,
         "continued": outcome.continued,
+        "file_comments": outcome.file_comments.len(),
         "findings": outcome.findings,
         "followups": outcome.followups,
         "open_prev_blockers": round

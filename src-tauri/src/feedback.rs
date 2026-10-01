@@ -232,6 +232,7 @@ mod tests {
             body: body.into(),
             in_reply_to_id: reply_to,
             created_at: None,
+            subject_type: None,
         }
     }
 
