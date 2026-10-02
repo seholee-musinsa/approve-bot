@@ -71,6 +71,9 @@ pub struct Ledger {
     pub keys: BTreeMap<String, KeyOutcome>,
     #[serde(default)]
     pub carryover: Vec<Carried>,
+    /// 스케줄러가 마지막으로 실행(또는 켠) 시각, unix 초.
+    #[serde(default)]
+    pub last_run_at: Option<u64>,
 }
 
 impl Cycle {

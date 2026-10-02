@@ -261,7 +261,9 @@ async fn run_loop(app: AppHandle, state: Arc<AppState>) {
             // Not connected — try once, otherwise back off and wait.
             try_connect(&app, &state).await;
         } else {
+            state.pass_running.store(true, std::sync::atomic::Ordering::SeqCst);
             run_one_pass(&app, &state).await;
+            state.pass_running.store(false, std::sync::atomic::Ordering::SeqCst);
         }
 
         // Either sleep for the configured interval or wake early on user action.
