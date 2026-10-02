@@ -387,6 +387,19 @@ pub fn stable_key(path: &str, category: &str, symbol: &str) -> String {
     format!("{h:08x}")
 }
 
+/// Stable id of a finding: the file and the kind of problem, nothing the model
+/// words freely. The model picks a different symbol or title from run to run,
+/// so those stay out; one file's problems of one kind are one piece of work
+/// anyway (3.5). A rule finding adds the rule document it cites.
+pub fn finding_key(path: &str, category: Category, rule_ref: &str) -> String {
+    let rule = if category == Category::Rule {
+        doc_paths(rule_ref).first().map(|d| d.rsplit('/').next().unwrap_or(d).to_string()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    stable_key(path, category.name(), &rule)
+}
+
 fn clean_rel(path: &str) -> Option<&str> {
     let p = path.trim();
     if p.is_empty() || p.starts_with('/') || p.split('/').any(|c| c == "..") {
@@ -475,11 +488,18 @@ pub fn verify(raw: Vec<RawFinding>, root: &Path, slice_files: &BTreeSet<String>)
             related: r.related_paths.into_iter().filter(|p| clean_rel(p).is_some_and(|c| root.join(c).is_file())).collect(),
             title: r.title.trim().chars().take(100).collect(),
             prerequisite: r.prerequisite.trim().to_string(),
-            key: stable_key(rel, category.name(), r.symbol.trim()),
+            key: finding_key(rel, category, &r.rule_ref),
         };
+        // Findings with the same key are one piece of work. The surer one stays and
+        // carries the other's claim, so a second problem in the file is not lost.
         match kept.iter_mut().find(|k| k.key == finding.key) {
-            Some(existing) if finding.confidence > existing.confidence => *existing = finding,
-            Some(_) => {}
+            Some(existing) => {
+                let (mut win, lose) = if finding.confidence > existing.confidence { (finding, existing.clone()) } else { (existing.clone(), finding) };
+                if lose.claim != win.claim && !win.evidence.contains(&lose.claim) {
+                    win.evidence = format!("{}\n그 밖에: {}", win.evidence, lose.claim);
+                }
+                *existing = win;
+            }
             None => kept.push(finding),
         }
     }
@@ -1009,8 +1029,32 @@ mod tests {
         let (kept, _) = verify(vec![a, b], &root, &files(&["a.ts"]));
         assert_eq!(kept.len(), 1);
         assert_eq!((kept[0].confidence, kept[0].claim.as_str()), (90, "더 확실한 말"));
-        assert_eq!(kept[0].key, stable_key("a.ts", "debt", "x"));
-        assert_ne!(stable_key("a.ts", "debt", "x"), stable_key("a.ts", "rule", "x"));
+        assert_eq!(kept[0].key, finding_key("a.ts", Category::Debt, ""));
+        assert_ne!(finding_key("a.ts", Category::Debt, ""), finding_key("a.ts", Category::Rule, ""));
+        assert!(kept[0].evidence.contains("그 밖에"), "낮은 확신 쪽 주장은 근거에 남는다");
+    }
+
+    #[test]
+    fn key_does_not_depend_on_model_wording() {
+        let root = tmp("keystable");
+        write(&root, "a.ts", "const x = 1;\nconst y = 2;\n");
+        let mut a = raw("debt", "a.ts");
+        a.symbol = "x".into();
+        a.claim = "첫 번째 표현".into();
+        let mut b = raw("debt", "a.ts");
+        b.symbol = "y".into();
+        b.claim = "전혀 다른 표현".into();
+        let k = |r| verify(vec![r], &root, &files(&["a.ts"])).0[0].key.clone();
+        assert_eq!(k(a), k(b));
+        // 규칙 지적은 인용한 규칙 문서 이름이 같으면 같은 키(경로·표기가 달라도).
+        assert_eq!(
+            finding_key("a.ts", Category::Rule, "docs/rules/mcds-prefix.md §2"),
+            finding_key("a.ts", Category::Rule, "(mcds-prefix.md)")
+        );
+        assert_ne!(
+            finding_key("a.ts", Category::Rule, "mcds-prefix.md"),
+            finding_key("a.ts", Category::Rule, "s3-asset-url.md")
+        );
     }
 
     // ---- grouping and drafts ----
