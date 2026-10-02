@@ -16,6 +16,7 @@ mod trace;
 mod review;
 mod state;
 mod sweep;
+mod jira;
 mod sweep_day;
 mod sweep_review;
 mod sweep_state;

@@ -549,6 +549,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut day = false;
     let mut save = false;
     let mut open_tickets: usize = 0;
+    let mut open_tickets_given = false;
     let mut i = 0;
     while i < flags.len() {
         let name = flags[i].as_str();
@@ -574,7 +575,10 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             "--exclude" => exclude.push(value(&mut i)?),
             "--day" => day = true,
             "--save" => save = true,
-            "--open-tickets" => open_tickets = value(&mut i)?.parse()?,
+            "--open-tickets" => {
+                open_tickets = value(&mut i)?.parse()?;
+                open_tickets_given = true;
+            }
             "--rank" => {
                 by = match value(&mut i)?.as_str() {
                     "sum" => RankBy::Sum,
@@ -647,7 +651,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     };
     let slices = rank(pack_slices(&files, &w, max_lines), by);
     if day {
-        let ctx = DayCtx { notes: &notes, files: &files, w: &w, checkout: &checkout, commit: &commit, max_candidates, max_files, model, thinking, save, open_tickets };
+        let ctx = DayCtx { notes: &notes, files: &files, w: &w, checkout: &checkout, commit: &commit, max_candidates, max_files, model, thinking, save, open_tickets, open_tickets_given };
         return run_day(&ctx, &slices);
     }
     if let Some(sel) = &slice_sel {
@@ -749,10 +753,44 @@ struct DayCtx<'a> {
     thinking: Option<u32>,
     save: bool,
     open_tickets: usize,
+    open_tickets_given: bool,
 }
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Read-only Jira lookups for a day: (open bot tickets of the first assignee unless
+/// the count was given by hand, outcomes of tickets already holding these keys).
+/// `Ok(None)` when no Jira config exists.
+#[allow(clippy::type_complexity)]
+fn jira_view(
+    dir: &Path,
+    kept: &[crate::sweep_review::Finding],
+    now: u64,
+    count_given: bool,
+) -> anyhow::Result<Option<(Option<usize>, Vec<(String, crate::sweep_state::KeyOutcome)>)>> {
+    use crate::jira;
+    if !jira::config_path(dir).exists() {
+        return Ok(None);
+    }
+    let cfg = jira::load_config(dir)?;
+    let client = jira::Jira::connect(&cfg)?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    rt.block_on(async {
+        let open = match (count_given, cfg.assignees.first()) {
+            (false, Some(a)) => Some(client.count_open_bot(&cfg, a).await?),
+            _ => None,
+        };
+        let keys: Vec<String> = kept.iter().map(|f| f.key.clone()).collect();
+        let mut found = Vec::new();
+        for chunk in keys.chunks(50) {
+            for issue in client.search(&jira::jql_by_keys(chunk), 200).await? {
+                found.extend(jira::outcomes(&issue, now));
+            }
+        }
+        Ok(Some((open, found)))
+    })
 }
 
 /// Files that changed between two commits; empty when git cannot say.
@@ -807,9 +845,29 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         }
         return Ok(out);
     }
+    // Jira: open bot tickets (cap) and tickets that already hold these keys (3.3 b). Read only.
+    // If Jira cannot be read, nothing is created today: a day late beats a duplicate (3.3).
+    let mut view = ledger.clone();
+    let mut open_tickets = c.open_tickets;
+    match jira_view(&dir, &outcome.kept, now, c.open_tickets_given) {
+        Ok(Some((open, found))) => {
+            if let Some(n) = open {
+                open_tickets = n;
+            }
+            out.push_str(&format!("Jira 확인(읽기): 열린 봇 티켓 {open_tickets}건 · 같은 키 티켓 {}건\n", found.len()));
+            for (k, o) in found {
+                view.record(&k, o);
+            }
+        }
+        Ok(None) => out.push_str("Jira 설정(sweep-jira.json)이 없어 Jira 확인을 건너뛴다(열린 티켓 수는 --open-tickets 값)\n"),
+        Err(e) => {
+            open_tickets = usize::MAX / 2;
+            out.push_str(&format!("⚠️ Jira 를 읽지 못해 오늘은 만들지 않고 모두 이월한다: {e:#}\n"));
+        }
+    }
     let by_path: std::collections::HashMap<&str, f64> = c.files.iter().map(|f| (f.path.as_str(), score(f, c.w))).collect();
     let policy = sd::Policy { max_files: c.max_files, ..Default::default() };
-    let plan = sd::plan_day(outcome.kept.clone(), &ledger, &policy, now, c.open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
+    let plan = sd::plan_day(outcome.kept.clone(), &view, &policy, now, open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
     out.push_str(&format!(
         "지적 {}건 → 후보 {}건 · 오늘 만들 티켓 {}건 · 이월 {}건 · 걸러냄 {}건 (열린 봇 티켓 {} / 상한 {})\n",
         outcome.kept.len(),
@@ -817,7 +875,7 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         plan.create.len(),
         plan.carry.len(),
         plan.skipped.len(),
-        c.open_tickets,
+        open_tickets.min(9999),
         policy.open_cap
     ));
     for (key, why) in &plan.skipped {
