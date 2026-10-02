@@ -527,6 +527,7 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
 /// `approve-bot sweep-once --repo owner/name [--cache-dir <dir>] [--clear-cache] ...` reads an app-owned cache clone (kept fresh, see `repocache`) instead of a local folder.
 /// `--exclude <glob>` (repeatable) and `sweep-rules.json` in the config dir keep paths out of the sweep.
 /// `--day [--save] [--open-tickets n]` takes the next slice of the cycle in the ledger (`sweep-state.json` in the config dir), reads it, and prints what would be created today and what is carried over; `--save` also writes the ledger (nothing else is written; Jira is not touched, so the open-ticket count is given by hand).
+/// `--reset-cycle` starts the cycle over (slices unread, carry-over dropped; the key history stays).
 /// `--create [--create-max n]` (with `--day`) really creates the day's tickets in Jira, only when `sweep-jira.json` has `allow_create: true`; it implies `--save` so the created keys are recorded.
 /// `--slice <rank|name part> --dry-run [--model m] [--thinking n] [--max-candidates n]` has the model read that slice and prints ticket drafts (nothing is written anywhere); `--print-prompt` shows the prompt without calling the model.
 pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
@@ -552,6 +553,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut open_tickets: usize = 0;
     let mut open_tickets_given = false;
     let mut create = false;
+    let mut reset_cycle = false;
     let mut create_max: usize = usize::MAX;
     let mut i = 0;
     while i < flags.len() {
@@ -578,6 +580,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             "--exclude" => exclude.push(value(&mut i)?),
             "--day" => day = true,
             "--create" => create = true,
+            "--reset-cycle" => reset_cycle = true,
             "--create-max" => create_max = value(&mut i)?.parse()?,
             "--save" => save = true,
             "--open-tickets" => {
@@ -594,6 +597,19 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
         i += 1;
+    }
+    if reset_cycle {
+        // Back to the start of a cycle: every slice unread, carry-over dropped. The
+        // record of keys (created, rejected) stays so nothing is proposed twice.
+        let dir = crate::eval_cli::config_dir()?;
+        let mut ledger = crate::sweep_state::load(&dir);
+        let had = ledger.cycle.as_ref().map(|c| (c.done_count(), c.slices.len()));
+        ledger.reset_cycle();
+        crate::sweep_state::save(&dir, &ledger)?;
+        return Ok(match had {
+            Some((d, n)) => format!("바퀴를 초기화했다(읽은 조각 {d}/{n} 를 비움, 이월분 비움). 키 이력 {}건은 그대로 둔다\n", ledger.keys.len()),
+            None => format!("진행 중인 바퀴가 없었다. 이월분만 비웠다. 키 이력 {}건은 그대로 둔다\n", ledger.keys.len()),
+        });
     }
     if !repo.is_empty() && !local.is_empty() {
         return Err(anyhow::anyhow!("--repo and --local cannot be used together"));
@@ -778,10 +794,9 @@ fn create_tickets(
     plan: &crate::sweep_day::DayPlan,
     slice: &str,
     commit: &str,
-    max: usize,
     now: u64,
     ledger: &mut crate::sweep_state::Ledger,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, Vec<usize>)> {
     use crate::{jira, sweep_review as sr, sweep_state::KeyOutcome};
     let cfg = jira::load_config(dir)?;
     if !cfg.allow_create {
@@ -790,8 +805,10 @@ fn create_tickets(
     let client = jira::Jira::connect(&cfg)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut text = String::new();
-    for d in plan.create.iter().take(max) {
-        let mut body = sr::render_ticket(d, &plan.kept, slice, commit);
+    let mut failed = Vec::new();
+    for (n, d) in plan.create.iter().enumerate() {
+        let (sl, cm) = origin(&plan.kept, d, slice, commit);
+        let mut body = sr::render_ticket(d, &plan.kept, &sl, &cm);
         let keys: Vec<String> = d.findings.iter().map(|&i| plan.kept[i].key.clone()).collect();
         let prev: Vec<&String> = keys.iter().filter_map(|k| plan.recurrences.get(k)).collect();
         if let Some(p) = prev.first() {
@@ -805,10 +822,20 @@ fn create_tickets(
                 }
                 text.push_str(&format!("생성: {key} {}\n", d.title));
             }
-            Err(e) => text.push_str(&format!("⚠️ 생성 실패 {}: {e:#}\n", d.title)),
+            Err(e) => {
+                failed.push(n);
+                text.push_str(&format!("⚠️ 생성 실패 {}: {e:#}\n", d.title));
+            }
         }
     }
-    Ok(text)
+    Ok((text, failed))
+}
+
+/// Slice and commit a draft was read from (its first finding); today's when unknown.
+fn origin(kept: &[crate::sweep_review::Finding], d: &crate::sweep_review::TicketDraft, slice: &str, commit: &str) -> (String, String) {
+    let f = d.findings.first().and_then(|&i| kept.get(i));
+    let pick = |v: Option<&String>, dflt: &str| v.filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| dflt.to_string());
+    (pick(f.map(|f| &f.slice), slice), pick(f.map(|f| &f.commit), commit))
 }
 
 /// Read-only Jira lookups for a day: (open bot tickets of the first assignee unless
@@ -896,11 +923,22 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         }
         return Ok(out);
     }
+    // Findings left over from earlier days come first; they compete with today's by risk.
+    let mut incoming = outcome.kept.clone();
+    for f in &mut incoming {
+        f.slice = slice.name.clone();
+        f.commit = c.commit.to_string();
+    }
+    let carried: Vec<_> = ledger.take_carried(usize::MAX).into_iter().flat_map(|x| x.findings).collect();
+    if !carried.is_empty() {
+        out.push_str(&format!("이월분 지적 {}건을 오늘 후보에 합친다\n", carried.len()));
+    }
+    let incoming: Vec<_> = carried.into_iter().chain(incoming).collect();
     // Jira: open bot tickets (cap) and tickets that already hold these keys (3.3 b). Read only.
     // If Jira cannot be read, nothing is created today: a day late beats a duplicate (3.3).
     let mut view = ledger.clone();
     let mut open_tickets = c.open_tickets;
-    match jira_view(&dir, &outcome.kept, now, c.open_tickets_given) {
+    match jira_view(&dir, &incoming, now, c.open_tickets_given) {
         Ok(Some((open, found))) => {
             if let Some(n) = open {
                 open_tickets = n;
@@ -918,10 +956,10 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     }
     let by_path: std::collections::HashMap<&str, f64> = c.files.iter().map(|f| (f.path.as_str(), score(f, c.w))).collect();
     let policy = sd::Policy { max_files: c.max_files, ..Default::default() };
-    let plan = sd::plan_day(outcome.kept.clone(), &view, &policy, now, open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
+    let mut plan = sd::plan_day(incoming.clone(), &view, &policy, now, open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
     out.push_str(&format!(
         "지적 {}건 → 후보 {}건 · 오늘 만들 티켓 {}건 · 이월 {}건 · 걸러냄 {}건 (열린 봇 티켓 {} / 상한 {})\n",
-        outcome.kept.len(),
+        incoming.len(),
         plan.kept.len(),
         plan.create.len(),
         plan.carry.len(),
@@ -932,17 +970,37 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     for (key, why) in &plan.skipped {
         out.push_str(&format!("  걸러냄 {key}: {why:?}\n"));
     }
+    // What is not created today is carried over, not lost: the cap, a hand limit,
+    // a failed create, or a save without --create.
+    if c.create && plan.create.len() > c.create_max {
+        let rest = plan.create.split_off(c.create_max);
+        plan.carry.extend(rest);
+    }
     for d in &plan.create {
-        out.push_str(&format!("\n### 생성: {}\n{}\n", d.title, sr::render_ticket(d, &plan.kept, &input.name, c.commit)));
+        let (sl, cm) = origin(&plan.kept, d, &input.name, c.commit);
+        out.push_str(&format!("\n### 생성: {}\n{}\n", d.title, sr::render_ticket(d, &plan.kept, &sl, &cm)));
+    }
+    if c.create && !plan.create.is_empty() {
+        match create_tickets(&dir, &plan, &input.name, c.commit, now, &mut ledger) {
+            Ok((text, failed)) => {
+                out.push_str(&text);
+                for i in failed.into_iter().rev() {
+                    let d = plan.create.remove(i);
+                    plan.carry.push(d);
+                }
+            }
+            Err(e) => {
+                out.push_str(&format!("⚠️ 생성하지 못했다: {e:#}\n"));
+                let all = std::mem::take(&mut plan.create);
+                plan.carry.extend(all);
+            }
+        }
+    } else if c.save && !plan.create.is_empty() {
+        let all = std::mem::take(&mut plan.create);
+        plan.carry.extend(all);
     }
     for d in &plan.carry {
         out.push_str(&format!("이월: {}\n", d.title));
-    }
-    if c.create && !plan.create.is_empty() {
-        match create_tickets(&dir, &plan, &input.name, c.commit, c.create_max, now, &mut ledger) {
-            Ok(text) => out.push_str(&text),
-            Err(e) => out.push_str(&format!("⚠️ 생성하지 못했다: {e:#}\n")),
-        }
     }
     ledger.mark_read(&slice.name, c.commit, now);
     sd::park(&mut ledger, &plan, c.commit);

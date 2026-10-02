@@ -369,6 +369,12 @@ pub struct Finding {
     /// Stable id: path, category and symbol. The model's wording is left out
     /// because it changes from run to run (requirement 3.2).
     pub key: String,
+    /// Slice and commit the finding came from. Set by the caller after verification
+    /// so a carried-over finding still says where it was read.
+    #[serde(default)]
+    pub slice: String,
+    #[serde(default)]
+    pub commit: String,
 }
 
 #[derive(Debug, Clone)]
@@ -489,6 +495,8 @@ pub fn verify(raw: Vec<RawFinding>, root: &Path, slice_files: &BTreeSet<String>)
             title: r.title.trim().chars().take(100).collect(),
             prerequisite: r.prerequisite.trim().to_string(),
             key: finding_key(rel, category, &r.rule_ref),
+            slice: String::new(),
+            commit: String::new(),
         };
         // Findings with the same key are one piece of work. The surer one stays and
         // carries the other's claim, so a second problem in the file is not lost.
@@ -1077,6 +1085,8 @@ mod tests {
             title: String::new(),
             prerequisite: String::new(),
             key: stable_key(path, cat.name(), "sym"),
+            slice: String::new(),
+            commit: String::new(),
         }
     }
 
