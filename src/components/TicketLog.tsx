@@ -4,7 +4,7 @@ import type { TicketRow } from "../lib/types";
 
 const REFRESH_MS = 60_000;
 
-/** 봇이 만든 티켓을 최신순으로 쌓아 보여 주고, 누르면 Jira 로 이동한다(읽기 전용). */
+/** 자동 생성 티켓을 최신순으로 쌓아 보여 주고, 누르면 Jira 로 이동한다(읽기 전용). */
 export function TicketLog() {
   const [rows, setRows] = useState<TicketRow[]>([]);
   const [err, setErr] = useState<string | null>(null);
@@ -64,7 +64,7 @@ export function TicketLog() {
                 <div className="muted">
                   {r.assignee ?? "담당자 없음"} · {r.status}
                   {r.resolution ? ` (${r.resolution})` : ""}
-                  {!r.has_parent && " · ⚠ 부모 없음"}
+                  {!r.has_parent && " · ⚠ 상위 에픽 없음"}
                 </div>
               </span>
               {r.url && (

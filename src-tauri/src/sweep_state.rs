@@ -81,6 +81,20 @@ pub struct Ledger {
     pub last_monthly_at: Option<u64>,
 }
 
+impl RejectReason {
+    /// 사람이 읽는 거절 사유(티켓 코멘트 안내와 같은 말).
+    pub fn label(self) -> &'static str {
+        match self {
+            RejectReason::Wrong => "내용이 틀림",
+            RejectReason::LowValue => "가치 낮음",
+            RejectReason::SizeTiming => "지금은 어려움",
+            RejectReason::Duplicate => "중복",
+            RejectReason::AlreadyFixed => "이미 해결",
+            RejectReason::Unknown => "사유 없음",
+        }
+    }
+}
+
 impl Cycle {
     fn is_open(e: &SliceEntry) -> bool {
         matches!(e.status, SliceStatus::Pending | SliceStatus::Failed { .. })

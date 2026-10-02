@@ -58,15 +58,15 @@ export function JiraPanels() {
         <Row label="프로젝트">
           <input type="text" value={v.project} onChange={(e) => setV({ ...v, project: e.target.value })} />
         </Row>
-        <Row label="부모 Epic">
+        <Row label="상위 에픽">
           <input
             type="text"
-            placeholder="비우면 부모 없이 만들고 나중에 지정"
+            placeholder="비우면 상위 에픽 없이 만들고 나중에 지정"
             value={v.parent_key}
             onChange={(e) => setV({ ...v, parent_key: e.target.value })}
           />
         </Row>
-        <Row label="열린 봇 티켓 상한">
+        <Row label="열린 자동 생성 티켓 상한">
           <input
             type="number"
             style={{ maxWidth: 96 }}
@@ -78,7 +78,7 @@ export function JiraPanels() {
               if (Number.isFinite(n)) setV({ ...v, open_cap: Math.min(100, Math.max(1, Math.round(n))) });
             }}
           />
-          <span className="muted">한 사람 기준, 이 수에 이르면 새 티켓을 만들지 않고 이월</span>
+          <span className="muted">한 사람 기준, 이 수에 이르면 새 티켓을 만들지 않고 대기</span>
         </Row>
         <Row label="Jira 쓰기 허용">
           <span className={v.allow_create ? "error-text" : "muted"}>

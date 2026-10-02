@@ -1,7 +1,7 @@
-//! Jira 연동(정기 스윕 4단계). 읽기(검색·열린 티켓 수·결과 수집)와 쓰기(생성·배정)를 나눈다.
+//! Jira 연동(코드 정기 점검 4단계). 읽기(검색·열린 티켓 수·결과 수집)와 쓰기(생성·배정)를 나눈다.
 //!
 //! 자격은 `~/.config/jira.env` 를 호출 시점에 읽고 로그·오류에 남기지 않는다.
-//! 사이트 고유 값(cloud id, 프로젝트, 부모 Epic 등)은 설정 폴더의 `sweep-jira.json` 에 둔다(공개 repo 에 넣지 않는다).
+//! 사이트 고유 값(cloud id, 프로젝트, 상위 에픽 등)은 설정 폴더의 `sweep-jira.json` 에 둔다(공개 repo 에 넣지 않는다).
 //! 쓰기는 설정의 `allow_create` 가 true 일 때만 호출부가 부를 수 있다.
 
 use crate::sweep_state::{KeyOutcome, RejectReason};
@@ -37,7 +37,7 @@ pub struct JiraConfig {
     pub bot_label: String,
     #[serde(default = "d_estimate_field")]
     pub estimate_field: String,
-    /// 부모 Epic. 비우면 부모 없이 만든다(나중에 일괄 지정).
+    /// 상위 에픽(Jira 의 부모). 비우면 상위 에픽 없이 만든다(나중에 일괄 지정).
     #[serde(default)]
     pub parent_key: Option<String>,
     /// 담당자 accountId 목록(카나리: 본인 한 명).
@@ -49,7 +49,7 @@ pub struct JiraConfig {
     /// Jira 사이트 주소(티켓 링크용). 비어 있으면 처음 필요할 때 API 로 알아내 저장한다.
     #[serde(default)]
     pub site_url: String,
-    /// 한 사람의 열린 봇 티켓 상한(5.5).
+    /// 한 사람의 열린 자동 생성 티켓 상한(5.5).
     #[serde(default = "d_open_cap")]
     pub open_cap: usize,
     /// 쓰기 허용. 기본 false.
@@ -107,7 +107,7 @@ pub fn key_label(key: &str) -> String {
     format!("{KEY_LABEL_PREFIX}{key}")
 }
 
-/// 이 담당자의 열린 봇 티켓(5.3).
+/// 이 담당자의 열린 자동 생성 티켓(5.3).
 pub fn jql_open_bot(c: &JiraConfig, assignee: &str) -> String {
     format!(
         "labels = \"{}\" AND assignee = \"{}\" AND statusCategory != Done",
@@ -270,11 +270,11 @@ pub fn reject_reason_from_comments(comments: &[String]) -> RejectReason {
         let first = c.trim().lines().next().unwrap_or("").trim();
         if let Some(rest) = first.strip_prefix("사유:").or_else(|| first.strip_prefix("사유：")) {
             let r = rest.trim();
-            return if r.contains("사실 틀림") {
+            return if r.contains("내용이 틀림") || r.contains("사실 틀림") {
                 RejectReason::Wrong
             } else if r.contains("가치 낮음") {
                 RejectReason::LowValue
-            } else if r.contains("크기") {
+            } else if r.contains("지금은 어려움") || r.contains("크기") {
                 RejectReason::SizeTiming
             } else if r.contains("중복") {
                 RejectReason::Duplicate
@@ -315,7 +315,7 @@ pub fn outcomes(issue: &Issue, now: u64) -> Vec<(String, KeyOutcome)> {
         .collect()
 }
 
-/// 봇 티켓 결과 집계(채택률). 보류는 채택률의 분모에서 빼고 방치로 따로 센다.
+/// 자동 생성 티켓 결과 집계(반영률). 30일 넘게 열린 티켓은 반영률의 분모에서 빼고 따로 센다.
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Results {
     pub total: usize,
@@ -332,7 +332,7 @@ pub struct Results {
     pub no_reason: usize,
     /// done / (done + rejected), 퍼센트. 결과가 없으면 None.
     pub adoption_percent: Option<f64>,
-    /// 전환 기준(결과 난 건 10건 이상, 채택률 60% 이상)을 넘었는가.
+    /// 확대 기준(결과 난 건 10건 이상, 반영률 60% 이상)을 넘었는가.
     pub ready_to_expand: bool,
 }
 
@@ -372,12 +372,12 @@ pub fn results(issues: &[Issue], now: u64, stale_days: u64) -> Results {
     r
 }
 
-/// 이 설정으로 만든 봇 티켓 전부.
+/// 이 설정으로 만든 자동 생성 티켓 전부.
 pub fn jql_bot_all(c: &JiraConfig) -> String {
     format!("labels = \"{}\"", c.bot_label)
 }
 
-/// 부모가 없는 봇 티켓(4.14). 사람이 만든 KTLO 티켓이 섞이지 않게 봇 라벨을 함께 쓴다.
+/// 상위 에픽이 없는 자동 생성 티켓(4.14). 사람이 만든 KTLO 티켓이 섞이지 않게 봇 라벨을 함께 쓴다.
 pub fn jql_bot_orphans(c: &JiraConfig) -> String {
     format!("labels = \"{}\" AND parent is EMPTY", c.bot_label)
 }
@@ -503,7 +503,7 @@ impl Jira {
         Ok(parse_users(&v))
     }
 
-    /// 읽기: 부모 Epic 의 (제목, 완료 여부).
+    /// 읽기: 상위 에픽의 (제목, 완료 여부).
     pub async fn issue_brief(&self, key: &str) -> Result<(String, bool)> {
         let resp = self
             .http
@@ -518,7 +518,7 @@ impl Jira {
         Ok((title, done))
     }
 
-    /// 쓰기: 티켓의 부모 Epic 지정. 호출부가 `allow_create` 를 확인한다.
+    /// 쓰기: 티켓의 상위 에픽 지정. 호출부가 `allow_create` 를 확인한다.
     pub async fn set_parent(&self, c: &JiraConfig, key: &str, parent: &str) -> Result<()> {
         if !c.allow_create {
             return Err(anyhow!("sweep-jira.json 의 allow_create 가 false 다"));
@@ -621,6 +621,9 @@ mod tests {
         assert_eq!(r("사유: 사실 틀림\n이 파일은 이미 분리됨"), RejectReason::Wrong);
         assert_eq!(r("사유: 가치 낮음"), RejectReason::LowValue);
         assert_eq!(r("사유: 크기·시점"), RejectReason::SizeTiming);
+        // 새 안내 문구와 예전 문구를 모두 읽는다.
+        assert_eq!(r("사유: 내용이 틀림"), RejectReason::Wrong);
+        assert_eq!(r("사유: 지금은 어려움(크기·시점)"), RejectReason::SizeTiming);
         assert_eq!(r("사유: 중복"), RejectReason::Duplicate);
         assert_eq!(r("사유: 이미 해결"), RejectReason::AlreadyFixed);
         assert_eq!(r("그냥 닫음"), RejectReason::Unknown);
@@ -686,7 +689,7 @@ mod tests {
         // 결과가 10건 미만이면 판단하지 않는다.
         let few = results(&v[..5], now, 30);
         assert!(!few.ready_to_expand);
-        // 채택률이 낮으면 건수가 충분해도 넓히지 않는다.
+        // 반영률이 낮으면 건수가 충분해도 넓히지 않는다.
         let low: Vec<_> = (0..10).map(|n| mk(true, Some(if n < 3 { "Done" } else { "Won't Do" }), 1, &[])).collect();
         assert!(!results(&low, now, 30).ready_to_expand);
         assert_eq!(results(&[], now, 30).adoption_percent, None);

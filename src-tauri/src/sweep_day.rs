@@ -40,6 +40,20 @@ pub enum Skip {
     Cooling,
 }
 
+impl Skip {
+    /// 걸러낸 이유를 사람이 읽는 말로(실행 기록에 보인다).
+    pub fn label(&self) -> String {
+        match self {
+            Skip::LowConfidence => "확신이 낮아 제외".into(),
+            Skip::SameRun => "같은 실행에서 이미 나옴".into(),
+            Skip::Carried => "이미 대기 중인 후보".into(),
+            Skip::Ticketed(t) => format!("이미 티켓 {t} 가 있음"),
+            Skip::Rejected(r) => format!("이전에 거절됨({})", r.label()),
+            Skip::Cooling => "거절 뒤 재제안 대기 기간".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
     New,

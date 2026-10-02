@@ -95,7 +95,7 @@ impl Failure {
             Failure::RateLimit => "속도 제한",
             Failure::NotFound => "repo 없음 또는 권한 없음",
             Failure::Locked => "잠금 파일",
-            Failure::Corrupt => "캐시 손상",
+            Failure::Corrupt => "저장소 사본 손상",
             Failure::DiskFull => "디스크 부족",
             Failure::Unknown => "원인 미상",
         }
