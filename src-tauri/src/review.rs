@@ -49,12 +49,13 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것) ===
 {"verdict":"approve|comment|request_changes","score":<0-5>,"blocking_issues":["suspicious-instruction 같은 엔진 규칙 위반만"],
  "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
    "symbol":"<함수·컴포넌트 이름>","claim":"<한 문장: 무엇이 틀렸나>","repro":"<어떤 입력·상태에서 무엇이 잘못 나오나>",
-   "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>","fix":"<고치는 방법, 대안이 있으면 A/B>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>","fix_code":"<선택: 여러 줄 수정 후 코드>"}]}
+   "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>","fix":"<고치는 방법, 대안이 있으면 A/B>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>","end_line":<fix_code 가 line~end_line 구간을 통째로 바꿀 때 마지막 줄 번호, 아니면 null>,"fix_code":"<선택: 여러 줄 수정 후 코드>"}]}
 ```
 - findings 는 본문 `# 발견`·`# 질문`에 적은 항목과 같아야 한다(없으면 []). blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 본문에만 남는다.
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
-- suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌거나 diff 밖이면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다(일반 코드 블록으로 달린다).
+- suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다.
+- fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 그러면 작성자가 버튼 한 번으로 적용할 수 있는 제안(suggestion)으로 달린다. 구간이 이어지지 않거나 diff 밖이거나 30줄을 넘으면 end_line 은 null 로 두고, fix_code 는 일반 코드 블록으로 달린다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
 - major·minor 는 fix·suggestion·fix_code 중 하나가 있어야 인라인으로 달린다. 고치는 방법을 모르면 question 으로 내린다.
 - 재리뷰 블록이 있으면 JSON 에 `"followups":[{"id":"<이전 지적 f:id>","status":"resolved|partial|unresolved|wont_fix|withdrawn","note":"<근거 한 줄>"}]` 를 이전 지적마다 하나씩 넣는다.
 - 이 JSON 은 게이트 판정과 인라인 코멘트 게시에 쓰인다."#;
@@ -407,10 +408,13 @@ pub struct Finding {
     pub fix: String,
     #[serde(default)]
     pub suggestion: String,
-    /// Multi-line corrected code. Rendered as a plain code block, not a
-    /// GitHub `suggestion` (which can only replace the anchored line).
+    /// Multi-line corrected code. A plain code block, unless `end_line` names
+    /// the contiguous diff range it replaces (then a GitHub `suggestion`).
     #[serde(default)]
     pub fix_code: String,
+    /// Last line of the range `fix_code` replaces (`line` is the first).
+    #[serde(default)]
+    pub end_line: Option<u64>,
 }
 
 impl Finding {
@@ -445,7 +449,43 @@ fn severity_label(sev: &str) -> (&'static str, &'static str) {
     }
 }
 
+/// A fence long enough that the code inside cannot close it.
+fn fence(code: &str) -> String {
+    let mut longest = 0;
+    let mut run = 0;
+    for c in code.chars() {
+        if c == '`' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    "`".repeat((longest + 1).max(3))
+}
+
+/// Longest range a multi-line suggestion may replace.
+const MAX_SUGGESTION_LINES: u64 = 30;
+
+/// The range `fix_code` replaces, when it can be a one-click `suggestion`:
+/// `line..=end_line` must be a short, contiguous run of RIGHT-side diff lines
+/// of one file. A wrong range would corrupt code when applied, so anything
+/// doubtful returns None and the code stays a plain block.
+fn suggestion_range(f: &Finding, allowed: &HashMap<String, HashSet<u64>>) -> Option<(u64, u64)> {
+    let (start, end) = (f.line?, f.end_line?);
+    if f.fix_code.trim().is_empty() || end <= start || end - start + 1 > MAX_SUGGESTION_LINES {
+        return None;
+    }
+    let set = allowed.get(&f.path)?;
+    (start..=end).all(|l| set.contains(&l)).then_some((start, end))
+}
+
 fn render_inline(f: &Finding) -> String {
+    render_inline_with(f, false)
+}
+
+/// `as_range`: render `fix_code` as a `suggestion` (the caller verified the range).
+fn render_inline_with(f: &Finding, as_range: bool) -> String {
     let (emoji, label) = severity_label(&f.severity);
     let conf = f.confidence.map(|c| format!(" (확신 {c:.0})")).unwrap_or_default();
     let mut out = format!("{emoji} **{label}**{conf} — {}", f.claim.trim());
@@ -457,9 +497,17 @@ fn render_inline(f: &Finding) -> String {
         }
     }
     if !f.suggestion.trim().is_empty() {
-        out.push_str(&format!("\n\n```suggestion\n{}\n```", f.suggestion.trim_end()));
+        let code = f.suggestion.trim_end();
+        let fe = fence(code);
+        out.push_str(&format!("\n\n{fe}suggestion\n{code}\n{fe}"));
     } else if !f.fix_code.trim().is_empty() {
-        out.push_str(&format!("\n\n```\n{}\n```", f.fix_code.trim_end()));
+        let code = f.fix_code.trim_end();
+        let fe = fence(code);
+        if as_range {
+            out.push_str(&format!("\n\n{fe}suggestion\n{code}\n{fe}"));
+        } else {
+            out.push_str(&format!("\n\n{fe}\n{code}\n{fe}"));
+        }
     }
     if !f.evidence.trim().is_empty() {
         out.push_str(&format!("\n\n<details>\n<summary>근거</summary>\n\n{}\n\n</details>", f.evidence.trim()));
@@ -497,11 +545,13 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
         let anchored = f
             .line
             .is_some_and(|l| allowed.get(&f.path).is_some_and(|set| set.contains(&l)));
-        if postable && anchored {
-            split.inline.push(ReviewComment {
-                path: f.path.clone(),
-                line: f.line.unwrap_or(0),
-                body: render_inline(f),
+        // A single-line `suggestion` wins; otherwise a verified range turns
+        // `fix_code` into a one-click suggestion.
+        let range = if f.suggestion.trim().is_empty() { suggestion_range(f, &allowed) } else { None };
+        if postable && (anchored || range.is_some()) {
+            split.inline.push(match range {
+                Some((start, end)) => ReviewComment { path: f.path.clone(), line: end, start_line: Some(start), body: render_inline_with(f, true) },
+                None => ReviewComment { path: f.path.clone(), line: f.line.unwrap_or(0), start_line: None, body: render_inline(f) },
             });
         } else if matches!(f.severity.as_str(), "blocker" | "major") {
             // Still listed in the body, so a failed file comment loses nothing.
@@ -579,6 +629,7 @@ fn filter_inline(raw: Vec<InlineRaw>, diff: &str) -> Vec<ReviewComment> {
         .map(|c| ReviewComment {
             path: c.path,
             line: c.line,
+            start_line: None,
             body: c.comment,
         })
         .collect()
@@ -1213,7 +1264,7 @@ mod tests {
         let known = finding("major", 80.0, "src/x.ts", Some(11), "이미 지적");
         let mut first = outcome(vec![known.clone()], vec![]);
         let new_blocker = finding("blocker", 90.0, "src/x.ts", Some(12), "쓰기 권한 확인 없음");
-        let mut second = outcome(vec![known, new_blocker], vec![ReviewComment { path: "src/x.ts".into(), line: 12, body: "b".into() }]);
+        let mut second = outcome(vec![known, new_blocker], vec![ReviewComment { path: "src/x.ts".into(), line: 12, start_line: None, body: "b".into() }]);
         second.body = "# 재점검\n- ❌ 권한 — 라우터 확인 → 쓰기 권한 없음".into();
         second.blocking_issues = vec!["쓰기 권한 확인 없음 (src/x.ts)".into()];
         merge_second_pass(&mut first, second);
@@ -1232,7 +1283,7 @@ mod tests {
         let mut first = outcome(vec![known.clone()], vec![]);
         let mut extra = outcome(
             vec![known, finding("blocker", 90.0, "src/b.ts", Some(12), "b 에서 권한 확인 없음")],
-            vec![ReviewComment { path: "src/b.ts".into(), line: 12, body: "b".into() }],
+            vec![ReviewComment { path: "src/b.ts".into(), line: 12, start_line: None, body: "b".into() }],
         );
         extra.score = 3.5;
         extra.cost_usd = Some(0.7);
@@ -1339,13 +1390,75 @@ mod tests {
     fn fix_code_renders_as_plain_block_and_suggestion_wins() {
         let mut f = finding("minor", 80.0, "src/x.ts", Some(11), "c");
         f.fix_code = "if (!a?.length) return;\nrun(a);".into();
-        let body = render_inline(&f);
+        let body = render_inline(&f); // 범위가 없으면(render_inline) 일반 코드 블록
         assert!(body.contains("```\nif (!a?.length) return;\nrun(a);\n```"));
         assert!(!body.contains("```suggestion"));
         f.suggestion = "const y = 2;".into();
         let body = render_inline(&f);
         assert!(body.contains("```suggestion\nconst y = 2;\n```"));
         assert!(!body.contains("run(a);"), "one block only");
+    }
+
+    fn ranged(start: u64, end: Option<u64>, code: &str) -> Finding {
+        let mut f = finding("major", 85.0, "src/x.ts", Some(start), "범위 수정");
+        f.end_line = end;
+        f.fix_code = code.into();
+        f
+    }
+
+    #[test]
+    fn contiguous_diff_range_becomes_a_multi_line_suggestion() {
+        // SAMPLE_DIFF 의 오른쪽 줄: 10(맥락) 11·12(추가) 13(맥락) 은 모두 이어진다.
+        let s = split_findings(&[ranged(11, Some(13), "a();\nb();\nc();")], SAMPLE_DIFF);
+        assert_eq!(s.inline.len(), 1);
+        let c = &s.inline[0];
+        assert_eq!((c.start_line, c.line), (Some(11), 13), "start_line=first, line=last");
+        assert!(c.body.contains("```suggestion\na();\nb();\nc();\n```"), "{}", c.body);
+    }
+
+    #[test]
+    fn doubtful_ranges_stay_plain_blocks() {
+        let plain = |f: Finding| {
+            let s = split_findings(&[f], SAMPLE_DIFF);
+            assert_eq!(s.inline.len(), 1, "still posted (anchored on its first line)");
+            assert_eq!(s.inline[0].start_line, None);
+            assert!(!s.inline[0].body.contains("```suggestion"));
+            assert!(s.inline[0].body.contains("a();"));
+        };
+        plain(ranged(11, None, "a();"));            // end_line 없음
+        plain(ranged(12, Some(12), "a();"));        // 한 줄짜리 범위
+        plain(ranged(12, Some(11), "a();"));        // 거꾸로
+        plain(ranged(11, Some(14), "a();"));        // 14 는 diff 밖 → 이어지지 않음
+        plain(ranged(10, Some(99), "a();"));        // 한참 밖
+    }
+
+    #[test]
+    fn single_line_suggestion_wins_over_a_range_and_fences_grow_around_backticks() {
+        let mut f = ranged(11, Some(12), "a();\nb();");
+        f.suggestion = "const y = 2;".into();
+        let s = split_findings(&[f], SAMPLE_DIFF);
+        assert_eq!(s.inline[0].start_line, None, "single-line suggestion keeps the old behavior");
+        assert!(s.inline[0].body.contains("```suggestion\nconst y = 2;\n```"));
+        // 코드 안에 ``` 가 있으면 펜스를 더 길게 한다.
+        let g = ranged(11, Some(12), "x = `a`;\n```\ny");
+        let s = split_findings(&[g], SAMPLE_DIFF);
+        assert!(s.inline[0].body.contains("````suggestion\nx = `a`;\n```\ny\n````"), "{}", s.inline[0].body);
+    }
+
+    #[test]
+    fn oversized_range_is_not_a_suggestion() {
+        let diff = format!(
+            "diff --git a/src/x.ts b/src/x.ts\n--- a/src/x.ts\n+++ b/src/x.ts\n@@ -1,0 +1,40 @@\n{}",
+            (1..=40).map(|i| format!("+l{i}\n")).collect::<String>()
+        );
+        let mut f = finding("major", 85.0, "src/x.ts", Some(1), "큰 구간");
+        f.end_line = Some(40);
+        f.fix_code = "x".into();
+        let s = split_findings(&[f.clone()], &diff);
+        assert_eq!(s.inline[0].start_line, None, "40 lines exceed the cap");
+        f.end_line = Some(30);
+        let s = split_findings(&[f], &diff);
+        assert_eq!(s.inline[0].start_line, Some(1), "30 lines are fine");
     }
 
     #[test]

@@ -42,6 +42,20 @@ fn flush(out: &mut String, s: Section) {
     out.push_str(&format!("<details>\n<summary>{summary}</summary>\n\n{content}\n\n</details>\n\n"));
 }
 
+/// One closing line asking authors to answer the suggestions. Weave counts a
+/// suggestion as addressed by a later commit or a clear reply, and our own
+/// `feedback` tally reads the replies too. Only added when suggestions were
+/// posted (`n` inline + file threads), so a review without any carries no note.
+pub fn with_reply_hint(body: &str, n: usize) -> String {
+    if n == 0 || body.contains(REPLY_HINT_MARK) {
+        return body.to_string();
+    }
+    format!("{}\n\n{REPLY_HINT}", body.trim_end())
+}
+
+const REPLY_HINT_MARK: &str = "한 줄 답글";
+const REPLY_HINT: &str = "💬 제안마다 반영 커밋이나 한 줄 답글(반영 / 보류 / 반대 + 이유)을 남겨 주세요. 처리 여부를 다음 리뷰와 집계에 반영합니다.";
+
 /// Fold the evidence sections of a review body. A body with none of them comes
 /// back unchanged.
 pub fn fold_sections(body: &str) -> String {
@@ -87,6 +101,16 @@ mod tests {
     use super::*;
 
     const BODY: &str = "# 총평\n\n요약입니다. 5/5점\n\n# 발견\n\n- 🟡 `a.ts:1` — 문제\n\n# 검증 근거\n\n- ✅ 첫째 — 확인\n  - 자세히\n- ⚠️ 둘째 — 확신 낮음\n- ❌ 셋째 — 틀림\n\n# 미확인\n\n- 서버 응답 — 못 봄\n\n# 산입하지 않은 것\n\n- 다른 곳의 같은 결함 — 이 PR 탓 아님\n";
+
+    #[test]
+    fn reply_hint_only_when_suggestions_were_posted_and_never_twice() {
+        let body = "# 총평\n\n좋아요";
+        assert_eq!(with_reply_hint(body, 0), body, "no suggestions, no note");
+        let with = with_reply_hint(body, 2);
+        assert!(with.starts_with(body) && with.trim_end().ends_with("집계에 반영합니다."));
+        assert!(with.contains("한 줄 답글"));
+        assert_eq!(with_reply_hint(&with, 3), with, "an already-hinted body is left alone");
+    }
 
     #[test]
     fn folds_evidence_sections_and_keeps_the_rest_open() {
