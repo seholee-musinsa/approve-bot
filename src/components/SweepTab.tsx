@@ -127,8 +127,11 @@ export function SweepTab({ value, onChange, dirty }: Props) {
             <div className="muted">
               다음 실행부터 Jira 에 실제 티켓이 만들어집니다. "지금 실행"도 마찬가지입니다.
               <br />
-              담당자: {jira && jira.assignees.length > 0 ? jira.assignees[0].name : "없음(담당자 없이 생성)"} · 상위 에픽:{" "}
-              {jira && jira.parent_key ? jira.parent_key : "없음(상위 에픽 없이 생성)"} · 열린 티켓 상한: {jira ? jira.open_cap : "-"}건
+              담당자:{" "}
+              {jira && jira.assignees.length > 0
+                ? `${jira.assignees.map((a) => a.name).join(", ")} (${jira.assignees.length}명에게 나눠 배정)`
+                : "없음(담당자 없이 생성)"}{" "}
+              · 상위 에픽: {jira && jira.parent_key ? jira.parent_key : "없음(상위 에픽 없이 생성)"} · 열린 티켓 상한: 한 사람당 {jira ? jira.open_cap : "-"}건
               <br />
               한 번에 최대 {s.max_create_per_run}건까지 만들고, 나머지는 다음 실행으로 대기합니다.
             </div>

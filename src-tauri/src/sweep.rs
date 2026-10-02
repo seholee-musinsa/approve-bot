@@ -815,7 +815,26 @@ pub(crate) fn create_tickets(
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut text = String::new();
     let mut failed = Vec::new();
+    // 담당자: 열린 자동 생성 티켓이 가장 적은 사람에게, 같으면 무작위로(상한에 닿은 사람은 뺀다).
+    let mut book = if cfg.assignees.is_empty() {
+        None
+    } else {
+        Some(jira::AssigneeBook::new(rt.block_on(client.open_counts(&cfg))?, cfg.open_cap))
+    };
+    let seed = now_secs();
     for (n, d) in plan.create.iter().enumerate() {
+        let assignee: Option<String> = match book.as_mut() {
+            Some(b) => match b.pick(seed.wrapping_mul(2_654_435_761).wrapping_add(n as u64 * 40_503) >> 7) {
+                Some(a) => Some(a),
+                None => {
+                    // 모두 상한이면 담당자 없이 만들지 않고, 남은 초안은 대기로 보낸다.
+                    failed.extend(n..plan.create.len());
+                    text.push_str(&format!("⚠️ 담당자 전원이 열린 티켓 상한({})에 닿아 남은 {}건은 대기한다\n", cfg.open_cap, plan.create.len() - n));
+                    break;
+                }
+            },
+            None => None,
+        };
         let (sl, cm) = origin(&plan.kept, d, slice, commit);
         let mut body = sr::render_ticket(d, &plan.kept, &sl, &cm);
         let keys: Vec<String> = d.findings.iter().map(|&i| plan.kept[i].key.clone()).collect();
@@ -823,15 +842,19 @@ pub(crate) fn create_tickets(
         if let Some(p) = prev.first() {
             body.push_str(&format!("\n\n다시 발견됨: 이전에 {p} 로 완료했던 항목이 다시 발견됐다."));
         }
-        let t = jira::NewTicket { title: &d.title, body: &body, keys: &keys, estimate_md: d.effort.md(), assignee: cfg.assignees.first().map(String::as_str), category: d.category.name() };
+        let t = jira::NewTicket { title: &d.title, body: &body, keys: &keys, estimate_md: d.effort.md(), assignee: assignee.as_deref(), category: d.category.name() };
         match rt.block_on(client.create(&cfg, &t)) {
             Ok(key) => {
                 for k in &keys {
                     ledger.record(k, KeyOutcome::Created { ticket: key.clone(), at: now });
                 }
-                text.push_str(&format!("생성: {key} {}\n", d.title));
+                let who = assignee.as_ref().map(|a| cfg.assignee_names.get(a).cloned().unwrap_or_else(|| a.clone()));
+                text.push_str(&format!("생성: {key} {}{}\n", d.title, who.map(|w| format!(" (담당: {w})")).unwrap_or_default()));
             }
             Err(e) => {
+                if let (Some(b), Some(a)) = (book.as_mut(), assignee.as_ref()) {
+                    b.release(a);
+                }
                 failed.push(n);
                 text.push_str(&format!("⚠️ 생성 실패 {}: {e:#}\n", d.title));
             }
@@ -863,10 +886,7 @@ pub(crate) fn create_waiting(dir: &Path, ids: &[String], max_files: usize) -> an
     let now = now_secs();
     // 읽기: 열린 자동 생성 티켓 수와, 이 후보의 식별값을 이미 가진 티켓.
     let (open, found) = rt.block_on(async {
-        let open = match cfg.assignees.first() {
-            Some(a) => client.count_open_bot(&cfg, a).await?,
-            None => 0,
-        };
+        let open: usize = client.open_counts(&cfg).await?.iter().map(|(_, n)| n).sum();
         let keys: Vec<String> = chosen.iter().flat_map(|c| c.findings.iter().map(|f| f.key.clone())).collect();
         let mut found = Vec::new();
         for chunk in keys.chunks(50) {
@@ -883,7 +903,9 @@ pub(crate) fn create_waiting(dir: &Path, ids: &[String], max_files: usize) -> an
     let ticketed = |c: &crate::sweep_state::Carried| c.findings.iter().any(|f| matches!(ledger.keys.get(&f.key), Some(KeyOutcome::Created { .. })));
     let (skip, todo): (Vec<_>, Vec<_>) = chosen.into_iter().partition(|c| ticketed(c));
     let skipped_ids: Vec<String> = skip.iter().map(sd::carried_id).collect();
-    let room = cfg.open_cap.saturating_sub(open);
+    // 담당자마다 상한이 있으므로 전체 여유는 (상한 × 담당자 수 − 열린 수). 사람별 상한은 만들 때 다시 지킨다.
+    let total_cap = cfg.open_cap * cfg.assignees.len().max(1);
+    let room = total_cap.saturating_sub(open);
     let mut out = String::new();
     if !skip.is_empty() {
         out.push_str(&format!("이미 티켓이 있는 후보 {}건은 대기 목록에서 뺐다\n", skip.len()));
@@ -904,7 +926,7 @@ pub(crate) fn create_waiting(dir: &Path, ids: &[String], max_files: usize) -> an
     if todo.is_empty() {
         ledger.carryover.retain(|c| !skipped_ids.contains(&sd::carried_id(c)));
         crate::sweep_state::save(dir, &ledger)?;
-        out.push_str(&format!("열린 자동 생성 티켓 {open}건이 상한 {} 에 닿아 새로 만들지 않았다\n", cfg.open_cap));
+        out.push_str(&format!("열린 자동 생성 티켓 {open}건이 전체 상한 {total_cap} 에 닿아 새로 만들지 않았다\n"));
         return Ok(out);
     }
     let (plan, owner) = sd::plan_from_carried(&todo, max_files);
@@ -951,9 +973,11 @@ fn jira_view(
     let client = jira::Jira::connect(&cfg)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     rt.block_on(async {
-        let open = match (count_given, cfg.assignees.first()) {
-            (false, Some(a)) => Some(client.count_open_bot(&cfg, a).await?),
-            _ => None,
+        // 담당자 전원의 열린 자동 생성 티켓 합. 담당자가 없으면 세지 않는다.
+        let open = if count_given || cfg.assignees.is_empty() {
+            None
+        } else {
+            Some(client.open_counts(&cfg).await?.iter().map(|(_, n)| n).sum::<usize>())
         };
         let keys: Vec<String> = kept.iter().map(|f| f.key.clone()).collect();
         let mut found = Vec::new();
@@ -1050,7 +1074,8 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         }
     }
     let by_path: std::collections::HashMap<&str, f64> = c.files.iter().map(|f| (f.path.as_str(), score(f, c.w))).collect();
-    let open_cap = crate::jira::load_config(&dir).map(|j| j.open_cap).unwrap_or(10);
+    // 사람마다 상한이 있어 전체 상한은 상한 × 담당자 수(담당자가 없으면 1명 몫).
+    let open_cap = crate::jira::load_config(&dir).map(|j| j.open_cap * j.assignees.len().max(1)).unwrap_or(10);
     let policy = sd::Policy { max_files: c.max_files, open_cap, ..Default::default() };
     let mut plan = sd::plan_day(incoming.clone(), &view, &policy, now, open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
     out.push_str(&format!(

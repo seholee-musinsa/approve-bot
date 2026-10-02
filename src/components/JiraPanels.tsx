@@ -78,7 +78,7 @@ export function JiraPanels() {
               if (Number.isFinite(n)) setV({ ...v, open_cap: Math.min(100, Math.max(1, Math.round(n))) });
             }}
           />
-          <span className="muted">한 사람 기준, 이 수에 이르면 새 티켓을 만들지 않고 대기</span>
+          <span className="muted">한 사람 기준입니다. 모두 이 수에 이르면 새 티켓을 만들지 않고 대기</span>
         </Row>
         <div className="muted">티켓을 실제로 만들지는 "코드 점검" 설정의 "티켓 만들기"에서 정합니다.</div>
         <div className="row">
@@ -165,7 +165,7 @@ function Assignees({
     <div className="panel">
       <h2>담당자 ({value.length})</h2>
       <div className="muted">
-        티켓은 이 목록의 첫 번째 사람에게 배정됩니다. 비어 있으면 담당자 없이 만들어집니다.
+        티켓은 이 목록의 사람들에게 나눠 배정됩니다. 열린 자동 생성 티켓이 가장 적은 사람에게 먼저 가고, 같으면 무작위입니다. 상한에 닿은 사람은 건너뜁니다. 목록이 비어 있으면 담당자 없이 만들어집니다.
       </div>
       <div className="autocomplete-wrap">
         <input
@@ -189,10 +189,9 @@ function Assignees({
       {value.length === 0 ? (
         <div className="muted">담당자 목록이 비어 있음</div>
       ) : (
-        value.map((a, i) => (
+        value.map((a) => (
           <div key={a.id} className="row" style={{ justifyContent: "space-between" }}>
             <span>
-              {i === 0 && <span className="badge" style={{ marginRight: 6 }}>기본</span>}
               {a.name}
             </span>
             <button className="danger" onClick={() => onChange(value.filter((x) => x.id !== a.id))}>삭제</button>
