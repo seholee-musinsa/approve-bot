@@ -290,6 +290,11 @@ function StatusPanel({
             </button>
             {confirmReset && <button onClick={() => setConfirmReset(false)}>취소</button>}
           </div>
+          {confirmReset && (
+            <div className="error-text">
+              점검한 구간 기록과 대기 중인 후보 {st.carryover}건이 함께 비워집니다. 만든 티켓과 처리 이력은 그대로 둡니다.
+            </div>
+          )}
           {dirty && <div className="muted">저장하지 않은 변경이 있어 저장 후 실행할 수 있습니다.</div>}
           {msg && <div className="muted">{msg}</div>}
         </>

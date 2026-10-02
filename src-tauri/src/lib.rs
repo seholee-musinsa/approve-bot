@@ -92,6 +92,9 @@ pub fn run() {
             commands::list_reports,
             commands::read_report,
             commands::generate_report,
+            commands::list_waiting_candidates,
+            commands::create_waiting_candidates,
+            commands::discard_waiting_candidates,
             commands::publish_report,
             commands::check_report_parent,
         ])

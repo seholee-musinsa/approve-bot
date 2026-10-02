@@ -133,6 +133,56 @@ pub fn plan_day(
     plan
 }
 
+/// 대기 중인 후보 한 건의 화면용 id(첫 지적의 키).
+pub fn carried_id(c: &Carried) -> String {
+    c.findings.first().map(|f| f.key.clone()).unwrap_or_default()
+}
+
+/// 화면에 보여 줄 대기 후보 한 줄.
+#[derive(Debug, Clone, serde::Serialize, PartialEq, Eq)]
+pub struct WaitingView {
+    pub id: String,
+    pub title: String,
+    pub category: String,
+    pub effort: String,
+    pub files: Vec<String>,
+    pub slice: String,
+}
+
+pub fn waiting_views(carried: &[Carried], max_files: usize) -> Vec<WaitingView> {
+    carried
+        .iter()
+        .filter_map(|c| {
+            let d = group(&c.findings, max_files).into_iter().next()?;
+            Some(WaitingView {
+                id: carried_id(c),
+                title: d.title.clone(),
+                category: d.category.label().to_string(),
+                effort: d.effort.describe().to_string(),
+                files: d.files.clone(),
+                slice: c.findings.first().map(|f| f.slice.clone()).unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+/// 대기 후보들을 다시 만들 수 있는 초안으로 되돌린다.
+/// 돌려주는 두 번째 값은 초안마다 어느 대기 후보에서 나왔는지(인덱스)다.
+pub fn plan_from_carried(carried: &[Carried], max_files: usize) -> (DayPlan, Vec<usize>) {
+    let mut plan = DayPlan::default();
+    let mut owner = Vec::new();
+    for (ci, c) in carried.iter().enumerate() {
+        let base = plan.kept.len();
+        plan.kept.extend(c.findings.iter().cloned());
+        for mut d in group(&c.findings, max_files) {
+            d.findings = d.findings.iter().map(|i| i + base).collect();
+            plan.create.push(d);
+            owner.push(ci);
+        }
+    }
+    (plan, owner)
+}
+
 /// 이월할 초안을 장부에 저장한다(기준 커밋과 함께).
 pub fn park(ledger: &mut Ledger, plan: &DayPlan, commit: &str) {
     for d in &plan.carry {
@@ -305,6 +355,29 @@ mod tests {
         let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
         let got = &back.carryover[0].findings[0];
         assert_eq!((got.slice.as_str(), got.commit.as_str()), ("layers/features/mamud", "abc123"));
+    }
+
+    #[test]
+    fn waiting_candidates_roundtrip_to_drafts_with_correct_indexes() {
+        let p = Policy::default();
+        let mut l = Ledger::default();
+        let mut a = f("a.ts", Category::Split, "x", 90);
+        a.slice = "s1".into();
+        let b = f("b.ts", Category::Split, "y", 90);
+        let plan = plan_day(vec![a, b], &l, &p, 0, 10, &|_| 1.0);
+        park(&mut l, &plan, "c1");
+        assert_eq!(l.carryover.len(), 2);
+        let views = waiting_views(&l.carryover, 10);
+        assert_eq!(views.len(), 2);
+        assert!(views.iter().all(|v| v.category == "분리 필요" && !v.id.is_empty()));
+        assert!(views.iter().any(|v| v.slice == "s1"));
+        let (plan2, owner) = plan_from_carried(&l.carryover, 10);
+        assert_eq!(plan2.create.len(), 2);
+        assert_eq!(owner, vec![0, 1]);
+        // 초안이 가리키는 지적은 합쳐진 목록 안의 올바른 위치다.
+        for (d, &ci) in plan2.create.iter().zip(&owner) {
+            assert_eq!(plan2.kept[d.findings[0]].key, l.carryover[ci].findings[0].key);
+        }
     }
 
     #[test]
