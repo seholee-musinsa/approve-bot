@@ -10,7 +10,7 @@
 //! finding never becomes a ticket.
 
 use crate::sweep::{score, FileStat, Slice, Weights, BIG_FILE_LINES};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -290,7 +290,7 @@ pub fn parse_output(text: &str) -> Result<Raw, String> {
 
 // ---- verification ------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Category {
     Rule,
     Split,
@@ -315,7 +315,7 @@ impl Category {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Effort {
     S,
     M,
@@ -347,7 +347,7 @@ impl Effort {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Finding {
     pub category: Category,
     pub kind: String,

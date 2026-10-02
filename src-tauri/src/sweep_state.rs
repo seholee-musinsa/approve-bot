@@ -1,7 +1,9 @@
 //! 정기 스윕 장부. 한 바퀴(cycle)의 조각 진행 상황을 파일로 보관한다.
 //! 시각과 커밋은 호출자가 넘긴다(테스트 가능하게 시계를 읽지 않는다).
 
+use crate::sweep_review::Finding;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 /// 같은 조각이 이만큼 연속 실패하면 이번 바퀴에서는 건너뛴다.
@@ -32,11 +34,43 @@ pub struct Cycle {
     pub slices: Vec<SliceEntry>,
 }
 
+/// 티켓을 닫을 때 코멘트 첫 줄에 적는 거절 사유(요구 4.13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RejectReason {
+    Wrong,
+    LowValue,
+    SizeTiming,
+    Duplicate,
+    AlreadyFixed,
+    Unknown,
+}
+
+/// 안정 키별 처리 결과.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum KeyOutcome {
+    Created { ticket: String, at: u64 },
+    Done { ticket: String, at: u64 },
+    Rejected { reason: RejectReason, at: u64 },
+}
+
+/// 상한 때문에 오늘 만들지 못하고 이월한 티켓 한 건 분량의 지적.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Carried {
+    pub commit: String,
+    pub findings: Vec<Finding>,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ledger {
     pub cycle: Option<Cycle>,
     /// 지금까지 끝낸 바퀴 수.
     pub finished_cycles: u32,
+    #[serde(default)]
+    pub keys: BTreeMap<String, KeyOutcome>,
+    #[serde(default)]
+    pub carryover: Vec<Carried>,
 }
 
 impl Cycle {
@@ -59,6 +93,7 @@ impl Cycle {
 impl Ledger {
     /// 순위(위험 순)가 매겨진 조각 `(이름, 줄 수)` 로 새 바퀴를 시작한다. 진행 중이던 바퀴는 버린다.
     pub fn start_cycle(&mut self, ranked: &[(String, usize)], commit: &str, now: u64) {
+        self.carryover.clear();
         let no = self.finished_cycles + 1;
         self.cycle = Some(Cycle {
             no,
@@ -129,11 +164,38 @@ impl Ledger {
     pub fn finish_if_complete(&mut self) -> bool {
         if self.cycle.as_ref().is_some_and(|c| c.is_complete()) {
             self.cycle = None;
+            self.carryover.clear();
             self.finished_cycles += 1;
             true
         } else {
             false
         }
+    }
+
+    pub fn record(&mut self, key: &str, outcome: KeyOutcome) {
+        self.keys.insert(key.to_string(), outcome);
+    }
+
+    pub fn is_carried(&self, key: &str) -> bool {
+        self.carryover.iter().any(|c| c.findings.iter().any(|f| f.key == key))
+    }
+
+    /// 이월분 중 파일이 바뀐 것을 버린다(3.7). 버린 건수를 돌려준다.
+    pub fn expire_carryover(&mut self, changed: &HashSet<String>) -> usize {
+        let before = self.carryover.len();
+        self.carryover.retain(|c| {
+            !c.findings
+                .iter()
+                .any(|f| changed.contains(&f.path) || f.related.iter().any(|r| changed.contains(r)))
+        });
+        before - self.carryover.len()
+    }
+
+    /// 자리가 난 만큼 이월분을 앞에서부터 꺼낸다. (Jira 생성 단계에서 쓴다)
+    #[allow(dead_code)]
+    pub fn take_carried(&mut self, n: usize) -> Vec<Carried> {
+        let n = n.min(self.carryover.len());
+        self.carryover.drain(..n).collect()
     }
 
     /// repo 가 바뀌어 조각 구성이 달라졌을 때 순위를 새로 맞춘다.

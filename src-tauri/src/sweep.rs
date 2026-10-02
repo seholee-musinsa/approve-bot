@@ -526,6 +526,7 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
 /// `approve-bot sweep-once --local <dir> [--days 90] [--top 12] [--max-lines 25000] [--max-files 10] [--rank density|sum]`
 /// `approve-bot sweep-once --repo owner/name [--cache-dir <dir>] [--clear-cache] ...` reads an app-owned cache clone (kept fresh, see `repocache`) instead of a local folder.
 /// `--exclude <glob>` (repeatable) and `sweep-rules.json` in the config dir keep paths out of the sweep.
+/// `--day [--save] [--open-tickets n]` takes the next slice of the cycle in the ledger (`sweep-state.json` in the config dir), reads it, and prints what would be created today and what is carried over; `--save` also writes the ledger (nothing else is written; Jira is not touched, so the open-ticket count is given by hand).
 /// `--slice <rank|name part> --dry-run [--model m] [--thinking n] [--max-candidates n]` has the model read that slice and prints ticket drafts (nothing is written anywhere); `--print-prompt` shows the prompt without calling the model.
 pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut local = String::new();
@@ -545,6 +546,9 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut thinking: Option<u32> = None;
     let mut max_candidates: usize = crate::sweep_review::MAX_CANDIDATE_FILES;
     let mut exclude: Vec<String> = Vec::new();
+    let mut day = false;
+    let mut save = false;
+    let mut open_tickets: usize = 0;
     let mut i = 0;
     while i < flags.len() {
         let name = flags[i].as_str();
@@ -568,6 +572,9 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             "--thinking" => thinking = Some(value(&mut i)?.parse()?),
             "--max-candidates" => max_candidates = value(&mut i)?.parse()?,
             "--exclude" => exclude.push(value(&mut i)?),
+            "--day" => day = true,
+            "--save" => save = true,
+            "--open-tickets" => open_tickets = value(&mut i)?.parse()?,
             "--rank" => {
                 by = match value(&mut i)?.as_str() {
                     "sum" => RankBy::Sum,
@@ -584,6 +591,12 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     }
     if repo.is_empty() && local.is_empty() {
         return Err(anyhow::anyhow!("--repo owner/name or --local <checkout dir> is required"));
+    }
+    if save && !day {
+        return Err(anyhow::anyhow!("--save is only for --day"));
+    }
+    if day && slice_sel.is_some() {
+        return Err(anyhow::anyhow!("--day picks the slice from the ledger; drop --slice"));
     }
     if slice_sel.is_some() && !dry_run && !print_prompt {
         return Err(anyhow::anyhow!("--slice needs --dry-run (it reads and drafts, nothing is written anywhere) or --print-prompt"));
@@ -633,6 +646,10 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
         (files, dir, synced.commit)
     };
     let slices = rank(pack_slices(&files, &w, max_lines), by);
+    if day {
+        let ctx = DayCtx { notes: &notes, files: &files, w: &w, checkout: &checkout, commit: &commit, max_candidates, max_files, model, thinking, save, open_tickets };
+        return run_day(&ctx, &slices);
+    }
     if let Some(sel) = &slice_sel {
         let slice = pick_slice(&slices, sel)?;
         return review_slice(&notes, slice, &files, &w, &checkout, &commit, max_candidates, max_files, print_prompt, model, thinking);
@@ -671,6 +688,31 @@ fn review_slice(
     thinking: Option<u32>,
 ) -> anyhow::Result<String> {
     use crate::sweep_review as sr;
+    let (input, prompt) = slice_prompt(slice, files, w, checkout, commit, max_candidates);
+    if print_prompt {
+        return Ok(format!("{notes}{prompt}\n\n(프롬프트 {}자 · 모델은 호출하지 않았다)\n", prompt.chars().count()));
+    }
+    let (model, thinking) = model_settings(model, thinking);
+    let outcome = read_slice(slice, &prompt, checkout, &model, thinking, max_files);
+    Ok(format!(
+        "{notes}조각 {} · 파일 {}개 · {}줄 · 모델 {model} · 생각 예산 {thinking} · 프롬프트 {}자\n{}",
+        slice.name,
+        slice.files.len(),
+        slice.lines,
+        prompt.chars().count(),
+        sr::report(&input, &outcome)
+    ))
+}
+
+fn slice_prompt(
+    slice: &Slice,
+    files: &[FileStat],
+    w: &Weights,
+    checkout: &Path,
+    commit: &str,
+    max_candidates: usize,
+) -> (crate::sweep_review::SliceInput, String) {
+    use crate::sweep_review as sr;
     let lines: std::collections::HashMap<&str, usize> = files.iter().map(|f| (f.path.as_str(), f.lines)).collect();
     let input = sr::SliceInput {
         name: slice.name.clone(),
@@ -680,23 +722,125 @@ fn review_slice(
     };
     let docs = sr::collect_rule_docs(checkout, &slice.files);
     let prompt = sr::build_prompt(&input, &docs);
-    if print_prompt {
-        return Ok(format!("{notes}{prompt}\n\n(프롬프트 {}자 · 모델은 호출하지 않았다)\n", prompt.chars().count()));
-    }
+    (input, prompt)
+}
+
+fn model_settings(model: Option<String>, thinking: Option<u32>) -> (String, u32) {
     let cfg = crate::config::AppConfig::default();
-    let model = model.unwrap_or(cfg.review_model);
-    let thinking = thinking.unwrap_or(cfg.review_thinking_tokens);
-    let run = sr::run_model(&prompt, &model, thinking, checkout);
+    (model.unwrap_or(cfg.review_model), thinking.unwrap_or(cfg.review_thinking_tokens))
+}
+
+fn read_slice(slice: &Slice, prompt: &str, checkout: &Path, model: &str, thinking: u32, max_files: usize) -> crate::sweep_review::SliceOutcome {
+    use crate::sweep_review as sr;
+    let run = sr::run_model(prompt, model, thinking, checkout);
     let set: std::collections::BTreeSet<String> = slice.files.iter().cloned().collect();
-    let outcome = sr::evaluate(run, checkout, &set, max_files);
-    Ok(format!(
-        "{notes}조각 {} · 파일 {}개 · {}줄 · 모델 {model} · 생각 예산 {thinking} · 프롬프트 {}자\n{}",
-        slice.name,
-        slice.files.len(),
-        slice.lines,
-        prompt.chars().count(),
-        sr::report(&input, &outcome)
-    ))
+    sr::evaluate(run, checkout, &set, max_files)
+}
+
+struct DayCtx<'a> {
+    notes: &'a str,
+    files: &'a [FileStat],
+    w: &'a Weights,
+    checkout: &'a Path,
+    commit: &'a str,
+    max_candidates: usize,
+    max_files: usize,
+    model: Option<String>,
+    thinking: Option<u32>,
+    save: bool,
+    open_tickets: usize,
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Files that changed between two commits; empty when git cannot say.
+fn changed_between(root: &Path, from: &str, to: &str) -> std::collections::HashSet<String> {
+    git(root, &["diff", "--name-only", from, to])
+        .map(|o| o.lines().map(str::to_string).collect())
+        .unwrap_or_default()
+}
+
+/// One day of the sweep: pick the next slice from the ledger, read it, decide
+/// what to create and what to carry over. Writes the ledger only with `--save`.
+fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
+    use crate::{sweep_day as sd, sweep_review as sr, sweep_state as st};
+    let dir = crate::eval_cli::config_dir()?;
+    let now = now_secs();
+    let mut ledger = st::load(&dir);
+    let ranked: Vec<(String, usize)> = slices.iter().map(|s| (s.name.clone(), s.lines)).collect();
+    let mut out = String::from(c.notes);
+    match ledger.cycle.as_ref().map(|cy| cy.started_commit.clone()) {
+        None => {
+            ledger.start_cycle(&ranked, c.commit, now);
+            out.push_str(&format!("새 바퀴 {} 시작 · 조각 {}개\n", ledger.finished_cycles + 1, ranked.len()));
+        }
+        Some(old) if old != c.commit => {
+            let changed = changed_between(c.checkout, &old, c.commit);
+            let dropped = ledger.expire_carryover(&changed);
+            ledger.replan(&ranked, c.commit);
+            out.push_str(&format!("기준 커밋이 바뀌어 조각 구성을 다시 맞췄다(이월 {dropped}건 만료)\n"));
+        }
+        Some(_) => {}
+    }
+    let Some(next) = ledger.next().map(|e| e.name.clone()) else {
+        ledger.finish_if_complete();
+        if c.save {
+            st::save(&dir, &ledger)?;
+        }
+        out.push_str("이번 바퀴의 조각을 모두 읽었다. 다음 실행에서 새 바퀴를 시작한다\n");
+        return Ok(out);
+    };
+    let slice = slices.iter().find(|s| s.name == next).ok_or_else(|| anyhow::anyhow!("장부의 조각 {next} 이(가) 지금 구성에 없다"))?;
+    let (input, prompt) = slice_prompt(slice, c.files, c.w, c.checkout, c.commit, c.max_candidates);
+    let (model, thinking) = model_settings(c.model.clone(), c.thinking);
+    let outcome = read_slice(slice, &prompt, c.checkout, &model, thinking, c.max_files);
+    out.push_str(&format!("오늘의 조각 {} · 파일 {}개 · {}줄 · 모델 {model}\n", slice.name, slice.files.len(), slice.lines));
+    if outcome.run.is_error || outcome.parse_error.is_some() {
+        let why = outcome.parse_error.clone().unwrap_or_else(|| outcome.run.text.chars().take(200).collect());
+        ledger.mark_failed(&slice.name, &why);
+        out.push_str(&format!("읽기에 실패했다: {why}\n"));
+        if c.save {
+            st::save(&dir, &ledger)?;
+            out.push_str("실패를 장부에 기록했다(저장)\n");
+        }
+        return Ok(out);
+    }
+    let by_path: std::collections::HashMap<&str, f64> = c.files.iter().map(|f| (f.path.as_str(), score(f, c.w))).collect();
+    let policy = sd::Policy { max_files: c.max_files, ..Default::default() };
+    let plan = sd::plan_day(outcome.kept.clone(), &ledger, &policy, now, c.open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
+    out.push_str(&format!(
+        "지적 {}건 → 후보 {}건 · 오늘 만들 티켓 {}건 · 이월 {}건 · 걸러냄 {}건 (열린 봇 티켓 {} / 상한 {})\n",
+        outcome.kept.len(),
+        plan.kept.len(),
+        plan.create.len(),
+        plan.carry.len(),
+        plan.skipped.len(),
+        c.open_tickets,
+        policy.open_cap
+    ));
+    for (key, why) in &plan.skipped {
+        out.push_str(&format!("  걸러냄 {key}: {why:?}\n"));
+    }
+    for d in &plan.create {
+        out.push_str(&format!("\n### 생성: {}\n{}\n", d.title, sr::render_ticket(d, &plan.kept, &input.name, c.commit)));
+    }
+    for d in &plan.carry {
+        out.push_str(&format!("이월: {}\n", d.title));
+    }
+    ledger.mark_read(&slice.name, c.commit, now);
+    sd::park(&mut ledger, &plan, c.commit);
+    if ledger.finish_if_complete() {
+        out.push_str("이번 바퀴를 모두 읽었다\n");
+    }
+    if c.save {
+        st::save(&dir, &ledger)?;
+        out.push_str("장부를 저장했다(Jira 에는 아무것도 쓰지 않았다)\n");
+    } else {
+        out.push_str("\n(저장하지 않았다: 장부 변경 없음. --save 로 기록)\n");
+    }
+    Ok(out)
 }
 
 /// Bring the cache clone of `owner/name` up to date and describe what happened:
