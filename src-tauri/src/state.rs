@@ -95,6 +95,8 @@ pub struct AppState {
     /// True while a PR poll pass (including its reviews) is running. The sweep
     /// scheduler waits for it to be false so the two never compete.
     pub pass_running: std::sync::atomic::AtomicBool,
+    /// True while a sweep run (scheduled or by hand) is in progress.
+    pub sweep_running: std::sync::atomic::AtomicBool,
 }
 
 impl AppState {
@@ -111,6 +113,7 @@ impl AppState {
             gh_login_busy: Mutex::new(false),
             failed_heads: Mutex::new(std::collections::HashMap::new()),
             pass_running: std::sync::atomic::AtomicBool::new(false),
+            sweep_running: std::sync::atomic::AtomicBool::new(false),
         })
     }
 

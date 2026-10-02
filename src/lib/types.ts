@@ -17,6 +17,50 @@ export interface AppConfig {
   /** true = attach inline line comments (resolvable threads). Turn off if a repo
    *  requires conversation resolution to merge. */
   inline_comments_enabled: boolean;
+  /** Regular repo sweep. Always sent back whole so saving never resets it. */
+  sweep: SweepSettings;
+}
+
+export type Frequency = "daily" | "weekly" | "monthly";
+export type CreateMode = "draft" | "auto";
+
+export interface SweepSettings {
+  enabled: boolean;
+  repo: string;
+  frequency: Frequency;
+  /** 0 = Monday … 6 = Sunday (weekly) */
+  weekday: number;
+  /** 1..28 (monthly) */
+  month_day: number;
+  hour: number;
+  minute: number;
+  slices_per_run: number;
+  max_slice_lines: number;
+  max_files_per_ticket: number;
+  create_mode: CreateMode;
+}
+
+export interface SweepStatus {
+  running: boolean;
+  cycle_no: number | null;
+  slices_done: number;
+  slices_total: number;
+  next_slice: string | null;
+  carryover: number;
+  created_keys: number;
+  done_keys: number;
+  rejected_keys: number;
+  finished_cycles: number;
+  last_run: string | null;
+  next_run: string | null;
+}
+
+export interface SweepRun {
+  /** unix seconds */
+  at: number;
+  ok: boolean;
+  seconds: number;
+  text: string;
 }
 
 export interface ConnectionStatus {

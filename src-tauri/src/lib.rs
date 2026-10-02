@@ -75,6 +75,10 @@ pub fn run() {
             commands::force_check_now,
             commands::search_users,
             commands::start_gh_login,
+            commands::get_sweep_status,
+            commands::get_sweep_log,
+            commands::run_sweep_now,
+            commands::reset_sweep_cycle,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

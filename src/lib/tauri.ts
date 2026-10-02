@@ -7,6 +7,8 @@ import type {
   ConnectionStatus,
   GhLoginProgress,
   GhUserHint,
+  SweepRun,
+  SweepStatus,
 } from "./types";
 
 export const ACTIVITY_EVENT = "approve-bot://activity";
@@ -26,6 +28,10 @@ export const api = {
   searchUsers: (query: string) =>
     invoke<GhUserHint[]>("search_users", { query }),
   startGhLogin: () => invoke<void>("start_gh_login"),
+  getSweepStatus: () => invoke<SweepStatus>("get_sweep_status"),
+  getSweepLog: (limit = 30) => invoke<SweepRun[]>("get_sweep_log", { limit }),
+  runSweepNow: () => invoke<boolean>("run_sweep_now"),
+  resetSweepCycle: () => invoke<void>("reset_sweep_cycle"),
 };
 
 export function onActivity(
