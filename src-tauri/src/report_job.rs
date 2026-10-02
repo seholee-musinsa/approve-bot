@@ -33,10 +33,33 @@ pub struct ReportMeta {
     pub title: String,
     /// 만든 시각(파일 수정 시각), unix 초.
     pub generated_at: u64,
+    /// Confluence 에 게시했다면 페이지 주소(주소를 알 수 없으면 빈 문자열). 게시 전이면 None.
+    pub published_url: Option<String>,
+}
+
+fn published_path(dir: &Path) -> PathBuf {
+    reports_dir(dir).join("published.json")
+}
+
+/// 제목 → 페이지 주소.
+pub fn load_published(dir: &Path) -> std::collections::BTreeMap<String, String> {
+    std::fs::read_to_string(published_path(dir)).ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default()
+}
+
+fn mark_published(dir: &Path, title: &str, url: &str) -> Result<()> {
+    let mut m = load_published(dir);
+    m.insert(title.to_string(), url.to_string());
+    std::fs::create_dir_all(reports_dir(dir))?;
+    let p = published_path(dir);
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(&m)?)?;
+    std::fs::rename(tmp, p)?;
+    Ok(())
 }
 
 /// 최신순.
 pub fn list_reports(dir: &Path) -> Vec<ReportMeta> {
+    let published = load_published(dir);
     let mut v: Vec<ReportMeta> = std::fs::read_dir(reports_dir(dir))
         .into_iter()
         .flatten()
@@ -44,8 +67,9 @@ pub fn list_reports(dir: &Path) -> Vec<ReportMeta> {
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let title = name.strip_suffix(".md")?.to_string();
+            let published_url = published.get(&title).cloned();
             let at = e.metadata().ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-            Some(ReportMeta { title, generated_at: at })
+            Some(ReportMeta { title, generated_at: at, published_url })
         })
         .collect();
     v.sort_by(|a, b| b.generated_at.cmp(&a.generated_at).then_with(|| b.title.cmp(&a.title)));
@@ -54,6 +78,48 @@ pub fn list_reports(dir: &Path) -> Vec<ReportMeta> {
 
 pub fn read_report(dir: &Path, title: &str) -> Result<String> {
     std::fs::read_to_string(reports_dir(dir).join(file_name(title))).map_err(|_| anyhow!("리포트를 찾을 수 없다: {title}"))
+}
+
+/// 저장된 리포트를 Confluence 에 게시한다(같은 제목이면 갱신, R.6). 쓰기 호출이다.
+/// space 와 부모 페이지가 설정돼 있어야 한다. 성공하면 게시 기록을 남기고 주소를 돌려준다.
+pub fn publish(dir: &Path, cfg: &AppConfig, title: &str) -> Result<String> {
+    let r = &cfg.report;
+    if r.space_key.is_empty() || r.parent_page_id.is_empty() {
+        return Err(anyhow!("Confluence space 와 부모 페이지 ID 를 먼저 입력해 주세요"));
+    }
+    let jc = crate::jira::load_config(dir)?;
+    if jc.cloud_id.is_empty() {
+        return Err(anyhow!("Cloud ID 가 없다(티켓 설정에서 저장)"));
+    }
+    let md = read_report(dir, title)?;
+    let storage = crate::confluence::md_to_storage(&md);
+    let client = crate::confluence::Confluence::connect(&jc.cloud_id)?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let url = rt.block_on(client.publish(&r.space_key, &r.parent_page_id, title, &storage))?;
+    mark_published(dir, title, &url)?;
+    Ok(url)
+}
+
+/// 읽기: 설정한 space·부모 페이지가 실제로 있는지 확인한다.
+pub fn check_parent(dir: &Path, cfg: &AppConfig) -> Result<String> {
+    let r = &cfg.report;
+    if r.space_key.is_empty() || r.parent_page_id.is_empty() {
+        return Err(anyhow!("space 와 부모 페이지 ID 를 먼저 입력해 주세요"));
+    }
+    let jc = crate::jira::load_config(dir)?;
+    let client = crate::confluence::Confluence::connect(&jc.cloud_id)?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let (title, space) = rt.block_on(client.page_brief(&r.parent_page_id))?;
+    if !space.eq_ignore_ascii_case(&r.space_key) {
+        return Err(anyhow!("부모 페이지 {} 는 space {space} 에 있다(설정: {})", r.parent_page_id, r.space_key));
+    }
+    Ok(format!("부모 페이지 확인: {title} ({space})"))
+}
+
+/// 아직 게시하지 않은 리포트 제목들(R.7 의 재시도 대상).
+pub fn unpublished(dir: &Path) -> Vec<String> {
+    let done = load_published(dir);
+    list_reports(dir).into_iter().map(|m| m.title).filter(|t| !done.contains_key(t)).collect()
 }
 
 pub fn kind_from(s: &str) -> Result<Kind> {
@@ -145,6 +211,31 @@ mod tests {
         let last_gen = NaiveDate::from_ymd_opt(2026, 10, 1).unwrap().and_hms_opt(9, 5, 0).unwrap();
         assert!(due(&m, last_gen, first));
         assert!(!due(&m, first, first + chrono::Duration::days(3)));
+    }
+
+    #[test]
+    fn published_index_marks_titles_and_finds_the_unpublished() {
+        let d = tmp("pub");
+        save_report(&d, "a", "1").unwrap();
+        save_report(&d, "b", "2").unwrap();
+        assert_eq!(unpublished(&d).len(), 2);
+        mark_published(&d, "a", "https://w/wiki/spaces/S/pages/1").unwrap();
+        assert_eq!(unpublished(&d), vec!["b".to_string()]);
+        let l = list_reports(&d);
+        assert_eq!(l.iter().find(|m| m.title == "a").unwrap().published_url.as_deref(), Some("https://w/wiki/spaces/S/pages/1"));
+        assert_eq!(l.iter().find(|m| m.title == "b").unwrap().published_url, None);
+        // published.json 은 리포트 목록에 끼지 않는다.
+        assert_eq!(l.len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn publish_refuses_without_space_and_parent() {
+        let d = tmp("nopub");
+        save_report(&d, "t", "x").unwrap();
+        let cfg = AppConfig::default();
+        assert!(publish(&d, &cfg, "t").unwrap_err().to_string().contains("space"));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]

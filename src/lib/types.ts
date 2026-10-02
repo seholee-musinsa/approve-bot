@@ -160,10 +160,14 @@ export interface ReportSettings {
   hour: number;
   space_key: string;
   parent_page_id: string;
+  /** publish new reports to Confluence by themselves */
+  publish_enabled: boolean;
 }
 
 export interface ReportMeta {
   title: string;
   /** unix seconds */
   generated_at: number;
+  /** null = not published yet; "" = published, address unknown */
+  published_url: string | null;
 }
