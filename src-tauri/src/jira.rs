@@ -178,6 +178,10 @@ pub struct Issue {
     pub resolution: Option<String>,
     /// 코멘트 본문 텍스트(첫 페이지).
     pub comments: Vec<String>,
+    pub summary: String,
+    /// 생성 시각, unix 초(읽지 못하면 0).
+    pub created: u64,
+    pub parent: Option<String>,
 }
 
 fn adf_text(v: &Value, out: &mut String) {
@@ -192,6 +196,11 @@ fn adf_text(v: &Value, out: &mut String) {
             out.push('\n');
         }
     }
+}
+
+/// Jira 시각(`2026-10-02T11:13:20.123+0900`)을 unix 초로. 읽지 못하면 0.
+pub fn parse_jira_time(s: &str) -> u64 {
+    chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3f%z").map(|d| d.timestamp().max(0) as u64).unwrap_or(0)
 }
 
 pub fn parse_issues(v: &Value) -> Vec<Issue> {
@@ -226,6 +235,9 @@ pub fn parse_issues(v: &Value) -> Vec<Issue> {
                         done: f.pointer("/status/statusCategory/key").and_then(Value::as_str) == Some("done"),
                         resolution: f.pointer("/resolution/name").and_then(Value::as_str).map(String::from),
                         comments,
+                        summary: f.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
+                        created: f.get("created").and_then(Value::as_str).map_or(0, parse_jira_time),
+                        parent: f.pointer("/parent/key").and_then(Value::as_str).map(String::from),
                     })
                 })
                 .collect()
@@ -257,27 +269,98 @@ pub fn reject_reason_from_comments(comments: &[String]) -> RejectReason {
     RejectReason::Unknown
 }
 
-/// 티켓 하나가 가진 키 라벨마다 처리 결과를 낸다. 완료 값 해석은 요구 4.16.
-/// 닫히지 않았으면 만든 것(Created), 판정에서 뺄 완료 값이면 아무것도 내지 않는다.
+/// 티켓 하나의 처리 결과. 완료 값 해석은 요구 4.16.
+/// 닫히지 않았으면 만든 것(Created), 판정에서 뺄 완료 값이면 None.
+pub fn outcome_of(issue: &Issue, now: u64) -> Option<KeyOutcome> {
+    if !issue.done {
+        return Some(KeyOutcome::Created { ticket: issue.key.clone(), at: now });
+    }
+    Some(match issue.resolution.as_deref() {
+        Some("Done") => KeyOutcome::Done { ticket: issue.key.clone(), at: now },
+        Some("Won't Do") => KeyOutcome::Rejected { reason: reject_reason_from_comments(&issue.comments), at: now },
+        Some("Duplicate") => KeyOutcome::Rejected { reason: RejectReason::Duplicate, at: now },
+        Some("재현 불가") => KeyOutcome::Rejected { reason: RejectReason::Wrong, at: now },
+        Some("Canceled") => KeyOutcome::Rejected { reason: RejectReason::Unknown, at: now },
+        _ => return None,
+    })
+}
+
+/// 티켓이 가진 키 라벨마다 처리 결과를 낸다.
 pub fn outcomes(issue: &Issue, now: u64) -> Vec<(String, KeyOutcome)> {
-    let outcome = if !issue.done {
-        KeyOutcome::Created { ticket: issue.key.clone(), at: now }
-    } else {
-        match issue.resolution.as_deref() {
-            Some("Done") => KeyOutcome::Done { ticket: issue.key.clone(), at: now },
-            Some("Won't Do") => KeyOutcome::Rejected { reason: reject_reason_from_comments(&issue.comments), at: now },
-            Some("Duplicate") => KeyOutcome::Rejected { reason: RejectReason::Duplicate, at: now },
-            Some("재현 불가") => KeyOutcome::Rejected { reason: RejectReason::Wrong, at: now },
-            Some("Canceled") => KeyOutcome::Rejected { reason: RejectReason::Unknown, at: now },
-            _ => return vec![],
-        }
-    };
+    let Some(outcome) = outcome_of(issue, now) else { return vec![] };
     issue
         .labels
         .iter()
         .filter_map(|l| l.strip_prefix(KEY_LABEL_PREFIX))
         .map(|k| (k.to_string(), outcome.clone()))
         .collect()
+}
+
+/// 봇 티켓 결과 집계(채택률). 보류는 채택률의 분모에서 빼고 방치로 따로 센다.
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct Results {
+    pub total: usize,
+    pub open: usize,
+    /// 열린 채 `stale_days` 넘게 처리 없는 티켓.
+    pub stale: usize,
+    pub done: usize,
+    pub rejected: usize,
+    pub wrong: usize,
+    pub low_value: usize,
+    pub size_timing: usize,
+    pub duplicate: usize,
+    pub already_fixed: usize,
+    pub no_reason: usize,
+    /// done / (done + rejected), 퍼센트. 결과가 없으면 None.
+    pub adoption_percent: Option<f64>,
+    /// 전환 기준(결과 난 건 10건 이상, 채택률 60% 이상)을 넘었는가.
+    pub ready_to_expand: bool,
+}
+
+pub const EXPAND_MIN_RESULTS: usize = 10;
+pub const EXPAND_MIN_PERCENT: f64 = 60.0;
+
+pub fn results(issues: &[Issue], now: u64, stale_days: u64) -> Results {
+    let mut r = Results { total: issues.len(), ..Default::default() };
+    for i in issues {
+        match outcome_of(i, now) {
+            Some(KeyOutcome::Created { .. }) => {
+                r.open += 1;
+                if i.created > 0 && now.saturating_sub(i.created) >= stale_days * 86_400 {
+                    r.stale += 1;
+                }
+            }
+            Some(KeyOutcome::Done { .. }) => r.done += 1,
+            Some(KeyOutcome::Rejected { reason, .. }) => {
+                r.rejected += 1;
+                match reason {
+                    RejectReason::Wrong => r.wrong += 1,
+                    RejectReason::LowValue => r.low_value += 1,
+                    RejectReason::SizeTiming => r.size_timing += 1,
+                    RejectReason::Duplicate => r.duplicate += 1,
+                    RejectReason::AlreadyFixed => r.already_fixed += 1,
+                    RejectReason::Unknown => r.no_reason += 1,
+                }
+            }
+            None => {}
+        }
+    }
+    let judged = r.done + r.rejected;
+    if judged > 0 {
+        r.adoption_percent = Some(r.done as f64 * 100.0 / judged as f64);
+    }
+    r.ready_to_expand = judged >= EXPAND_MIN_RESULTS && r.adoption_percent.is_some_and(|p| p >= EXPAND_MIN_PERCENT);
+    r
+}
+
+/// 이 설정으로 만든 봇 티켓 전부.
+pub fn jql_bot_all(c: &JiraConfig) -> String {
+    format!("labels = \"{}\"", c.bot_label)
+}
+
+/// 부모가 없는 봇 티켓(4.14). 사람이 만든 KTLO 티켓이 섞이지 않게 봇 라벨을 함께 쓴다.
+pub fn jql_bot_orphans(c: &JiraConfig) -> String {
+    format!("labels = \"{}\" AND parent is EMPTY", c.bot_label)
 }
 
 pub fn parse_users(v: &Value) -> Vec<(String, String)> {
@@ -347,7 +430,7 @@ impl Jira {
         loop {
             let mut q = vec![
                 ("jql", jql.to_string()),
-                ("fields", "labels,status,resolution,comment".to_string()),
+                ("fields", "labels,status,resolution,comment,summary,created,parent".to_string()),
                 ("maxResults", limit.min(100).to_string()),
             ];
             if let Some(t) = &token {
@@ -402,6 +485,21 @@ impl Jira {
         let title = v.pointer("/fields/summary").and_then(Value::as_str).unwrap_or("").to_string();
         let done = v.pointer("/fields/status/statusCategory/key").and_then(Value::as_str) == Some("done");
         Ok((title, done))
+    }
+
+    /// 쓰기: 티켓의 부모 Epic 지정. 호출부가 `allow_create` 를 확인한다.
+    pub async fn set_parent(&self, c: &JiraConfig, key: &str, parent: &str) -> Result<()> {
+        if !c.allow_create {
+            return Err(anyhow!("sweep-jira.json 의 allow_create 가 false 다"));
+        }
+        let resp = self
+            .http
+            .put(format!("{}/issue/{key}", self.base))
+            .basic_auth(&self.email, Some(&self.token))
+            .json(&json!({"fields": {"parent": {"key": parent}}}))
+            .send()
+            .await?;
+        Self::check(resp).await.map(|_| ())
     }
 
     /// 쓰기: 티켓 생성. 호출부가 `allow_create` 를 확인한다.
@@ -505,6 +603,9 @@ mod tests {
             done,
             resolution: res.map(String::from),
             comments: comments.iter().map(|s| s.to_string()).collect(),
+            summary: "t".into(),
+            created: 0,
+            parent: None,
         }
     }
 
@@ -523,6 +624,45 @@ mod tests {
         assert!(matches!(outcomes(&issue(true, Some("재현 불가"), &[]), 5)[0].1, KeyOutcome::Rejected { reason: RejectReason::Wrong, .. }));
         assert!(matches!(outcomes(&issue(true, Some("Canceled"), &[]), 5)[0].1, KeyOutcome::Rejected { reason: RejectReason::Unknown, .. }));
         assert!(outcomes(&issue(true, Some("미배포완료"), &[]), 5).is_empty(), "그 밖의 값은 판정에서 뺀다");
+    }
+
+    #[test]
+    fn results_count_adoption_without_open_tickets_and_flag_expansion() {
+        let mk = |done: bool, res: Option<&str>, created: u64, comments: &[&str]| {
+            let mut i = issue(done, res, comments);
+            i.created = created;
+            i
+        };
+        let now = 100 * 86_400;
+        let mut v = vec![];
+        for _ in 0..7 {
+            v.push(mk(true, Some("Done"), 1, &[]));
+        }
+        v.push(mk(true, Some("Won't Do"), 1, &["사유: 가치 낮음"]));
+        v.push(mk(true, Some("Duplicate"), 1, &[]));
+        v.push(mk(true, Some("Canceled"), 1, &[]));
+        v.push(mk(false, None, 99 * 86_400, &[])); // 열림, 최근
+        v.push(mk(false, None, 10 * 86_400, &[])); // 열림, 90일 방치
+        v.push(mk(true, Some("미배포완료"), 1, &[])); // 판정에서 뺌
+        let r = results(&v, now, 30);
+        assert_eq!((r.total, r.open, r.stale, r.done, r.rejected), (13, 2, 1, 7, 3));
+        assert_eq!((r.low_value, r.duplicate, r.no_reason), (1, 1, 1));
+        assert_eq!(r.adoption_percent, Some(70.0));
+        assert!(r.ready_to_expand);
+        // 결과가 10건 미만이면 판단하지 않는다.
+        let few = results(&v[..5], now, 30);
+        assert!(!few.ready_to_expand);
+        // 채택률이 낮으면 건수가 충분해도 넓히지 않는다.
+        let low: Vec<_> = (0..10).map(|n| mk(true, Some(if n < 3 { "Done" } else { "Won't Do" }), 1, &[])).collect();
+        assert!(!results(&low, now, 30).ready_to_expand);
+        assert_eq!(results(&[], now, 30).adoption_percent, None);
+    }
+
+    #[test]
+    fn jira_time_and_orphan_query() {
+        assert_eq!(parse_jira_time("2026-10-02T11:13:20.123+0900"), 1_790_907_200);
+        assert_eq!(parse_jira_time("garbage"), 0);
+        assert_eq!(jql_bot_orphans(&cfg()), "labels = \"bot-created\" AND parent is EMPTY");
     }
 
     #[test]

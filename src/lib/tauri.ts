@@ -9,6 +9,7 @@ import type {
   Assignee,
   GhUserHint,
   JiraView,
+  ResultsView,
   SweepRun,
   SweepStatus,
 } from "./types";
@@ -40,6 +41,9 @@ export const api = {
   searchJiraUsers: (query: string) =>
     invoke<Assignee[]>("search_jira_users", { query }),
   testJiraConnection: () => invoke<string>("test_jira_connection"),
+  collectSweepResults: () => invoke<ResultsView>("collect_sweep_results"),
+  assignParentBulk: (keys: string[]) =>
+    invoke<string>("assign_parent_bulk", { keys }),
 };
 
 export function onActivity(

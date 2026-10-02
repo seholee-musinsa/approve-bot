@@ -219,3 +219,83 @@ pub async fn test_jira_connection(state: State<'_, Arc<AppState>>) -> Result<Str
     };
     Ok(format!("연결됨: {me} · {epic}"))
 }
+
+#[derive(serde::Serialize)]
+pub struct OrphanTicket {
+    pub key: String,
+    pub summary: String,
+}
+
+#[derive(serde::Serialize)]
+pub struct ResultsView {
+    pub results: crate::jira::Results,
+    /// 부모 없는 봇 티켓(4.14).
+    pub orphans: Vec<OrphanTicket>,
+    pub parent_key: String,
+    pub allow_create: bool,
+}
+
+/// Read Jira for the bot's tickets, fold what happened to them into the ledger
+/// (so rejections and completions steer later proposals), and total the results.
+#[tauri::command]
+pub async fn collect_sweep_results(state: State<'_, Arc<AppState>>) -> Result<ResultsView, String> {
+    let (c, j) = jira_client(&state.config_dir)?;
+    let issues = j.search(&crate::jira::jql_bot_all(&c), 500).await.map_err(|e| format!("{e:#}"))?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let mut ledger = crate::sweep_state::load(&state.config_dir);
+    for i in &issues {
+        for (k, o) in crate::jira::outcomes(i, now) {
+            ledger.merge_outcome(&k, o);
+        }
+    }
+    crate::sweep_state::save(&state.config_dir, &ledger).map_err(|e| e.to_string())?;
+    let orphans = issues
+        .iter()
+        .filter(|i| i.parent.is_none() && !i.done)
+        .map(|i| OrphanTicket { key: i.key.clone(), summary: i.summary.clone() })
+        .collect();
+    Ok(ResultsView {
+        results: crate::jira::results(&issues, now, 30),
+        orphans,
+        parent_key: c.parent_key.clone().unwrap_or_default(),
+        allow_create: c.allow_create,
+    })
+}
+
+/// Write: put the listed bot tickets under the configured parent Epic. Needs
+/// `allow_create`, and refuses a parent that is already done. Only tickets that
+/// carry the bot label and have no parent are touched.
+#[tauri::command]
+pub async fn assign_parent_bulk(state: State<'_, Arc<AppState>>, keys: Vec<String>) -> Result<String, String> {
+    let (c, j) = jira_client(&state.config_dir)?;
+    if !c.allow_create {
+        return Err("Jira 쓰기가 꺼져 있습니다(sweep-jira.json 의 allow_create)".into());
+    }
+    let parent = c.parent_key.clone().ok_or_else(|| "부모 Epic 이 설정되어 있지 않습니다".to_string())?;
+    let (title, done) = j.issue_brief(&parent).await.map_err(|e| format!("{e:#}"))?;
+    if done {
+        return Err(format!("부모 Epic {parent} 가 완료 상태라 지정하지 않았습니다: {title}"));
+    }
+    // 화면에서 넘어온 키를 믿지 않고 지금 부모 없는 봇 티켓인지 다시 확인한다.
+    let orphans = j.search(&crate::jira::jql_bot_orphans(&c), 500).await.map_err(|e| format!("{e:#}"))?;
+    let allowed: std::collections::HashSet<&str> = orphans.iter().map(|i| i.key.as_str()).collect();
+    let (mut ok, mut skipped, mut failed) = (0, 0, Vec::new());
+    for k in &keys {
+        if !allowed.contains(k.as_str()) {
+            skipped += 1;
+            continue;
+        }
+        match j.set_parent(&c, k, &parent).await {
+            Ok(()) => ok += 1,
+            Err(e) => failed.push(format!("{k}: {e:#}")),
+        }
+    }
+    let mut msg = format!("{parent} 아래로 {ok}건 지정");
+    if skipped > 0 {
+        msg.push_str(&format!(" · 건너뜀 {skipped}건(이미 부모가 있거나 봇 티켓이 아님)"));
+    }
+    if !failed.is_empty() {
+        msg.push_str(&format!(" · 실패 {}건: {}", failed.len(), failed.join(" / ")));
+    }
+    Ok(msg)
+}

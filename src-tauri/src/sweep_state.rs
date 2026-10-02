@@ -185,6 +185,20 @@ impl Ledger {
         self.keys.insert(key.to_string(), outcome);
     }
 
+    /// Jira 에서 다시 읽은 결과를 합친다. 같은 결과면 처음 기록한 시각을 지킨다
+    /// (거절 뒤 재제안 대기 기간이 읽을 때마다 새로 시작하지 않게).
+    pub fn merge_outcome(&mut self, key: &str, new: KeyOutcome) {
+        let same = match (self.keys.get(key), &new) {
+            (Some(KeyOutcome::Created { ticket: a, .. }), KeyOutcome::Created { ticket: b, .. }) => a == b,
+            (Some(KeyOutcome::Done { ticket: a, .. }), KeyOutcome::Done { ticket: b, .. }) => a == b,
+            (Some(KeyOutcome::Rejected { reason: a, .. }), KeyOutcome::Rejected { reason: b, .. }) => a == b,
+            _ => false,
+        };
+        if !same {
+            self.keys.insert(key.to_string(), new);
+        }
+    }
+
     pub fn is_carried(&self, key: &str) -> bool {
         self.carryover.iter().any(|c| c.findings.iter().any(|f| f.key == key))
     }
@@ -324,6 +338,18 @@ mod tests {
         assert_eq!(c.slices[2].status, SliceStatus::Pending);
         assert_eq!(c.started_commit, "c2");
         assert_eq!(c.done_count(), 1);
+    }
+
+    #[test]
+    fn merge_outcome_keeps_the_first_time_for_the_same_result() {
+        let mut l = Ledger::default();
+        l.record("k", KeyOutcome::Rejected { reason: RejectReason::SizeTiming, at: 10 });
+        l.merge_outcome("k", KeyOutcome::Rejected { reason: RejectReason::SizeTiming, at: 99 });
+        assert_eq!(l.keys["k"], KeyOutcome::Rejected { reason: RejectReason::SizeTiming, at: 10 });
+        l.merge_outcome("k", KeyOutcome::Rejected { reason: RejectReason::Wrong, at: 99 });
+        assert_eq!(l.keys["k"], KeyOutcome::Rejected { reason: RejectReason::Wrong, at: 99 });
+        l.merge_outcome("new", KeyOutcome::Done { ticket: "T".into(), at: 5 });
+        assert!(matches!(l.keys["new"], KeyOutcome::Done { .. }));
     }
 
     #[test]

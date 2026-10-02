@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { api } from "../lib/tauri";
 import { JiraPanels } from "./JiraPanels";
+import { ResultsPanel } from "./ResultsPanel";
 import type {
   AppConfig,
   CreateMode,
@@ -111,6 +112,7 @@ export function SweepTab({ value, onChange, dirty }: Props) {
           </div>
         )}
       </div>
+      <ResultsPanel />
       <JiraPanels />
       <RunLog />
     </>
