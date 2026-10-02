@@ -3,6 +3,7 @@ import { ConnectionStatus } from "./components/ConnectionStatus";
 import { RepositoriesPanel } from "./components/RepositoriesPanel";
 import { AuthorsPanel } from "./components/AuthorsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { ReportsTab, ReportViewer } from "./components/ReportsTab";
 import { TicketLog } from "./components/TicketLog";
 import { SweepTab } from "./components/SweepTab";
 import { ActivityLog } from "./components/ActivityLog";
@@ -22,6 +23,7 @@ const DEFAULT_CFG: AppConfig = {
   review_deep: true,
   approve_only_after_review: true,
   inline_comments_enabled: true,
+  report: { weekly_enabled: false, monthly_enabled: false, hour: 9, space_key: "", parent_page_id: "" },
   sweep: {
     enabled: false,
     repo: "",
@@ -42,7 +44,8 @@ function eq(a: AppConfig, b: AppConfig): boolean {
 }
 
 export default function App() {
-  const [tab, setTab] = useState<"review" | "sweep">("review");
+  const [openReport, setOpenReport] = useState<string | null>(null);
+  const [tab, setTab] = useState<"review" | "sweep" | "report">("review");
   const [saved, setSaved] = useState<AppConfig>(DEFAULT_CFG);
   const [draft, setDraft] = useState<AppConfig>(DEFAULT_CFG);
   const [busy, setBusy] = useState(false);
@@ -106,8 +109,22 @@ export default function App() {
         <button className={tab === "sweep" ? "tab active" : "tab"} onClick={() => setTab("sweep")}>
           정기 스윕
         </button>
+        <button className={tab === "report" ? "tab active" : "tab"} onClick={() => setTab("report")}>
+          리포트
+        </button>
       </div>
-      {tab === "sweep" ? (
+      {tab === "report" ? (
+        <div className="body">
+          <div className="col">
+            <ReportsTab open={openReport} onOpen={setOpenReport} value={draft} onChange={setDraft} dirty={dirty} />
+            {saveBar}
+            {err && <div className="error-text">{err}</div>}
+          </div>
+          <div className="col">
+            <ReportViewer title={openReport} />
+          </div>
+        </div>
+      ) : tab === "sweep" ? (
         <div className="body">
           <div className="col">
             <SweepTab value={draft} onChange={setDraft} dirty={dirty} />

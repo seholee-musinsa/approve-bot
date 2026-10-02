@@ -72,6 +72,35 @@ pub struct AppConfig {
     /// Regular repo sweep (all defaulted, off until switched on).
     #[serde(default)]
     pub sweep: SweepSettings,
+    /// Weekly / monthly sweep report.
+    #[serde(default)]
+    pub report: ReportSettings,
+}
+
+/// Report schedule (Monday for weekly, the 1st for monthly) and where to publish.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReportSettings {
+    pub weekly_enabled: bool,
+    pub monthly_enabled: bool,
+    pub hour: u32,
+    /// Confluence space key and parent page id (used when publishing).
+    pub space_key: String,
+    pub parent_page_id: String,
+}
+
+impl Default for ReportSettings {
+    fn default() -> Self {
+        Self { weekly_enabled: false, monthly_enabled: false, hour: 9, space_key: String::new(), parent_page_id: String::new() }
+    }
+}
+
+impl ReportSettings {
+    pub fn clamp(&mut self) {
+        self.hour = self.hour.min(23);
+        self.space_key = self.space_key.trim().to_string();
+        self.parent_page_id = self.parent_page_id.trim().to_string();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -197,6 +226,7 @@ impl Default for AppConfig {
             review_second_pass_enabled: true,
             review_value_trace_enabled: false,
             sweep: SweepSettings::default(),
+            report: ReportSettings::default(),
         }
     }
 }
@@ -204,6 +234,7 @@ impl Default for AppConfig {
 impl AppConfig {
     pub fn clamp(&mut self) {
         self.sweep.clamp();
+        self.report.clamp();
         if self.polling_interval_seconds < 30 {
             self.polling_interval_seconds = 30;
         }

@@ -527,6 +527,7 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
 /// `approve-bot sweep-once --repo owner/name [--cache-dir <dir>] [--clear-cache] ...` reads an app-owned cache clone (kept fresh, see `repocache`) instead of a local folder.
 /// `--exclude <glob>` (repeatable) and `sweep-rules.json` in the config dir keep paths out of the sweep.
 /// `--day [--save] [--open-tickets n]` takes the next slice of the cycle in the ledger (`sweep-state.json` in the config dir), reads it, and prints what would be created today and what is carried over; `--save` also writes the ledger (nothing else is written; Jira is not touched, so the open-ticket count is given by hand).
+/// `--report weekly|monthly` builds the report of the last full week/month (reads Jira, writes `reports/<title>.md` locally).
 /// `--reset-cycle` starts the cycle over (slices unread, carry-over dropped; the key history stays).
 /// `--create [--create-max n]` (with `--day`) really creates the day's tickets in Jira, only when `sweep-jira.json` has `allow_create: true`; it implies `--save` so the created keys are recorded.
 /// `--slice <rank|name part> --dry-run [--model m] [--thinking n] [--max-candidates n]` has the model read that slice and prints ticket drafts (nothing is written anywhere); `--print-prompt` shows the prompt without calling the model.
@@ -553,6 +554,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut open_tickets: usize = 0;
     let mut open_tickets_given = false;
     let mut create = false;
+    let mut report_kind: Option<String> = None;
     let mut reset_cycle = false;
     let mut create_max: usize = usize::MAX;
     let mut i = 0;
@@ -580,6 +582,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             "--exclude" => exclude.push(value(&mut i)?),
             "--day" => day = true,
             "--create" => create = true,
+            "--report" => report_kind = Some(value(&mut i)?),
             "--reset-cycle" => reset_cycle = true,
             "--create-max" => create_max = value(&mut i)?.parse()?,
             "--save" => save = true,
@@ -597,6 +600,14 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             other => return Err(anyhow::anyhow!("unknown flag: {other}")),
         }
         i += 1;
+    }
+    if let Some(kind) = report_kind {
+        // Build the report for the last full week/month from Jira (read) into reports/ (local file).
+        let dir = crate::eval_cli::config_dir()?;
+        let cfg = crate::config::load(&dir).unwrap_or_default();
+        let now = now_secs();
+        let title = crate::report_job::generate(&dir, &cfg, crate::report_job::kind_from(&kind)?, crate::sweep_sched::to_local(now), now)?;
+        return Ok(format!("리포트를 만들었다: {title}\n{}\n\n{}", crate::report_job::reports_dir(&dir).display(), crate::report_job::read_report(&dir, &title)?));
     }
     if reset_cycle {
         // Back to the start of a cycle: every slice unread, carry-over dropped. The
@@ -814,7 +825,7 @@ fn create_tickets(
         if let Some(p) = prev.first() {
             body.push_str(&format!("\n\n재발: 이전에 {p} 로 완료했던 항목이 다시 발견됐다."));
         }
-        let t = jira::NewTicket { title: &d.title, body: &body, keys: &keys, estimate_md: d.effort.md(), assignee: cfg.assignees.first().map(String::as_str) };
+        let t = jira::NewTicket { title: &d.title, body: &body, keys: &keys, estimate_md: d.effort.md(), assignee: cfg.assignees.first().map(String::as_str), category: d.category.name() };
         match rt.block_on(client.create(&cfg, &t)) {
             Ok(key) => {
                 for k in &keys {

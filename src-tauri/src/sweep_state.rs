@@ -74,6 +74,11 @@ pub struct Ledger {
     /// 스케줄러가 마지막으로 실행(또는 켠) 시각, unix 초.
     #[serde(default)]
     pub last_run_at: Option<u64>,
+    /// 리포트를 마지막으로 만든(또는 켠) 시각, unix 초.
+    #[serde(default)]
+    pub last_weekly_at: Option<u64>,
+    #[serde(default)]
+    pub last_monthly_at: Option<u64>,
 }
 
 impl Cycle {

@@ -338,3 +338,27 @@ pub async fn list_bot_tickets(state: State<'_, Arc<AppState>>) -> Result<Vec<Tic
         })
         .collect())
 }
+
+#[tauri::command]
+pub async fn list_reports(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::report_job::ReportMeta>, String> {
+    Ok(crate::report_job::list_reports(&state.config_dir))
+}
+
+#[tauri::command]
+pub async fn read_report(state: State<'_, Arc<AppState>>, title: String) -> Result<String, String> {
+    crate::report_job::read_report(&state.config_dir, &title).map_err(|e| format!("{e:#}"))
+}
+
+/// Builds the report for the last full week or month now ("weekly" | "monthly"). Reads Jira, writes a local file.
+#[tauri::command]
+pub async fn generate_report(state: State<'_, Arc<AppState>>, kind: String) -> Result<String, String> {
+    let kind = crate::report_job::kind_from(&kind).map_err(|e| format!("{e:#}"))?;
+    let cfg = state.config.lock().await.clone();
+    let dir = state.config_dir.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let _ = tx.send(crate::report_job::generate(&dir, &cfg, kind, crate::sweep_sched::to_local(now), now).map_err(|e| format!("{e:#}")));
+    });
+    rx.await.map_err(|_| "리포트 만들기가 중단됐다".to_string())?
+}

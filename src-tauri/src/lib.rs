@@ -17,7 +17,9 @@ mod review;
 mod state;
 mod sweep;
 mod jira;
+mod report_job;
 mod sweep_day;
+mod sweep_report;
 mod sweep_review;
 mod sweep_sched;
 mod sweep_state;
@@ -86,6 +88,9 @@ pub fn run() {
             commands::collect_sweep_results,
             commands::assign_parent_bulk,
             commands::list_bot_tickets,
+            commands::list_reports,
+            commands::read_report,
+            commands::generate_report,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

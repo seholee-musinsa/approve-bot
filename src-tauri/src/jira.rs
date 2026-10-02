@@ -13,6 +13,13 @@ use std::time::Duration;
 
 /// 지적 한 건의 안정 키를 티켓에 남기는 라벨 접두(3.3 b). 라벨은 공백 없는 짧은 문자열이어야 한다.
 pub const KEY_LABEL_PREFIX: &str = "sweep-";
+/// 분류 라벨 접두. `sweep-` 로 시작하지 않아 키 라벨과 섞이지 않는다.
+pub const CATEGORY_LABEL_PREFIX: &str = "sweepcat-";
+
+/// 티켓의 분류(없으면 None: 분류 라벨이 생기기 전에 만든 티켓).
+pub fn category_of(labels: &[String]) -> Option<&str> {
+    labels.iter().find_map(|l| l.strip_prefix(CATEGORY_LABEL_PREFIX))
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JiraConfig {
@@ -150,12 +157,17 @@ pub struct NewTicket<'a> {
     pub keys: &'a [String],
     pub estimate_md: f64,
     pub assignee: Option<&'a str>,
+    /// rule / split / debt. 라벨 `sweepcat-<분류>` 로 남겨 리포트가 분류별로 집계한다.
+    pub category: &'a str,
 }
 
 /// 생성 요청 본문. 스프린트는 비운다(기획 시간에 넣는다).
 pub fn build_create_body(c: &JiraConfig, t: &NewTicket) -> Value {
     let mut labels = vec![c.work_label.clone(), c.bot_label.clone()];
     labels.extend(t.keys.iter().map(|k| key_label(k)));
+    if !t.category.is_empty() {
+        labels.push(format!("{CATEGORY_LABEL_PREFIX}{}", t.category));
+    }
     let mut fields = json!({
         "project": {"key": c.project},
         "issuetype": {"name": c.issue_type},
@@ -583,9 +595,10 @@ mod tests {
     fn create_body_has_labels_parent_estimate_and_no_sprint() {
         let c = cfg();
         let keys = vec!["k1".to_string()];
-        let b = build_create_body(&c, &NewTicket { title: "[KTLO] 제목", body: "# 배경\n설명\n- 하나\n- 둘", keys: &keys, estimate_md: 0.5, assignee: Some("acc") });
+        let b = build_create_body(&c, &NewTicket { title: "[KTLO] 제목", body: "# 배경\n설명\n- 하나\n- 둘", keys: &keys, estimate_md: 0.5, assignee: Some("acc"), category: "debt" });
         let f = &b["fields"];
-        assert_eq!(f["labels"], json!(["KTLO", "bot-created", "sweep-k1"]));
+        assert_eq!(f["labels"], json!(["KTLO", "bot-created", "sweep-k1", "sweepcat-debt"]));
+        assert_eq!(category_of(&["x".to_string(), "sweepcat-split".to_string()]), Some("split"));
         assert_eq!(f["parent"]["key"], "SID-1");
         assert_eq!(f["customfield_12766"], 0.5);
         assert_eq!(f["assignee"]["accountId"], "acc");
@@ -598,7 +611,7 @@ mod tests {
     fn create_body_without_parent_or_assignee() {
         let mut c = cfg();
         c.parent_key = None;
-        let b = build_create_body(&c, &NewTicket { title: "t", body: "b", keys: &[], estimate_md: 1.0, assignee: None });
+        let b = build_create_body(&c, &NewTicket { title: "t", body: "b", keys: &[], estimate_md: 1.0, assignee: None, category: "" });
         assert!(b["fields"].get("parent").is_none() && b["fields"].get("assignee").is_none());
     }
 
@@ -677,6 +690,14 @@ mod tests {
         let low: Vec<_> = (0..10).map(|n| mk(true, Some(if n < 3 { "Done" } else { "Won't Do" }), 1, &[])).collect();
         assert!(!results(&low, now, 30).ready_to_expand);
         assert_eq!(results(&[], now, 30).adoption_percent, None);
+    }
+
+    #[test]
+    fn category_label_is_not_mistaken_for_a_key_label() {
+        let mut i = issue(false, None, &[]);
+        i.labels = vec!["sweep-abc".into(), "sweepcat-rule".into()];
+        let keys: Vec<_> = outcomes(&i, 1).into_iter().map(|(k, _)| k).collect();
+        assert_eq!(keys, ["abc"]);
     }
 
     #[test]
