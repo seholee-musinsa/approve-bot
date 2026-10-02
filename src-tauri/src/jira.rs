@@ -379,6 +379,39 @@ pub fn jql_bot_orphans(c: &JiraConfig) -> String {
     format!("labels = \"{}\" AND parent is EMPTY", c.bot_label)
 }
 
+/// 담당자 배정(요구 5장): 열린 자동 생성 티켓이 가장 적은 사람에게, 같으면 무작위로 고른다.
+/// 열린 티켓이 상한에 닿은 사람은 후보에서 뺀다. 아무도 남지 않으면 None.
+pub struct AssigneeBook {
+    open: Vec<(String, usize)>,
+    cap: usize,
+}
+
+impl AssigneeBook {
+    pub fn new(open: Vec<(String, usize)>, cap: usize) -> Self {
+        Self { open, cap }
+    }
+
+    /// 한 명을 골라 그 사람의 열린 수를 하나 올린다. `rand` 는 같은 수일 때 고르는 데 쓴다.
+    pub fn pick(&mut self, rand: u64) -> Option<String> {
+        let min = self.open.iter().filter(|(_, n)| *n < self.cap).map(|(_, n)| *n).min()?;
+        let ties: Vec<usize> = self.open.iter().enumerate().filter(|(_, (_, n))| *n == min).map(|(i, _)| i).collect();
+        let i = ties[(rand % ties.len() as u64) as usize];
+        self.open[i].1 += 1;
+        Some(self.open[i].0.clone())
+    }
+
+    /// 생성에 실패한 배정을 되돌린다.
+    pub fn release(&mut self, id: &str) {
+        if let Some(e) = self.open.iter_mut().find(|(a, _)| a == id) {
+            e.1 = e.1.saturating_sub(1);
+        }
+    }
+
+    pub fn total_open(&self) -> usize {
+        self.open.iter().map(|(_, n)| n).sum()
+    }
+}
+
 /// 티켓 키로 만든 링크. 사이트 주소가 없으면 빈 문자열.
 pub fn browse_url(site: &str, key: &str) -> String {
     if site.is_empty() { String::new() } else { format!("{}/browse/{key}", site.trim_end_matches('/')) }
@@ -469,6 +502,18 @@ impl Jira {
         Ok(all)
     }
 
+    /// 읽기: 담당자 목록 각각의 열린 자동 생성 티켓 수(같은 사람은 한 번만).
+    pub async fn open_counts(&self, c: &JiraConfig) -> Result<Vec<(String, usize)>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut out = Vec::new();
+        for a in &c.assignees {
+            if seen.insert(a.clone()) {
+                out.push((a.clone(), self.count_open_bot(c, a).await?));
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn count_open_bot(&self, c: &JiraConfig, assignee: &str) -> Result<usize> {
         Ok(self.search(&jql_open_bot(c, assignee), 1000).await?.len())
     }
@@ -547,6 +592,38 @@ mod tests {
     fn old_config_with_allow_create_still_loads() {
         let c: JiraConfig = serde_json::from_str(r#"{"cloud_id":"x","allow_create":false,"open_cap":7}"#).unwrap();
         assert_eq!(c.open_cap, 7);
+    }
+
+    #[test]
+    fn assignees_are_spread_evenly_and_the_cap_is_respected() {
+        let mut b = AssigneeBook::new(vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)], 10);
+        let picks: Vec<String> = (0..6).map(|_| b.pick(0).unwrap()).collect();
+        // 같은 수에서는 앞에서부터, 하나씩 번갈아 간다.
+        assert_eq!(picks, ["a", "b", "c", "a", "b", "c"]);
+        // 이미 많이 가진 사람은 건너뛰고 가장 적은 사람에게 간다.
+        let mut b = AssigneeBook::new(vec![("a".into(), 5), ("b".into(), 1), ("c".into(), 3)], 10);
+        assert_eq!(b.pick(0).unwrap(), "b");
+        assert_eq!(b.pick(0).unwrap(), "b");
+        // b 가 3건이 되면 c(3건)와 같아지고, 같을 때는 목록에서 앞선 b 가 뽑힌다.
+        assert_eq!(b.pick(0).unwrap(), "b");
+        assert_eq!(b.pick(0).unwrap(), "c");
+    }
+
+    #[test]
+    fn ties_use_the_random_value_and_full_people_are_skipped() {
+        let mut b = AssigneeBook::new(vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)], 10);
+        assert_eq!(b.pick(1).unwrap(), "b");
+        let mut b = AssigneeBook::new(vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)], 10);
+        assert_eq!(b.pick(5).unwrap(), "c"); // 5 % 3 = 2
+        // 상한(3)에 닿은 사람은 후보에서 빠진다.
+        let mut b = AssigneeBook::new(vec![("a".into(), 3), ("b".into(), 2)], 3);
+        assert_eq!(b.pick(0).unwrap(), "b");
+        assert_eq!(b.pick(0), None, "둘 다 상한이면 아무에게도 배정하지 않는다");
+        // 실패한 배정은 되돌린다.
+        b.release("b");
+        assert_eq!(b.pick(0).unwrap(), "b");
+        assert_eq!(b.total_open(), 6);
+        assert_eq!(AssigneeBook::new(vec![], 10).pick(0), None);
     }
 
     #[test]
