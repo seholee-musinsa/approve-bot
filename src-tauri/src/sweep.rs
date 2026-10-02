@@ -527,6 +527,7 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
 /// `approve-bot sweep-once --repo owner/name [--cache-dir <dir>] [--clear-cache] ...` reads an app-owned cache clone (kept fresh, see `repocache`) instead of a local folder.
 /// `--exclude <glob>` (repeatable) and `sweep-rules.json` in the config dir keep paths out of the sweep.
 /// `--day [--save] [--open-tickets n]` takes the next slice of the cycle in the ledger (`sweep-state.json` in the config dir), reads it, and prints what would be created today and what is carried over; `--save` also writes the ledger (nothing else is written; Jira is not touched, so the open-ticket count is given by hand).
+/// `--create [--create-max n]` (with `--day`) really creates the day's tickets in Jira, only when `sweep-jira.json` has `allow_create: true`; it implies `--save` so the created keys are recorded.
 /// `--slice <rank|name part> --dry-run [--model m] [--thinking n] [--max-candidates n]` has the model read that slice and prints ticket drafts (nothing is written anywhere); `--print-prompt` shows the prompt without calling the model.
 pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut local = String::new();
@@ -550,6 +551,8 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut save = false;
     let mut open_tickets: usize = 0;
     let mut open_tickets_given = false;
+    let mut create = false;
+    let mut create_max: usize = usize::MAX;
     let mut i = 0;
     while i < flags.len() {
         let name = flags[i].as_str();
@@ -574,6 +577,8 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             "--max-candidates" => max_candidates = value(&mut i)?.parse()?,
             "--exclude" => exclude.push(value(&mut i)?),
             "--day" => day = true,
+            "--create" => create = true,
+            "--create-max" => create_max = value(&mut i)?.parse()?,
             "--save" => save = true,
             "--open-tickets" => {
                 open_tickets = value(&mut i)?.parse()?;
@@ -595,6 +600,9 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     }
     if repo.is_empty() && local.is_empty() {
         return Err(anyhow::anyhow!("--repo owner/name or --local <checkout dir> is required"));
+    }
+    if create && !day {
+        return Err(anyhow::anyhow!("--create is only for --day"));
     }
     if save && !day {
         return Err(anyhow::anyhow!("--save is only for --day"));
@@ -651,7 +659,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     };
     let slices = rank(pack_slices(&files, &w, max_lines), by);
     if day {
-        let ctx = DayCtx { notes: &notes, files: &files, w: &w, checkout: &checkout, commit: &commit, max_candidates, max_files, model, thinking, save, open_tickets, open_tickets_given };
+        let ctx = DayCtx { notes: &notes, files: &files, w: &w, checkout: &checkout, commit: &commit, max_candidates, max_files, model, thinking, save: save || create, open_tickets, open_tickets_given, create, create_max };
         return run_day(&ctx, &slices);
     }
     if let Some(sel) = &slice_sel {
@@ -754,10 +762,53 @@ struct DayCtx<'a> {
     save: bool,
     open_tickets: usize,
     open_tickets_given: bool,
+    create: bool,
+    create_max: usize,
 }
 
 fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// The only place that writes to Jira. Needs `allow_create` in the Jira config.
+/// A ticket that fails is reported and left out of the ledger; the ones made
+/// before it stay recorded (their key labels also let the next run find them).
+fn create_tickets(
+    dir: &Path,
+    plan: &crate::sweep_day::DayPlan,
+    slice: &str,
+    commit: &str,
+    max: usize,
+    now: u64,
+    ledger: &mut crate::sweep_state::Ledger,
+) -> anyhow::Result<String> {
+    use crate::{jira, sweep_review as sr, sweep_state::KeyOutcome};
+    let cfg = jira::load_config(dir)?;
+    if !cfg.allow_create {
+        return Err(anyhow::anyhow!("sweep-jira.json 의 allow_create 가 false 라 만들지 않았다"));
+    }
+    let client = jira::Jira::connect(&cfg)?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let mut text = String::new();
+    for d in plan.create.iter().take(max) {
+        let mut body = sr::render_ticket(d, &plan.kept, slice, commit);
+        let keys: Vec<String> = d.findings.iter().map(|&i| plan.kept[i].key.clone()).collect();
+        let prev: Vec<&String> = keys.iter().filter_map(|k| plan.recurrences.get(k)).collect();
+        if let Some(p) = prev.first() {
+            body.push_str(&format!("\n\n재발: 이전에 {p} 로 완료했던 항목이 다시 발견됐다."));
+        }
+        let t = jira::NewTicket { title: &d.title, body: &body, keys: &keys, estimate_md: d.effort.md(), assignee: cfg.assignees.first().map(String::as_str) };
+        match rt.block_on(client.create(&cfg, &t)) {
+            Ok(key) => {
+                for k in &keys {
+                    ledger.record(k, KeyOutcome::Created { ticket: key.clone(), at: now });
+                }
+                text.push_str(&format!("생성: {key} {}\n", d.title));
+            }
+            Err(e) => text.push_str(&format!("⚠️ 생성 실패 {}: {e:#}\n", d.title)),
+        }
+    }
+    Ok(text)
 }
 
 /// Read-only Jira lookups for a day: (open bot tickets of the first assignee unless
@@ -886,6 +937,12 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     }
     for d in &plan.carry {
         out.push_str(&format!("이월: {}\n", d.title));
+    }
+    if c.create && !plan.create.is_empty() {
+        match create_tickets(&dir, &plan, &input.name, c.commit, c.create_max, now, &mut ledger) {
+            Ok(text) => out.push_str(&text),
+            Err(e) => out.push_str(&format!("⚠️ 생성하지 못했다: {e:#}\n")),
+        }
     }
     ledger.mark_read(&slice.name, c.commit, now);
     sd::park(&mut ledger, &plan, c.commit);

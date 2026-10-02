@@ -496,7 +496,7 @@ pub fn verify(raw: Vec<RawFinding>, root: &Path, slice_files: &BTreeSet<String>)
             Some(existing) => {
                 let (mut win, lose) = if finding.confidence > existing.confidence { (finding, existing.clone()) } else { (existing.clone(), finding) };
                 if lose.claim != win.claim && !win.evidence.contains(&lose.claim) {
-                    win.evidence = format!("{}\n그 밖에: {}", win.evidence, lose.claim);
+                    win.evidence = format!("{} / 그 밖에: {}", win.evidence, lose.claim);
                 }
                 *existing = win;
             }
