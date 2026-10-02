@@ -79,6 +79,10 @@ pub fn run() {
             commands::get_sweep_log,
             commands::run_sweep_now,
             commands::reset_sweep_cycle,
+            commands::get_jira_settings,
+            commands::update_jira_settings,
+            commands::search_jira_users,
+            commands::test_jira_connection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

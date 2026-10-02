@@ -955,7 +955,8 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         }
     }
     let by_path: std::collections::HashMap<&str, f64> = c.files.iter().map(|f| (f.path.as_str(), score(f, c.w))).collect();
-    let policy = sd::Policy { max_files: c.max_files, ..Default::default() };
+    let open_cap = crate::jira::load_config(&dir).map(|j| j.open_cap).unwrap_or(10);
+    let policy = sd::Policy { max_files: c.max_files, open_cap, ..Default::default() };
     let mut plan = sd::plan_day(incoming.clone(), &view, &policy, now, open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
     out.push_str(&format!(
         "지적 {}건 → 후보 {}건 · 오늘 만들 티켓 {}건 · 이월 {}건 · 걸러냄 {}건 (열린 봇 티켓 {} / 상한 {})\n",

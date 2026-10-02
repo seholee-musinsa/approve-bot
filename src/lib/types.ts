@@ -97,3 +97,18 @@ export type GhLoginProgress =
   | { kind: "code"; code: string }
   | { kind: "done" }
   | { kind: "failed"; message: string };
+
+export interface Assignee {
+  id: string;
+  name: string;
+}
+
+export interface JiraView {
+  cloud_id: string;
+  project: string;
+  parent_key: string;
+  open_cap: number;
+  assignees: Assignee[];
+  /** read only: the second lock on writing to Jira, changed in the file by hand */
+  allow_create: boolean;
+}

@@ -6,7 +6,9 @@ import type {
   AppConfig,
   ConnectionStatus,
   GhLoginProgress,
+  Assignee,
   GhUserHint,
+  JiraView,
   SweepRun,
   SweepStatus,
 } from "./types";
@@ -32,6 +34,12 @@ export const api = {
   getSweepLog: (limit = 30) => invoke<SweepRun[]>("get_sweep_log", { limit }),
   runSweepNow: () => invoke<boolean>("run_sweep_now"),
   resetSweepCycle: () => invoke<void>("reset_sweep_cycle"),
+  getJiraSettings: () => invoke<JiraView>("get_jira_settings"),
+  updateJiraSettings: (view: JiraView) =>
+    invoke<JiraView>("update_jira_settings", { view }),
+  searchJiraUsers: (query: string) =>
+    invoke<Assignee[]>("search_jira_users", { query }),
+  testJiraConnection: () => invoke<string>("test_jira_connection"),
 };
 
 export function onActivity(
