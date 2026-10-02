@@ -3,6 +3,7 @@ import { ConnectionStatus } from "./components/ConnectionStatus";
 import { RepositoriesPanel } from "./components/RepositoriesPanel";
 import { AuthorsPanel } from "./components/AuthorsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { TicketLog } from "./components/TicketLog";
 import { SweepTab } from "./components/SweepTab";
 import { ActivityLog } from "./components/ActivityLog";
 import { ToastHost } from "./components/ToastHost";
@@ -112,6 +113,9 @@ export default function App() {
             <SweepTab value={draft} onChange={setDraft} dirty={dirty} />
             {saveBar}
             {err && <div className="error-text">{err}</div>}
+          </div>
+          <div className="col">
+            <TicketLog />
           </div>
         </div>
       ) : (

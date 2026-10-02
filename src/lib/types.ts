@@ -140,3 +140,15 @@ export interface ResultsView {
   parent_key: string;
   allow_create: boolean;
 }
+
+export interface TicketRow {
+  key: string;
+  summary: string;
+  status: string;
+  resolution: string | null;
+  assignee: string | null;
+  /** unix seconds */
+  created: number;
+  url: string;
+  has_parent: boolean;
+}

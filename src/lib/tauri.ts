@@ -12,6 +12,7 @@ import type {
   ResultsView,
   SweepRun,
   SweepStatus,
+  TicketRow,
 } from "./types";
 
 export const ACTIVITY_EVENT = "approve-bot://activity";
@@ -42,6 +43,7 @@ export const api = {
     invoke<Assignee[]>("search_jira_users", { query }),
   testJiraConnection: () => invoke<string>("test_jira_connection"),
   collectSweepResults: () => invoke<ResultsView>("collect_sweep_results"),
+  listBotTickets: () => invoke<TicketRow[]>("list_bot_tickets"),
   assignParentBulk: (keys: string[]) =>
     invoke<string>("assign_parent_bulk", { keys }),
 };

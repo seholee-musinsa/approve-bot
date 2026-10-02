@@ -85,6 +85,7 @@ pub fn run() {
             commands::test_jira_connection,
             commands::collect_sweep_results,
             commands::assign_parent_bulk,
+            commands::list_bot_tickets,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
