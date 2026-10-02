@@ -68,6 +68,81 @@ pub struct AppConfig {
     /// touches). Off: it showed no recall gain in the eval.
     #[serde(default)]
     pub review_value_trace_enabled: bool,
+
+    /// Regular repo sweep (all defaulted, off until switched on).
+    #[serde(default)]
+    pub sweep: SweepSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Frequency {
+    #[default]
+    Daily,
+    Weekly,
+    Monthly,
+}
+
+/// How a scheduled sweep treats the tickets it finds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CreateMode {
+    /// Print drafts only; nothing is written to Jira.
+    #[default]
+    Draft,
+    /// Create tickets (also needs `allow_create` in sweep-jira.json).
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SweepSettings {
+    pub enabled: bool,
+    /// `owner/name` of the repo to sweep.
+    pub repo: String,
+    pub frequency: Frequency,
+    /// 0 = Monday … 6 = Sunday (weekly).
+    pub weekday: u32,
+    /// 1..=28 (monthly).
+    pub month_day: u32,
+    pub hour: u32,
+    pub minute: u32,
+    /// Slices read per run.
+    pub slices_per_run: u32,
+    pub max_slice_lines: usize,
+    pub max_files_per_ticket: usize,
+    pub create_mode: CreateMode,
+}
+
+impl Default for SweepSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            repo: String::new(),
+            frequency: Frequency::Daily,
+            weekday: 0,
+            month_day: 1,
+            hour: 2,
+            minute: 0,
+            slices_per_run: 1,
+            max_slice_lines: 25_000,
+            max_files_per_ticket: 10,
+            create_mode: CreateMode::Draft,
+        }
+    }
+}
+
+impl SweepSettings {
+    pub fn clamp(&mut self) {
+        self.repo = self.repo.trim().to_string();
+        self.weekday = self.weekday.min(6);
+        self.month_day = self.month_day.clamp(1, 28);
+        self.hour = self.hour.min(23);
+        self.minute = self.minute.min(59);
+        self.slices_per_run = self.slices_per_run.clamp(1, 3);
+        self.max_slice_lines = self.max_slice_lines.clamp(2_000, 100_000);
+        self.max_files_per_ticket = self.max_files_per_ticket.clamp(1, 30);
+    }
 }
 
 fn default_true() -> bool {
@@ -121,12 +196,14 @@ impl Default for AppConfig {
             review_thinking_low: default_thinking_low(),
             review_second_pass_enabled: true,
             review_value_trace_enabled: false,
+            sweep: SweepSettings::default(),
         }
     }
 }
 
 impl AppConfig {
     pub fn clamp(&mut self) {
+        self.sweep.clamp();
         if self.polling_interval_seconds < 30 {
             self.polling_interval_seconds = 30;
         }

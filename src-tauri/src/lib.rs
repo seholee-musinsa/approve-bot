@@ -19,6 +19,7 @@ mod sweep;
 mod jira;
 mod sweep_day;
 mod sweep_review;
+mod sweep_sched;
 mod sweep_state;
 
 use std::sync::Arc;
@@ -60,6 +61,7 @@ pub fn run() {
             let state = state::AppState::new(config_dir, cfg);
             app.manage(Arc::clone(&state));
 
+            sweep_sched::spawn(Arc::clone(&state));
             poller::spawn(app.handle().clone(), state);
             Ok(())
         })
