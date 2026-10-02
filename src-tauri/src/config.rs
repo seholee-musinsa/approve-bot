@@ -121,7 +121,7 @@ pub enum CreateMode {
     /// Print drafts only; nothing is written to Jira.
     #[default]
     Draft,
-    /// Create tickets (also needs `allow_create` in sweep-jira.json).
+    /// Create tickets in Jira (up to `max_create_per_run` per run).
     Auto,
 }
 
@@ -143,6 +143,8 @@ pub struct SweepSettings {
     pub max_slice_lines: usize,
     pub max_files_per_ticket: usize,
     pub create_mode: CreateMode,
+    /// Most tickets one run creates in `Auto` mode; the rest wait for the next run.
+    pub max_create_per_run: u32,
 }
 
 impl Default for SweepSettings {
@@ -159,6 +161,7 @@ impl Default for SweepSettings {
             max_slice_lines: 25_000,
             max_files_per_ticket: 10,
             create_mode: CreateMode::Draft,
+            max_create_per_run: 3,
         }
     }
 }
@@ -173,6 +176,7 @@ impl SweepSettings {
         self.slices_per_run = self.slices_per_run.clamp(1, 3);
         self.max_slice_lines = self.max_slice_lines.clamp(2_000, 100_000);
         self.max_files_per_ticket = self.max_files_per_ticket.clamp(1, 30);
+        self.max_create_per_run = self.max_create_per_run.clamp(1, 20);
     }
 }
 

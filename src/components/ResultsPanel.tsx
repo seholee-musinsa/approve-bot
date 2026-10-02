@@ -93,13 +93,12 @@ export function ResultsPanel() {
                 <button
                   className="primary"
                   onClick={assign}
-                  disabled={busy || !view!.allow_create || view!.parent_key === ""}
+                  disabled={busy || view!.parent_key === ""}
                 >
                   {confirm ? `정말 ${view!.parent_key} 아래로 지정` : `상위 에픽 ${view!.parent_key || "(미설정)"} 로 일괄 지정`}
                 </button>
                 {confirm && <button onClick={() => setConfirm(false)}>취소</button>}
               </div>
-              {!view!.allow_create && <div className="muted">Jira 쓰기가 꺼져 있어(sweep-jira.json 의 allow_create) 지정할 수 없습니다.</div>}
             </>
           )}
         </>

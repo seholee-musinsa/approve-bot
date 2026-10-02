@@ -80,14 +80,7 @@ export function JiraPanels() {
           />
           <span className="muted">한 사람 기준, 이 수에 이르면 새 티켓을 만들지 않고 대기</span>
         </Row>
-        <Row label="Jira 쓰기 허용">
-          <span className={v.allow_create ? "error-text" : "muted"}>
-            {v.allow_create ? "켜짐 (자동 생성이면 실제 티켓을 만듭니다)" : "꺼짐 (티켓을 만들지 않음)"}
-          </span>
-        </Row>
-        <div className="muted">
-          쓰기 허용은 안전을 위해 화면에서 바꾸지 않습니다. 설정 폴더의 sweep-jira.json 에서 allow_create 를 직접 바꿉니다.
-        </div>
+        <div className="muted">티켓을 실제로 만들지는 "코드 점검" 설정의 "티켓 만들기"에서 정합니다.</div>
         <div className="row">
           <button className="primary" onClick={() => save()} disabled={!dirty}>
             저장

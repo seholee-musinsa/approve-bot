@@ -6,6 +6,7 @@ import type {
   AppConfig,
   CreateMode,
   Frequency,
+  JiraView,
   SweepRun,
   SweepSettings,
   SweepStatus,
@@ -27,6 +28,11 @@ export function SweepTab({ value, onChange, dirty }: Props) {
     onChange({ ...value, sweep: { ...s, ...p } });
   }
   const repoOk = s.repo === "" || REPO_PATTERN.test(s.repo);
+  const [pendingAuto, setPendingAuto] = useState(false);
+  const [jira, setJira] = useState<JiraView | null>(null);
+  useEffect(() => {
+    api.getJiraSettings().then(setJira).catch(() => {});
+  }, []);
 
   return (
     <>
@@ -99,18 +105,56 @@ export function SweepTab({ value, onChange, dirty }: Props) {
         </Field>
         <Field label="티켓 만들기">
           <select
-            value={s.create_mode}
-            onChange={(e) => patch({ create_mode: e.target.value as CreateMode })}
+            value={pendingAuto ? "auto" : s.create_mode}
+            onChange={(e) => {
+              const m = e.target.value as CreateMode;
+              if (m === "auto" && s.create_mode !== "auto") {
+                // 실제 티켓이 만들어지는 선택이라 한 번 더 확인한다.
+                setPendingAuto(true);
+              } else {
+                setPendingAuto(false);
+                patch({ create_mode: m });
+              }
+            }}
           >
             <option value="draft">초안만 (티켓을 만들지 않음)</option>
             <option value="auto">티켓 자동 생성</option>
           </select>
         </Field>
-        {s.create_mode === "auto" && (
-          <div className="error-text">
-            자동 생성은 설정 폴더의 sweep-jira.json 에서 allow_create 가 켜져 있을 때만 Jira 에 씁니다. 켜져 있으면 "지금 실행"도 실제 티켓을 만듭니다.
+        {pendingAuto && (
+          <div className="panel" style={{ borderColor: "var(--warning)" }}>
+            <b>티켓 자동 생성을 켤까요?</b>
+            <div className="muted">
+              다음 실행부터 Jira 에 실제 티켓이 만들어집니다. "지금 실행"도 마찬가지입니다.
+              <br />
+              담당자: {jira && jira.assignees.length > 0 ? jira.assignees[0].name : "없음(담당자 없이 생성)"} · 상위 에픽:{" "}
+              {jira && jira.parent_key ? jira.parent_key : "없음(상위 에픽 없이 생성)"} · 열린 티켓 상한: {jira ? jira.open_cap : "-"}건
+              <br />
+              한 번에 최대 {s.max_create_per_run}건까지 만들고, 나머지는 다음 실행으로 대기합니다.
+            </div>
+            <div className="row">
+              <button
+                className="primary"
+                onClick={() => {
+                  setPendingAuto(false);
+                  patch({ create_mode: "auto" });
+                }}
+              >
+                켜기
+              </button>
+              <button onClick={() => setPendingAuto(false)}>취소</button>
+            </div>
           </div>
         )}
+        {s.create_mode === "auto" && !pendingAuto && (
+          <div className="error-text">
+            티켓 자동 생성이 켜져 있습니다. 실행할 때마다 Jira 에 실제 티켓이 만들어집니다(저장 후 적용).
+          </div>
+        )}
+        <Field label="한 번에 최대">
+          <NumberInput value={s.max_create_per_run} min={1} max={20} onChange={(n) => patch({ max_create_per_run: n })} />
+          <span className="muted">건 (자동 생성일 때, 나머지는 대기)</span>
+        </Field>
       </div>
       <ResultsPanel />
       <JiraPanels />
@@ -280,7 +324,7 @@ function RunLog() {
         runs.map((r) => (
           <details key={r.at} className="review-detail">
             <summary>
-              {r.ok ? "✅" : "⚠"} {new Date(r.at * 1000).toLocaleString("ko-KR")} · {r.seconds}초
+              {r.ok ? "✅" : "⚠"} {new Date(r.at * 1000).toLocaleString("ko-KR")} · {r.seconds}초 · {summarize(r.text)}
             </summary>
             <pre className="review-body">{r.text}</pre>
           </details>
@@ -288,4 +332,15 @@ function RunLog() {
       )}
     </div>
   );
+}
+
+/** 실행 출력에서 만든 티켓·대기 건수를 한 줄로 요약한다. */
+function summarize(text: string): string {
+  const lines = text.split("\n");
+  const created = lines.filter((l) => l.startsWith("생성: ")).length;
+  const waiting = lines.filter((l) => l.startsWith("대기: ")).length;
+  const failed = lines.some((l) => l.startsWith("⚠️ 생성"));
+  const parts = [`티켓 ${created}건 생성`, `대기 ${waiting}건`];
+  if (failed) parts.push("⚠ 생성 실패");
+  return parts.join(" · ");
 }

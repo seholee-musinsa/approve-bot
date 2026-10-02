@@ -136,8 +136,7 @@ pub struct Assignee {
     pub name: String,
 }
 
-/// Jira side of the sweep as the screen sees it. `allow_create` is read only here:
-/// it is the second lock on writing to Jira and is changed in the file by hand.
+/// Jira side of the sweep as the screen sees it.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct JiraView {
     pub cloud_id: String,
@@ -145,8 +144,6 @@ pub struct JiraView {
     pub parent_key: String,
     pub open_cap: usize,
     pub assignees: Vec<Assignee>,
-    #[serde(default)]
-    pub allow_create: bool,
 }
 
 #[tauri::command]
@@ -162,7 +159,6 @@ pub async fn get_jira_settings(state: State<'_, Arc<AppState>>) -> Result<JiraVi
             .iter()
             .map(|id| Assignee { id: id.clone(), name: c.assignee_names.get(id).cloned().unwrap_or_else(|| id.clone()) })
             .collect(),
-        allow_create: c.allow_create,
     })
 }
 
@@ -179,7 +175,6 @@ pub async fn update_jira_settings(state: State<'_, Arc<AppState>>, view: JiraVie
     c.open_cap = view.open_cap.clamp(1, 100);
     c.assignees = view.assignees.iter().map(|a| a.id.clone()).collect();
     c.assignee_names = view.assignees.into_iter().map(|a| (a.id, a.name)).collect();
-    // allow_create is deliberately not taken from the screen.
     crate::jira::save_config(&state.config_dir, &c).map_err(|e| format!("{e:#}"))?;
     get_jira_settings(state).await
 }
@@ -232,7 +227,6 @@ pub struct ResultsView {
     /// 부모 없는 봇 티켓(4.14).
     pub orphans: Vec<OrphanTicket>,
     pub parent_key: String,
-    pub allow_create: bool,
 }
 
 /// Read Jira for the bot's tickets, fold what happened to them into the ledger
@@ -258,19 +252,15 @@ pub async fn collect_sweep_results(state: State<'_, Arc<AppState>>) -> Result<Re
         results: crate::jira::results(&issues, now, 30),
         orphans,
         parent_key: c.parent_key.clone().unwrap_or_default(),
-        allow_create: c.allow_create,
     })
 }
 
 /// Write: put the listed bot tickets under the configured parent Epic. Needs
-/// `allow_create`, and refuses a parent that is already done. Only tickets that
+/// the screen's confirm click, and refuses a parent that is already done. Only tickets that
 /// carry the bot label and have no parent are touched.
 #[tauri::command]
 pub async fn assign_parent_bulk(state: State<'_, Arc<AppState>>, keys: Vec<String>) -> Result<String, String> {
     let (c, j) = jira_client(&state.config_dir)?;
-    if !c.allow_create {
-        return Err("Jira 쓰기가 꺼져 있습니다(sweep-jira.json 의 allow_create)".into());
-    }
     let parent = c.parent_key.clone().ok_or_else(|| "상위 에픽이 설정되어 있지 않습니다".to_string())?;
     let (title, done) = j.issue_brief(&parent).await.map_err(|e| format!("{e:#}"))?;
     if done {
@@ -285,7 +275,7 @@ pub async fn assign_parent_bulk(state: State<'_, Arc<AppState>>, keys: Vec<Strin
             skipped += 1;
             continue;
         }
-        match j.set_parent(&c, k, &parent).await {
+        match j.set_parent(k, &parent).await {
             Ok(()) => ok += 1,
             Err(e) => failed.push(format!("{k}: {e:#}")),
         }
