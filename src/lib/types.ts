@@ -112,3 +112,31 @@ export interface JiraView {
   /** read only: the second lock on writing to Jira, changed in the file by hand */
   allow_create: boolean;
 }
+
+export interface SweepResults {
+  total: number;
+  open: number;
+  stale: number;
+  done: number;
+  rejected: number;
+  wrong: number;
+  low_value: number;
+  size_timing: number;
+  duplicate: number;
+  already_fixed: number;
+  no_reason: number;
+  adoption_percent: number | null;
+  ready_to_expand: boolean;
+}
+
+export interface OrphanTicket {
+  key: string;
+  summary: string;
+}
+
+export interface ResultsView {
+  results: SweepResults;
+  orphans: OrphanTicket[];
+  parent_key: string;
+  allow_create: boolean;
+}
