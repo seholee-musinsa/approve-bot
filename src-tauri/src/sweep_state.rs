@@ -172,6 +172,12 @@ impl Ledger {
         }
     }
 
+    /// 바퀴를 처음으로 되돌린다. 키 이력(만든·거절한 것)은 남겨 같은 것을 다시 제안하지 않는다.
+    pub fn reset_cycle(&mut self) {
+        self.cycle = None;
+        self.carryover.clear();
+    }
+
     pub fn record(&mut self, key: &str, outcome: KeyOutcome) {
         self.keys.insert(key.to_string(), outcome);
     }
@@ -315,6 +321,19 @@ mod tests {
         assert_eq!(c.slices[2].status, SliceStatus::Pending);
         assert_eq!(c.started_commit, "c2");
         assert_eq!(c.done_count(), 1);
+    }
+
+    #[test]
+    fn reset_cycle_keeps_key_history_and_cycle_count() {
+        let mut l = started(&["a"]);
+        l.mark_read("a", "c1", 1);
+        l.record("k", KeyOutcome::Created { ticket: "SID-1".into(), at: 1 });
+        l.finished_cycles = 3;
+        l.reset_cycle();
+        assert!(l.cycle.is_none() && l.carryover.is_empty());
+        assert_eq!((l.keys.len(), l.finished_cycles), (1, 3));
+        l.start_cycle(&ranked(&["a"]), "c2", 2);
+        assert_eq!(l.next().unwrap().name, "a");
     }
 
     #[test]

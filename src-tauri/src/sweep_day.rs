@@ -152,6 +152,8 @@ mod tests {
             title: String::new(),
             prerequisite: String::new(),
             key: stable_key(path, cat.name(), sym),
+            slice: String::new(),
+            commit: String::new(),
         }
     }
 
@@ -276,6 +278,19 @@ mod tests {
         l.mark_read("s", "c1", 1);
         assert!(l.finish_if_complete());
         assert!(l.carryover.is_empty());
+    }
+
+    #[test]
+    fn carried_findings_keep_their_origin_through_the_ledger_file() {
+        let mut l = Ledger::default();
+        let mut x = f("a.ts", Category::Split, "x", 90);
+        x.slice = "layers/features/mamud".into();
+        x.commit = "abc123".into();
+        let plan = plan_day(vec![x], &l, &Policy::default(), 0, 10, &|_| 1.0);
+        park(&mut l, &plan, "abc123");
+        let back: Ledger = serde_json::from_str(&serde_json::to_string(&l).unwrap()).unwrap();
+        let got = &back.carryover[0].findings[0];
+        assert_eq!((got.slice.as_str(), got.commit.as_str()), ("layers/features/mamud", "abc123"));
     }
 
     #[test]
