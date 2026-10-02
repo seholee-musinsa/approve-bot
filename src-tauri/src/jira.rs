@@ -6,7 +6,7 @@
 
 use crate::sweep_state::{KeyOutcome, RejectReason};
 use anyhow::{anyhow, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -14,8 +14,9 @@ use std::time::Duration;
 /// 지적 한 건의 안정 키를 티켓에 남기는 라벨 접두(3.3 b). 라벨은 공백 없는 짧은 문자열이어야 한다.
 pub const KEY_LABEL_PREFIX: &str = "sweep-";
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct JiraConfig {
+    #[serde(default)]
     pub cloud_id: String,
     #[serde(default = "d_project")]
     pub project: String,
@@ -35,11 +36,20 @@ pub struct JiraConfig {
     /// 담당자 accountId 목록(카나리: 본인 한 명).
     #[serde(default)]
     pub assignees: Vec<String>,
+    /// accountId → 표시 이름(화면용).
+    #[serde(default)]
+    pub assignee_names: std::collections::BTreeMap<String, String>,
+    /// 한 사람의 열린 봇 티켓 상한(5.5).
+    #[serde(default = "d_open_cap")]
+    pub open_cap: usize,
     /// 쓰기 허용. 기본 false.
     #[serde(default)]
     pub allow_create: bool,
 }
 
+fn d_open_cap() -> usize {
+    10
+}
 fn d_project() -> String {
     "SID".into()
 }
@@ -64,6 +74,21 @@ pub fn load_config(dir: &Path) -> Result<JiraConfig> {
     let p = config_path(dir);
     let raw = std::fs::read_to_string(&p).map_err(|_| anyhow!("{} 가 없다(cloud_id 필요)", p.display()))?;
     serde_json::from_str(&raw).map_err(|e| anyhow!("{} 를 읽지 못함: {e}", p.display()))
+}
+
+/// 설정 파일이 없으면 빈 설정(화면에서 처음 채울 수 있게).
+pub fn load_or_default(dir: &Path) -> JiraConfig {
+    load_config(dir).unwrap_or_else(|_| serde_json::from_str("{}").expect("defaults"))
+}
+
+/// 임시 파일에 쓰고 rename 한다.
+pub fn save_config(dir: &Path, c: &JiraConfig) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let p = config_path(dir);
+    let tmp = p.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(c)?)?;
+    std::fs::rename(tmp, p)?;
+    Ok(())
 }
 
 // ---- 순수 함수: JQL · 본문 · 해석 -------------------------------------------------
@@ -255,6 +280,18 @@ pub fn outcomes(issue: &Issue, now: u64) -> Vec<(String, KeyOutcome)> {
         .collect()
 }
 
+pub fn parse_users(v: &Value) -> Vec<(String, String)> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|u| u.get("accountType").and_then(Value::as_str).map_or(true, |t| t == "atlassian"))
+                .filter(|u| u.get("active").and_then(Value::as_bool).unwrap_or(true))
+                .filter_map(|u| Some((u.get("accountId")?.as_str()?.to_string(), u.get("displayName")?.as_str()?.to_string())))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 // ---- HTTP ------------------------------------------------------------------------
 
 pub struct Jira {
@@ -332,6 +369,41 @@ impl Jira {
         Ok(self.search(&jql_open_bot(c, assignee), 1000).await?.len())
     }
 
+    /// 읽기: 연결 확인용. (표시 이름)
+    pub async fn myself(&self) -> Result<String> {
+        let resp = self.http.get(format!("{}/myself", self.base)).basic_auth(&self.email, Some(&self.token)).send().await?;
+        let v = Self::check(resp).await?;
+        Ok(v.get("displayName").and_then(Value::as_str).unwrap_or("?").to_string())
+    }
+
+    /// 읽기: 담당자 후보 검색. (accountId, 표시 이름)
+    pub async fn search_users(&self, query: &str) -> Result<Vec<(String, String)>> {
+        let resp = self
+            .http
+            .get(format!("{}/user/search", self.base))
+            .basic_auth(&self.email, Some(&self.token))
+            .query(&[("query", query), ("maxResults", "8")])
+            .send()
+            .await?;
+        let v = Self::check(resp).await?;
+        Ok(parse_users(&v))
+    }
+
+    /// 읽기: 부모 Epic 의 (제목, 완료 여부).
+    pub async fn issue_brief(&self, key: &str) -> Result<(String, bool)> {
+        let resp = self
+            .http
+            .get(format!("{}/issue/{key}", self.base))
+            .basic_auth(&self.email, Some(&self.token))
+            .query(&[("fields", "summary,status")])
+            .send()
+            .await?;
+        let v = Self::check(resp).await?;
+        let title = v.pointer("/fields/summary").and_then(Value::as_str).unwrap_or("").to_string();
+        let done = v.pointer("/fields/status/statusCategory/key").and_then(Value::as_str) == Some("done");
+        Ok((title, done))
+    }
+
     /// 쓰기: 티켓 생성. 호출부가 `allow_create` 를 확인한다.
     pub async fn create(&self, c: &JiraConfig, t: &NewTicket<'_>) -> Result<String> {
         if !c.allow_create {
@@ -349,6 +421,31 @@ mod tests {
 
     fn cfg() -> JiraConfig {
         serde_json::from_str(r#"{"cloud_id":"x","parent_key":"SID-1","assignees":["acc"]}"#).unwrap()
+    }
+
+    #[test]
+    fn users_skip_bots_and_inactive_accounts() {
+        let v = json!([
+            {"accountId":"a1","displayName":"홍길동","accountType":"atlassian","active":true},
+            {"accountId":"b1","displayName":"앱","accountType":"app","active":true},
+            {"accountId":"c1","displayName":"퇴사자","accountType":"atlassian","active":false}
+        ]);
+        assert_eq!(parse_users(&v), vec![("a1".to_string(), "홍길동".to_string())]);
+    }
+
+    #[test]
+    fn config_roundtrips_and_missing_file_gives_defaults() {
+        let dir = std::env::temp_dir().join(format!("jira-cfg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let d = load_or_default(&dir);
+        assert_eq!((d.cloud_id.as_str(), d.open_cap, d.allow_create), ("", 10, false));
+        let mut c = cfg();
+        c.open_cap = 7;
+        c.assignee_names.insert("acc".into(), "나".into());
+        save_config(&dir, &c).unwrap();
+        let back = load_config(&dir).unwrap();
+        assert_eq!((back.open_cap, back.assignee_names.get("acc").map(String::as_str)), (7, Some("나")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
