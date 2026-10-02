@@ -1,4 +1,4 @@
-//! 리포트 만들기와 저장. 재료(Jira 의 봇 티켓, 장부, 실행 기록)를 읽어 `sweep_report` 로 렌더하고
+//! 리포트 만들기와 저장. 재료(Jira 의 자동 생성 티켓, 장부, 실행 기록)를 읽어 `sweep_report` 로 렌더하고
 //! 설정 폴더의 `reports/` 에 마크다운으로 남긴다. Jira 는 읽기만 한다.
 
 use crate::config::{AppConfig, Frequency, SweepSettings};
@@ -85,7 +85,7 @@ pub fn read_report(dir: &Path, title: &str) -> Result<String> {
 pub fn publish(dir: &Path, cfg: &AppConfig, title: &str) -> Result<String> {
     let r = &cfg.report;
     if r.space_key.is_empty() || r.parent_page_id.is_empty() {
-        return Err(anyhow!("Confluence space 와 부모 페이지 ID 를 먼저 입력해 주세요"));
+        return Err(anyhow!("Confluence space 와 상위 페이지 ID 를 먼저 입력해 주세요"));
     }
     let jc = crate::jira::load_config(dir)?;
     if jc.cloud_id.is_empty() {
@@ -104,16 +104,16 @@ pub fn publish(dir: &Path, cfg: &AppConfig, title: &str) -> Result<String> {
 pub fn check_parent(dir: &Path, cfg: &AppConfig) -> Result<String> {
     let r = &cfg.report;
     if r.space_key.is_empty() || r.parent_page_id.is_empty() {
-        return Err(anyhow!("space 와 부모 페이지 ID 를 먼저 입력해 주세요"));
+        return Err(anyhow!("space 와 상위 페이지 ID 를 먼저 입력해 주세요"));
     }
     let jc = crate::jira::load_config(dir)?;
     let client = crate::confluence::Confluence::connect(&jc.cloud_id)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let (title, space) = rt.block_on(client.page_brief(&r.parent_page_id))?;
     if !space.eq_ignore_ascii_case(&r.space_key) {
-        return Err(anyhow!("부모 페이지 {} 는 space {space} 에 있다(설정: {})", r.parent_page_id, r.space_key));
+        return Err(anyhow!("상위 페이지 {} 는 space {space} 에 있다(설정: {})", r.parent_page_id, r.space_key));
     }
-    Ok(format!("부모 페이지 확인: {title} ({space})"))
+    Ok(format!("상위 페이지 확인: {title} ({space})"))
 }
 
 /// 아직 게시하지 않은 리포트 제목들(R.7 의 재시도 대상).
@@ -152,7 +152,7 @@ pub fn generate(dir: &Path, cfg: &AppConfig, kind: Kind, now_local: NaiveDateTim
     Ok(title)
 }
 
-/// 리포트 주기를 스윕 예정 시각 계산에 태우기 위한 설정(주간: 월요일, 월간: 1일).
+/// 리포트 주기를 점검 예정 시각 계산에 태우기 위한 설정(주간: 월요일, 월간: 1일).
 pub fn slot_settings(kind: Kind, hour: u32) -> SweepSettings {
     SweepSettings {
         enabled: true,

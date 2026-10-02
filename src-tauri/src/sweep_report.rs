@@ -1,16 +1,17 @@
-//! 정기 스윕 리포트(요구 R.1~R.10). 이 모듈은 집계와 마크다운 렌더만 한다(읽기도 쓰기도 하지 않는다).
-//! 재료는 호출부가 넘긴다: Jira 의 봇 티켓, 장부 상태, 스윕 실행 기록, 설정.
+//! 코드 정기 점검 리포트(요구 R.1~R.10). 이 모듈은 집계와 마크다운 렌더만 한다(읽기도 쓰기도 하지 않는다).
+//! 재료는 호출부가 넘긴다: Jira 의 자동 생성 티켓, 장부 상태, 점검 실행 기록, 설정.
 //! 사내 정보(티켓 키, 제목, 경로)가 들어가므로 결과는 설정 폴더에만 저장한다.
 
 use crate::config::{Frequency, SweepSettings};
 use crate::jira::{category_of, results, browse_url, Issue, Results};
+use crate::sweep_review::category_label;
 use crate::sweep_sched::{to_local, RunEntry, Status};
 use chrono::{Datelike, Duration, NaiveDate, NaiveDateTime};
 use std::collections::BTreeMap;
 
-/// 분류별 표본이 이보다 적으면 "표본 부족"(2.10).
+/// 분류별 표본이 이보다 적으면 "건수가 적어 판단하지 않음"(2.10).
 pub const MIN_SAMPLE: usize = 5;
-/// 열린 채 이 일수를 넘으면 보류(방치).
+/// 열린 채 이 일수를 넘으면 30일 넘게 미처리.
 pub const STALE_DAYS: u64 = 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,14 +45,14 @@ impl Period {
         }
     }
 
-    /// `정기 스윕 주간 리포트 2026-W41` / `정기 스윕 월간 리포트 2026-10` (R.4).
+    /// `코드 정기 점검 주간 리포트 2026-W41` / `코드 정기 점검 월간 리포트 2026-10` (R.4).
     pub fn title(&self) -> String {
         match self.kind {
             Kind::Weekly => {
                 let w = self.start.iso_week();
-                format!("정기 스윕 주간 리포트 {}-W{:02}", w.year(), w.week())
+                format!("코드 정기 점검 주간 리포트 {}-W{:02}", w.year(), w.week())
             }
-            Kind::Monthly => format!("정기 스윕 월간 리포트 {}-{:02}", self.start.year(), self.start.month()),
+            Kind::Monthly => format!("코드 정기 점검 월간 리포트 {}-{:02}", self.start.year(), self.start.month()),
         }
     }
 
@@ -77,11 +78,11 @@ fn pct(p: Option<f64>) -> String {
     p.map_or("-".to_string(), |v| format!("{v:.0}%"))
 }
 
-/// 채택률 한 칸. 표본이 모자라면 숫자 대신 "표본 부족".
+/// 반영률 한 칸. 건수가 모자라면 숫자 대신 안내 문구.
 fn rate_cell(r: &Results) -> String {
     let judged = r.done + r.rejected;
     if judged < MIN_SAMPLE {
-        format!("표본 부족({judged}건)")
+        format!("건수가 적어 판단하지 않음({judged}건)")
     } else {
         format!("{} ({}/{})", pct(r.adoption_percent), r.done, judged)
     }
@@ -91,8 +92,9 @@ fn esc(s: &str) -> String {
     s.replace('|', "\\|").replace('\n', " ")
 }
 
-/// 실행 기록 출력에서 읽은 조각 수와 지적·후보·티켓 수를 센다.
-/// (출력 문구는 `sweep::run_day` 가 만든다: "오늘의 조각 …", "지적 N건 → 후보 M건 · 오늘 만들 티켓 K건 …")
+/// 실행 기록 출력에서 점검한 구간 수와 발견·후보·티켓 수를 센다.
+/// (출력 문구는 `sweep::run_day` 가 만든다: "오늘의 점검 구간 …", "발견 N건 → 티켓 후보 M건 · 오늘 만들 티켓 K건 …".
+    //  예전 문구("오늘의 조각", "지적 …")로 남은 실행 기록도 같이 읽는다.)
 fn run_totals(runs: &[&RunEntry]) -> (usize, usize, usize, usize) {
     let (mut slices, mut findings, mut cands, mut planned) = (0, 0, 0, 0);
     let num_after = |line: &str, key: &str| -> usize {
@@ -100,10 +102,10 @@ fn run_totals(runs: &[&RunEntry]) -> (usize, usize, usize, usize) {
     };
     for r in runs {
         for line in r.text.lines() {
-            if line.starts_with("오늘의 조각") {
+            if line.starts_with("오늘의 점검 구간") || line.starts_with("오늘의 조각") {
                 slices += 1;
-            } else if line.starts_with("지적 ") {
-                findings += num_after(line, "지적 ");
+            } else if line.starts_with("발견 ") || line.starts_with("지적 ") {
+                findings += num_after(line, if line.starts_with("발견 ") { "발견 " } else { "지적 " });
                 cands += num_after(line, "후보 ");
                 planned += num_after(line, "오늘 만들 티켓 ");
             }
@@ -129,21 +131,21 @@ pub fn render(p: &Period, i: &Input) -> String {
 
     // (1) 요약
     o.push_str("## 1. 요약\n\n");
-    o.push_str(&format!("- 실행 {}회(실패 {}회) · 읽은 조각 {}개 · 소요 {}\n", runs.len(), failed, slices, dur(secs)));
-    o.push_str(&format!("- 지적 {findings}건 → 후보 {cands}건 → 만든 티켓 {}건\n", mine.len()));
+    o.push_str(&format!("- 실행 {}회(실패 {}회) · 점검한 구간 {}개 · 소요 {}\n", runs.len(), failed, slices, dur(secs)));
+    o.push_str(&format!("- 발견 {findings}건 → 티켓 후보 {cands}건 → 만든 티켓 {}건\n", mine.len()));
     o.push_str(&match i.status.cycle_no {
         Some(n) if i.status.slices_total > 0 => format!(
-            "- 바퀴 {n}: 읽은 조각 {}/{} (커버리지 {}%) · 이월 후보 {}건\n",
+            "- 회차 {n}: 점검한 구간 {}/{} (점검한 비율 {}%) · 대기 중인 후보 {}건\n",
             i.status.slices_done,
             i.status.slices_total,
             i.status.slices_done * 100 / i.status.slices_total,
             i.status.carryover
         ),
-        _ => "- 진행 중인 바퀴 없음\n".to_string(),
+        _ => "- 진행 중인 회차 없음\n".to_string(),
     });
     let mut by_cat: BTreeMap<&str, usize> = BTreeMap::new();
     for x in &mine {
-        *by_cat.entry(category_of(&x.labels).unwrap_or("분류 미상")).or_default() += 1;
+        *by_cat.entry(category_label(category_of(&x.labels).unwrap_or("분류 미상"))).or_default() += 1;
     }
     if !by_cat.is_empty() {
         let parts: Vec<String> = by_cat.iter().map(|(k, v)| format!("{k} {v}")).collect();
@@ -165,43 +167,43 @@ pub fn render(p: &Period, i: &Input) -> String {
                 Some(r) => format!("{} ({r})", x.status),
                 None => x.status.clone(),
             };
-            o.push_str(&format!("| {link} | {} | {} | {} |\n", esc(&x.summary), category_of(&x.labels).unwrap_or("-"), esc(&st)));
+            o.push_str(&format!("| {link} | {} | {} | {} |\n", esc(&x.summary), category_label(category_of(&x.labels).unwrap_or("-")), esc(&st)));
         }
     }
 
     // (3) 결과
     o.push_str("\n## 3. 결과\n\n");
-    o.push_str("| 구분 | 완료 | 거절 | 열림 | 보류 | 채택률 |\n|---|--:|--:|--:|--:|---|\n");
+    o.push_str("| 구분 | 완료 | 거절 | 열림 | 30일 넘게 미처리 | 반영률 |\n|---|--:|--:|--:|--:|---|\n");
     let row = |name: &str, r: &Results| format!("| {name} | {} | {} | {} | {} | {} |\n", r.done, r.rejected, r.open, r.stale, rate_cell(r));
     o.push_str(&row("이 기간에 만든 것", &period_results));
-    o.push_str(&row("누적(전체 봇 티켓)", &all_results));
+    o.push_str(&row("누적(전체 자동 생성 티켓)", &all_results));
     for cat in ["rule", "split", "debt"] {
         let sub: Vec<Issue> = i.issues.iter().filter(|x| category_of(&x.labels) == Some(cat)).cloned().collect();
         if !sub.is_empty() {
-            o.push_str(&row(&format!("누적 · {cat}"), &results(&sub, i.now, STALE_DAYS)));
+            o.push_str(&row(&format!("누적 · {}", category_label(cat)), &results(&sub, i.now, STALE_DAYS)));
         }
     }
     let a = &all_results;
     if a.rejected > 0 {
         o.push_str(&format!(
-            "\n거절 사유(누적): 사실 틀림 {} · 가치 낮음 {} · 크기·시점 {} · 중복 {} · 이미 해결 {} · 사유 없음 {}\n",
+            "\n거절 사유(누적): 내용이 틀림 {} · 가치 낮음 {} · 지금은 어려움 {} · 중복 {} · 이미 해결 {} · 사유 없음 {}\n",
             a.wrong, a.low_value, a.size_timing, a.duplicate, a.already_fixed, a.no_reason
         ));
     }
     let open_all = a.open;
     o.push_str(&format!(
-        "\n방치율: 열린 티켓 {open_all}건 중 {STALE_DAYS}일 넘게 처리 없는 것 {}건({})\n",
+        "\n미처리 비율: 열린 티켓 {open_all}건 중 {STALE_DAYS}일 넘게 처리 없는 것 {}건({})\n",
         a.stale,
         if open_all == 0 { "-".to_string() } else { format!("{}%", a.stale * 100 / open_all) }
     ));
     o.push_str(&format!(
-        "전환 기준(결과 10건 이상, 채택률 60% 이상): {}\n",
+        "확대 기준(결과 10건 이상, 반영률 60% 이상): {}\n",
         if a.ready_to_expand { "충족 — 담당자 풀과 하루 상한 확대를 검토" } else { "미충족 — 계속 쌓는다" }
     ));
 
-    // (4) 부모 없는 봇 티켓
+    // (4) 상위 에픽이 없는 자동 생성 티켓
     let orphans: Vec<&Issue> = i.issues.iter().filter(|x| x.parent.is_none() && outcome_open(x)).collect();
-    o.push_str(&format!("\n## 4. 부모 없는 봇 티켓\n\n{}건\n", orphans.len()));
+    o.push_str(&format!("\n## 4. 상위 에픽이 없는 자동 생성 티켓\n\n{}건\n", orphans.len()));
     for x in orphans.iter().take(20) {
         o.push_str(&format!("- {} {}\n", x.key, esc(&x.summary)));
     }
@@ -248,11 +250,11 @@ pub fn render(p: &Period, i: &Input) -> String {
             Frequency::Weekly => runs_left * 7,
             Frequency::Monthly => runs_left * 30,
         };
-        o.push_str(&format!("- 남은 조각 {remaining}개, 회당 {per_run}개 기준 약 {runs_left}회({days}일) 뒤 한 바퀴 완료\n"));
+        o.push_str(&format!("- 남은 점검 구간 {remaining}개, 회당 {per_run}개 기준 약 {runs_left}회({days}일) 뒤 한 회차 완료\n"));
     } else {
-        o.push_str("- 진행 중인 바퀴 없음\n");
+        o.push_str("- 진행 중인 회차 없음\n");
     }
-    o.push_str(&format!("- 이월 후보 {}건\n", i.status.carryover));
+    o.push_str(&format!("- 대기 중인 후보 {}건\n", i.status.carryover));
     o
 }
 
@@ -288,7 +290,7 @@ mod tests {
         // 2026-10-05 월요일 오전 → 지난주 9/28~10/4 (ISO 2026-W40)
         let p = Period::previous(Kind::Weekly, dt(2026, 10, 5, 9));
         assert_eq!((p.start, p.end), (NaiveDate::from_ymd_opt(2026, 9, 28).unwrap(), NaiveDate::from_ymd_opt(2026, 10, 5).unwrap()));
-        assert_eq!(p.title(), "정기 스윕 주간 리포트 2026-W40");
+        assert_eq!(p.title(), "코드 정기 점검 주간 리포트 2026-W40");
         // 수요일에 만들어도 같은 지난주.
         assert_eq!(Period::previous(Kind::Weekly, dt(2026, 10, 7, 9)), p);
     }
@@ -297,8 +299,8 @@ mod tests {
     fn previous_month_handles_january() {
         let p = Period::previous(Kind::Monthly, dt(2026, 1, 1, 9));
         assert_eq!((p.start, p.end), (NaiveDate::from_ymd_opt(2025, 12, 1).unwrap(), NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()));
-        assert_eq!(p.title(), "정기 스윕 월간 리포트 2025-12");
-        assert_eq!(Period::previous(Kind::Monthly, dt(2026, 10, 1, 9)).title(), "정기 스윕 월간 리포트 2026-09");
+        assert_eq!(p.title(), "코드 정기 점검 월간 리포트 2025-12");
+        assert_eq!(Period::previous(Kind::Monthly, dt(2026, 10, 1, 9)).title(), "코드 정기 점검 월간 리포트 2026-09");
     }
 
     fn issue(key: &str, created: NaiveDateTime, cat: Option<&str>, res: Option<&str>, assignee: &str, parent: bool) -> Issue {
@@ -347,25 +349,27 @@ mod tests {
         ];
         let runs = vec![
             RunEntry { at: unix(dt(2026, 9, 29, 2)), ok: true, seconds: 120, text: "오늘의 조각 x\n지적 15건 → 후보 8건 · 오늘 만들 티켓 6건 · 이월 0건\n".into() },
-            RunEntry { at: unix(dt(2026, 9, 30, 2)), ok: false, seconds: 60, text: "--- 조각 1 실패 ---\n".into() },
+            RunEntry { at: unix(dt(2026, 9, 30, 2)), ok: false, seconds: 60, text: "--- 점검 구간 1 실패 ---\n".into() },
+            // 새 문구로 남은 실행 기록(예전 문구는 위 첫 줄)
+            RunEntry { at: unix(dt(2026, 10, 1, 2)), ok: true, seconds: 30, text: "오늘의 점검 구간 z\n발견 5건 → 티켓 후보 2건 · 오늘 만들 티켓 1건 · 대기 0건\n".into() },
             RunEntry { at: unix(dt(2026, 8, 1, 2)), ok: true, seconds: 999, text: "오늘의 조각 y\n".into() }, // 기간 밖
         ];
         let settings = SweepSettings { repo: "o/r".into(), ..Default::default() };
         let md = render(&p, &Input { issues: &issues, status: &status(), runs: &runs, settings: &settings, site_url: "https://x.atlassian.net", now: unix(dt(2026, 10, 5, 9)) });
-        for h in ["# 정기 스윕 주간 리포트 2026-W40", "## 1. 요약", "## 2. 이 기간에 만든 티켓", "## 3. 결과", "## 4. 부모 없는 봇 티켓", "## 5. 담당자별", "## 6. 시간", "## 7. 다음 기간 계획"] {
+        for h in ["# 코드 정기 점검 주간 리포트 2026-W40", "## 1. 요약", "## 2. 이 기간에 만든 티켓", "## 3. 결과", "## 4. 상위 에픽이 없는 자동 생성 티켓", "## 5. 담당자별", "## 6. 시간", "## 7. 다음 기간 계획"] {
             assert!(md.contains(h), "{h}");
         }
-                assert!(md.contains("실행 2회(실패 1회)"));
-        assert!(md.contains("읽은 조각 1개"));
-        assert!(md.contains("지적 15건 → 후보 8건 → 만든 티켓 2건"));
+                assert!(md.contains("실행 3회(실패 1회)"));
+        assert!(md.contains("점검한 구간 2개"));
+        assert!(md.contains("발견 20건 → 티켓 후보 10건 → 만든 티켓 2건"), "예전·새 문구의 실행 기록을 모두 센다");
         assert!(md.contains("[a1](https://x.atlassian.net/browse/a1)"));
         assert!(md.contains("제목 a1 \\| 파이프"), "표 안의 | 는 이스케이프");
         assert!(!md.contains("a3](") , "기간 밖 티켓은 목록에 없다");
-        assert!(md.contains("커버리지 11%"));
-        assert!(md.contains("남은 조각 80개"));
-        // 표본이 5건 미만이라 숫자 대신 표본 부족.
-        assert!(md.contains("표본 부족"));
-        assert!(md.contains("분류별 생성: rule 1 · split 1"));
+        assert!(md.contains("점검한 비율 11%"));
+        assert!(md.contains("남은 점검 구간 80개"));
+        // 표본이 5건 미만이라 숫자 대신 안내 문구.
+        assert!(md.contains("건수가 적어 판단하지 않음"));
+        assert!(md.contains("분류별 생성: 규칙 위반 1 · 분리 필요 1"));
         assert!(md.contains("| 가 | 2 | 1 |"));
     }
 
@@ -388,6 +392,6 @@ mod tests {
         let settings = SweepSettings::default();
         let idle = Status { cycle_no: None, slices_total: 0, slices_done: 0, ..status() };
         let md = render(&p, &Input { issues: &[], status: &idle, runs: &[], settings: &settings, site_url: "", now: unix(dt(2026, 10, 1, 9)) });
-        assert!(md.contains("진행 중인 바퀴 없음") && md.contains("없음"));
+        assert!(md.contains("진행 중인 회차 없음") && md.contains("없음"));
     }
 }

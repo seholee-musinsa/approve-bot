@@ -1,8 +1,8 @@
-//! 정기 스윕 스케줄러. 실행 시각 계산은 순수 함수로 두고(시계를 읽지 않는다),
+//! 코드 정기 점검 스케줄러. 실행 시각 계산은 순수 함수로 두고(시계를 읽지 않는다),
 //! 백그라운드 루프가 1분마다 "지금 돌릴 때인가"를 묻는다.
 //!
 //! 앱이 꺼져 있던 동안 지나간 시각은 켜질 때 한 번만 보정한다(밀린 횟수만큼 돌지 않는다).
-//! 스윕을 처음 켠 시점에는 과거 시각을 소급해 돌지 않고, 켠 시각부터 센다.
+//! 점검을 처음 켠 시점에는 과거 시각을 소급해 돌지 않고, 켠 시각부터 센다.
 
 use crate::config::{AppConfig, CreateMode, Frequency, SweepSettings};
 use crate::state::AppState;
@@ -93,7 +93,7 @@ pub fn run_flags(s: &SweepSettings) -> Vec<String> {
     f
 }
 
-// ---- 스윕 로그 --------------------------------------------------------------------
+// ---- 점검 실행 기록 --------------------------------------------------------------------
 
 const MAX_LOG: usize = 100;
 
@@ -182,14 +182,14 @@ pub async fn run_once(state: &Arc<AppState>, s: &SweepSettings) -> bool {
         });
         match rx.await {
             Ok(Ok(out)) => {
-                text.push_str(&format!("--- 조각 {} ---\n{out}\n", n + 1));
-                if out.contains("이번 바퀴의 조각을 모두 읽었다") {
+                text.push_str(&format!("--- 점검 구간 {} ---\n{out}\n", n + 1));
+                if out.contains("이번 회차의 점검 구간을 모두 읽었다") || out.contains("이번 바퀴의 조각을 모두 읽었다") {
                     break;
                 }
             }
             Ok(Err(e)) => {
                 ok = false;
-                text.push_str(&format!("--- 조각 {} 실패 ---\n{e}\n", n + 1));
+                text.push_str(&format!("--- 점검 구간 {} 실패 ---\n{e}\n", n + 1));
                 break;
             }
             Err(_) => {
@@ -273,7 +273,7 @@ async fn tick_reports(state: &Arc<AppState>) {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Status {
     pub running: bool,
-    /// 진행 중인 바퀴: (번호, 읽은 조각, 전체 조각, 다음 조각 이름)
+    /// 진행 중인 회차: (번호, 점검한 구간, 전체 구간, 다음 구간 이름)
     pub cycle_no: Option<u32>,
     pub slices_done: usize,
     pub slices_total: usize,

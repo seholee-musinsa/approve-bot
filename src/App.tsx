@@ -107,7 +107,7 @@ export default function App() {
           PR 리뷰
         </button>
         <button className={tab === "sweep" ? "tab active" : "tab"} onClick={() => setTab("sweep")}>
-          정기 스윕
+          코드 점검
         </button>
         <button className={tab === "report" ? "tab active" : "tab"} onClick={() => setTab("report")}>
           리포트

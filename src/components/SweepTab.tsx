@@ -32,14 +32,14 @@ export function SweepTab({ value, onChange, dirty }: Props) {
     <>
       <StatusPanel settings={s} dirty={dirty} repoOk={repoOk} />
       <div className="panel">
-        <h2>정기 스윕 설정</h2>
+        <h2>코드 정기 점검 설정</h2>
         <label className="toggle">
           <input
             type="checkbox"
             checked={s.enabled}
             onChange={(e) => patch({ enabled: e.target.checked })}
           />
-          정기 스윕 사용
+          코드 정기 점검 사용
         </label>
         <Field label="대상 repo">
           <input
@@ -87,23 +87,23 @@ export function SweepTab({ value, onChange, dirty }: Props) {
         <div className="muted">
           앱이 꺼져 있던 동안 지난 시각은 켜질 때 한 번만 보정해서 돌립니다. PR 리뷰가 도는 중에는 끝나길 기다립니다.
         </div>
-        <Field label="회당 조각 수">
+        <Field label="회당 점검 구간 수">
           <NumberInput value={s.slices_per_run} min={1} max={3} onChange={(n) => patch({ slices_per_run: n })} />
           <span className="muted">1~3</span>
         </Field>
-        <Field label="조각 최대 줄 수">
+        <Field label="구간 최대 줄 수">
           <NumberInput value={s.max_slice_lines} min={2000} max={100000} step={1000} onChange={(n) => patch({ max_slice_lines: n })} />
         </Field>
         <Field label="묶음당 최대 파일">
           <NumberInput value={s.max_files_per_ticket} min={1} max={30} onChange={(n) => patch({ max_files_per_ticket: n })} />
         </Field>
-        <Field label="티켓 생성 방식">
+        <Field label="티켓 만들기">
           <select
             value={s.create_mode}
             onChange={(e) => patch({ create_mode: e.target.value as CreateMode })}
           >
-            <option value="draft">초안만 (Jira 에 쓰지 않음)</option>
-            <option value="auto">자동 생성</option>
+            <option value="draft">초안만 (티켓을 만들지 않음)</option>
+            <option value="auto">티켓 자동 생성</option>
           </select>
         </Field>
         {s.create_mode === "auto" && (
@@ -200,7 +200,7 @@ function StatusPanel({
     setConfirmReset(false);
     try {
       await api.resetSweepCycle();
-      setMsg("바퀴를 처음으로 되돌렸습니다. 키 이력은 그대로 둡니다.");
+      setMsg("회차를 처음부터 다시 시작합니다. 처리 이력은 그대로 둡니다.");
       api.getSweepStatus().then(setSt).catch(() => {});
     } catch (e) {
       setMsg(String(e));
@@ -220,8 +220,8 @@ function StatusPanel({
           <div className="row">
             <span>
               {st.cycle_no
-                ? `바퀴 ${st.cycle_no} · 읽은 조각 ${st.slices_done}/${st.slices_total} (${pct}%)`
-                : "아직 시작한 바퀴가 없습니다"}
+                ? `회차 ${st.cycle_no} · 점검한 구간 ${st.slices_done}/${st.slices_total} (${pct}%)`
+                : "아직 시작한 회차가 없습니다"}
             </span>
             {st.running && <span className="badge">실행 중</span>}
           </div>
@@ -230,9 +230,9 @@ function StatusPanel({
               <div className="progress-bar" style={{ width: `${pct}%` }} />
             </div>
           )}
-          {st.next_slice && <div className="muted">다음 조각: {st.next_slice}</div>}
+          {st.next_slice && <div className="muted">다음 점검 구간: {st.next_slice}</div>}
           <div className="muted">
-            이월 후보 {st.carryover}건 · 만든 티켓 {st.created_keys} · 완료 {st.done_keys} · 거절 {st.rejected_keys} · 끝낸 바퀴 {st.finished_cycles}
+            대기 중인 후보 {st.carryover}건 · 만든 티켓 {st.created_keys} · 완료 {st.done_keys} · 거절 {st.rejected_keys} · 끝낸 회차 {st.finished_cycles}
           </div>
           <div className="muted">
             마지막 실행 {st.last_run ?? "-"} · 다음 실행 {st.next_run ?? (settings.enabled ? "-" : "꺼져 있음")}
@@ -242,7 +242,7 @@ function StatusPanel({
               지금 실행
             </button>
             <button onClick={reset} disabled={!st || st.running}>
-              {confirmReset ? "정말 초기화" : "바퀴 초기화"}
+              {confirmReset ? "정말 처음부터" : "회차 처음부터 다시"}
             </button>
             {confirmReset && <button onClick={() => setConfirmReset(false)}>취소</button>}
           </div>

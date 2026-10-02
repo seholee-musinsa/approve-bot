@@ -109,7 +109,7 @@ export function ReportsTab({ open, onOpen, value, onChange, dirty }: Props) {
           <input type="text" placeholder="예: FCPGNP" value={r.space_key} onChange={(e) => patch({ space_key: e.target.value })} />
         </div>
         <div className="row" style={{ gap: 12 }}>
-          <span className="field-label">부모 페이지 ID</span>
+          <span className="field-label">상위 페이지 ID</span>
           <input type="text" placeholder="리포트를 모아 둘 페이지의 ID" value={r.parent_page_id} onChange={(e) => patch({ parent_page_id: e.target.value })} />
         </div>
         <label className="toggle">
@@ -117,11 +117,11 @@ export function ReportsTab({ open, onOpen, value, onChange, dirty }: Props) {
           만든 리포트를 Confluence 에 자동 게시
         </label>
         <div className="muted">
-          자동 게시를 켜면 새 리포트와, 게시에 실패해 남아 있는 리포트를 부모 페이지 아래에 올립니다. 같은 제목의 페이지가 있으면 새로 만들지 않고 내용을 갱신합니다. 끄면 아래 목록에서 직접 게시합니다.
+          자동 게시를 켜면 새 리포트와, 게시에 실패해 남아 있는 리포트를 상위 페이지 아래에 올립니다. 같은 제목의 페이지가 있으면 새로 만들지 않고 내용을 갱신합니다. 끄면 아래 목록에서 직접 게시합니다.
         </div>
         <div className="row">
           <button onClick={checkParent} disabled={dirty || r.space_key === "" || r.parent_page_id === ""}>
-            부모 페이지 확인(읽기)
+            상위 페이지 확인(읽기)
           </button>
         </div>
         <div className="row">

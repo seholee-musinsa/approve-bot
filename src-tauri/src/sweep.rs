@@ -477,7 +477,7 @@ fn volume_report(v: &Volume, max_files: usize) -> String {
          | 후보 | 파일 수 |\n|---|--:|\n\
          | 규칙 위반 | {} |\n| suppression(eslint-disable 등) | {} |\n| as any | {} |\n| TODO·FIXME | {} |\n| {}줄 이상 큰 파일 | {} |\n| 후보가 하나라도 있는 파일 | {} |\n\n\
          티켓 수 환산(묶음 방식별)\n| 묶음 방식 | 티켓 수 |\n|---|--:|\n\
-         | 파일 단위 | {} |\n| 종류별, 전체를 한 번에 묶음(종류마다 최대 {max_files}개 파일씩, 큰 파일은 하나씩) | {} |\n| 종류별, 그날 읽은 조각 안에서 묶음(실제 하루 생성량의 합) | {} |\n| 조각 단위 | {} |\n",
+         | 파일 단위 | {} |\n| 종류별, 전체를 한 번에 묶음(종류마다 최대 {max_files}개 파일씩, 큰 파일은 하나씩) | {} |\n| 종류별, 그날 읽은 점검 구간 안에서 묶음(실제 하루 생성량의 합) | {} |\n| 점검 구간 단위 | {} |\n",
         v.rule_files, v.suppression_files, v.any_files, v.todo_files, BIG_FILE_LINES, v.big_files, v.candidate_files,
         v.by_file, v.by_kind, v.by_kind_in_slice, v.by_slice
     )
@@ -496,7 +496,7 @@ fn short_name(name: &str) -> String {
 /// Plain-text report for `sweep-once`.
 pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> String {
     let total_lines: usize = files.iter().map(|f| f.lines).sum();
-    let mut s = format!("소스 {}개 · {}줄 · 조각 {}개\n", files.len(), total_lines, slices.len());
+    let mut s = format!("소스 {}개 · {}줄 · 점검 구간 {}개\n", files.len(), total_lines, slices.len());
     let mut by_rule: BTreeMap<&str, usize> = BTreeMap::new();
     for f in files {
         for v in &f.violations {
@@ -509,13 +509,13 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
         let parts: Vec<String> = by_rule.iter().map(|(r, n)| format!("{r} {n}")).collect();
         s.push_str(&format!("규칙 위반(줄 수): {}\n", parts.join(" · ")));
     }
-    s.push_str(&format!("\n위험 점수 상위 조각 {top}개\n| # | 조각 | 줄 | 파일 | 점수 | 천 줄당 |\n|--:|---|--:|--:|--:|--:|\n"));
+    s.push_str(&format!("\n우선순위 점수 상위 점검 구간 {top}개\n| # | 점검 구간 | 줄 | 파일 | 점수 | 천 줄당 |\n|--:|---|--:|--:|--:|--:|\n"));
     for (i, sl) in slices.iter().take(top).enumerate() {
         s.push_str(&format!("| {} | {} | {} | {} | {:.0} | {:.1} |\n", i + 1, short_name(&sl.name), sl.lines, sl.files.len(), sl.score, density(sl)));
     }
     let mut hot: Vec<&FileStat> = files.iter().collect();
     hot.sort_by(|a, b| score(b, w).partial_cmp(&score(a, w)).unwrap_or(std::cmp::Ordering::Equal).then(a.path.cmp(&b.path)));
-    s.push_str(&format!("\n위험 점수 상위 파일 {top}개\n| # | 파일 | 줄 | 변경 | 마커 | 위반 | 점수 |\n|--:|---|--:|--:|--:|--:|--:|\n"));
+    s.push_str(&format!("\n우선순위 점수 상위 파일 {top}개\n| # | 파일 | 줄 | 변경 | 마커 | 위반 | 점수 |\n|--:|---|--:|--:|--:|--:|--:|\n"));
     for (i, f) in hot.iter().take(top).enumerate() {
         let m = f.markers.suppressions + f.markers.any_casts + f.markers.todos;
         s.push_str(&format!("| {} | {} | {} | {} | {} | {} | {:.0} |\n", i + 1, f.path, f.lines, f.churn, m, f.violations.len(), score(f, w)));
@@ -618,8 +618,8 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
         ledger.reset_cycle();
         crate::sweep_state::save(&dir, &ledger)?;
         return Ok(match had {
-            Some((d, n)) => format!("바퀴를 초기화했다(읽은 조각 {d}/{n} 를 비움, 이월분 비움). 키 이력 {}건은 그대로 둔다\n", ledger.keys.len()),
-            None => format!("진행 중인 바퀴가 없었다. 이월분만 비웠다. 키 이력 {}건은 그대로 둔다\n", ledger.keys.len()),
+            Some((d, n)) => format!("회차를 처음부터 다시 시작한다(점검한 구간 {d}/{n} 를 비움, 대기 중인 후보도 비움). 처리 이력 {}건은 그대로 둔다\n", ledger.keys.len()),
+            None => format!("진행 중인 회차가 없었다. 대기 중인 후보만 비웠다. 처리 이력 {}건은 그대로 둔다\n", ledger.keys.len()),
         });
     }
     if !repo.is_empty() && !local.is_empty() {
@@ -663,7 +663,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
         let dir = crate::repocache::cache_dir(&root, owner, name);
         if clear_cache {
             crate::repocache::clear(&dir);
-            return Ok(format!("캐시를 지웠다: {}", dir.display()));
+            return Ok(format!("점검용 저장소 사본을 지웠다: {}", dir.display()));
         }
         let (text, mut synced) = refresh_cache(owner, name, &dir)?;
         notes.push_str(&text);
@@ -673,7 +673,7 @@ pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
             // The sync was clean but the history cannot be read: the cache is
             // damaged somewhere the sync did not look. Rebuild it once.
             Err(e) if crate::repocache::is_corruption(&e.to_string()) => {
-                notes.push_str("이력을 읽지 못해(캐시 손상) 캐시를 지우고 다시 받는다\n");
+                notes.push_str("이력을 읽지 못해(저장소 사본 손상) 사본을 지우고 다시 받는다\n");
                 crate::repocache::clear(&dir);
                 let (text, again) = refresh_cache(owner, name, &dir)?;
                 notes.push_str(&text);
@@ -734,7 +734,7 @@ fn review_slice(
     let (model, thinking) = model_settings(model, thinking);
     let outcome = read_slice(slice, &prompt, checkout, &model, thinking, max_files);
     Ok(format!(
-        "{notes}조각 {} · 파일 {}개 · {}줄 · 모델 {model} · 생각 예산 {thinking} · 프롬프트 {}자\n{}",
+        "{notes}점검 구간 {} · 파일 {}개 · {}줄 · 모델 {model} · 생각 예산 {thinking} · 프롬프트 {}자\n{}",
         slice.name,
         slice.files.len(),
         slice.lines,
@@ -823,7 +823,7 @@ fn create_tickets(
         let keys: Vec<String> = d.findings.iter().map(|&i| plan.kept[i].key.clone()).collect();
         let prev: Vec<&String> = keys.iter().filter_map(|k| plan.recurrences.get(k)).collect();
         if let Some(p) = prev.first() {
-            body.push_str(&format!("\n\n재발: 이전에 {p} 로 완료했던 항목이 다시 발견됐다."));
+            body.push_str(&format!("\n\n다시 발견됨: 이전에 {p} 로 완료했던 항목이 다시 발견됐다."));
         }
         let t = jira::NewTicket { title: &d.title, body: &body, keys: &keys, estimate_md: d.effort.md(), assignee: cfg.assignees.first().map(String::as_str), category: d.category.name() };
         match rt.block_on(client.create(&cfg, &t)) {
@@ -901,13 +901,13 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     match ledger.cycle.as_ref().map(|cy| cy.started_commit.clone()) {
         None => {
             ledger.start_cycle(&ranked, c.commit, now);
-            out.push_str(&format!("새 바퀴 {} 시작 · 조각 {}개\n", ledger.finished_cycles + 1, ranked.len()));
+            out.push_str(&format!("새 회차 {} 시작 · 점검 구간 {}개\n", ledger.finished_cycles + 1, ranked.len()));
         }
         Some(old) if old != c.commit => {
             let changed = changed_between(c.checkout, &old, c.commit);
             let dropped = ledger.expire_carryover(&changed);
             ledger.replan(&ranked, c.commit);
-            out.push_str(&format!("기준 커밋이 바뀌어 조각 구성을 다시 맞췄다(이월 {dropped}건 만료)\n"));
+            out.push_str(&format!("기준 커밋이 바뀌어 점검 구간을 다시 나눴다(대기 중인 후보 {dropped}건 만료)\n"));
         }
         Some(_) => {}
     }
@@ -916,14 +916,14 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         if c.save {
             st::save(&dir, &ledger)?;
         }
-        out.push_str("이번 바퀴의 조각을 모두 읽었다. 다음 실행에서 새 바퀴를 시작한다\n");
+        out.push_str("이번 회차의 점검 구간을 모두 읽었다. 다음 실행에서 새 회차를 시작한다\n");
         return Ok(out);
     };
-    let slice = slices.iter().find(|s| s.name == next).ok_or_else(|| anyhow::anyhow!("장부의 조각 {next} 이(가) 지금 구성에 없다"))?;
+    let slice = slices.iter().find(|s| s.name == next).ok_or_else(|| anyhow::anyhow!("장부의 점검 구간 {next} 이(가) 지금 구성에 없다"))?;
     let (input, prompt) = slice_prompt(slice, c.files, c.w, c.checkout, c.commit, c.max_candidates);
     let (model, thinking) = model_settings(c.model.clone(), c.thinking);
     let outcome = read_slice(slice, &prompt, c.checkout, &model, thinking, c.max_files);
-    out.push_str(&format!("오늘의 조각 {} · 파일 {}개 · {}줄 · 모델 {model}\n", slice.name, slice.files.len(), slice.lines));
+    out.push_str(&format!("오늘의 점검 구간 {} · 파일 {}개 · {}줄 · 모델 {model}\n", slice.name, slice.files.len(), slice.lines));
     if outcome.run.is_error || outcome.parse_error.is_some() {
         let why = outcome.parse_error.clone().unwrap_or_else(|| outcome.run.text.chars().take(200).collect());
         ledger.mark_failed(&slice.name, &why);
@@ -942,7 +942,7 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     }
     let carried: Vec<_> = ledger.take_carried(usize::MAX).into_iter().flat_map(|x| x.findings).collect();
     if !carried.is_empty() {
-        out.push_str(&format!("이월분 지적 {}건을 오늘 후보에 합친다\n", carried.len()));
+        out.push_str(&format!("대기 중이던 후보 {}건을 오늘 후보에 합친다\n", carried.len()));
     }
     let incoming: Vec<_> = carried.into_iter().chain(incoming).collect();
     // Jira: open bot tickets (cap) and tickets that already hold these keys (3.3 b). Read only.
@@ -954,7 +954,7 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
             if let Some(n) = open {
                 open_tickets = n;
             }
-            out.push_str(&format!("Jira 확인(읽기): 열린 봇 티켓 {open_tickets}건 · 같은 키 티켓 {}건\n", found.len()));
+            out.push_str(&format!("Jira 확인(읽기): 열린 자동 생성 티켓 {open_tickets}건 · 같은 식별값의 티켓 {}건\n", found.len()));
             for (k, o) in found {
                 view.record(&k, o);
             }
@@ -962,7 +962,7 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         Ok(None) => out.push_str("Jira 설정(sweep-jira.json)이 없어 Jira 확인을 건너뛴다(열린 티켓 수는 --open-tickets 값)\n"),
         Err(e) => {
             open_tickets = usize::MAX / 2;
-            out.push_str(&format!("⚠️ Jira 를 읽지 못해 오늘은 만들지 않고 모두 이월한다: {e:#}\n"));
+            out.push_str(&format!("⚠️ Jira 를 읽지 못해 오늘은 만들지 않고 모두 대기시킨다: {e:#}\n"));
         }
     }
     let by_path: std::collections::HashMap<&str, f64> = c.files.iter().map(|f| (f.path.as_str(), score(f, c.w))).collect();
@@ -970,7 +970,7 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     let policy = sd::Policy { max_files: c.max_files, open_cap, ..Default::default() };
     let mut plan = sd::plan_day(incoming.clone(), &view, &policy, now, open_tickets, &|p| by_path.get(p).copied().unwrap_or(0.0));
     out.push_str(&format!(
-        "지적 {}건 → 후보 {}건 · 오늘 만들 티켓 {}건 · 이월 {}건 · 걸러냄 {}건 (열린 봇 티켓 {} / 상한 {})\n",
+        "발견 {}건 → 티켓 후보 {}건 · 오늘 만들 티켓 {}건 · 대기 {}건 · 걸러냄 {}건 (열린 자동 생성 티켓 {} / 상한 {})\n",
         incoming.len(),
         plan.kept.len(),
         plan.create.len(),
@@ -980,7 +980,7 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         policy.open_cap
     ));
     for (key, why) in &plan.skipped {
-        out.push_str(&format!("  걸러냄 {key}: {why:?}\n"));
+        out.push_str(&format!("  걸러냄 {key}: {}\n", why.label()));
     }
     // What is not created today is carried over, not lost: the cap, a hand limit,
     // a failed create, or a save without --create.
@@ -1012,12 +1012,12 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         plan.carry.extend(all);
     }
     for d in &plan.carry {
-        out.push_str(&format!("이월: {}\n", d.title));
+        out.push_str(&format!("대기: {}\n", d.title));
     }
     ledger.mark_read(&slice.name, c.commit, now);
     sd::park(&mut ledger, &plan, c.commit);
     if ledger.finish_if_complete() {
-        out.push_str("이번 바퀴를 모두 읽었다\n");
+        out.push_str("이번 회차를 모두 읽었다\n");
     }
     if c.save {
         st::save(&dir, &ledger)?;
@@ -1047,7 +1047,7 @@ fn refresh_cache(owner: &str, name: &str, dir: &Path) -> anyhow::Result<(String,
         Ok(ok) => {
             let mb = repocache::dir_size(dir) as f64 / 1_048_576.0;
             text.push_str(&format!(
-                "캐시 {} · 기본 브랜치 {} · 기준 커밋 {} · {} {:.1}초 · 용량 {:.0}MB{}\n",
+                "점검용 저장소 사본 {} · 기본 브랜치 {} · 기준 커밋 {} · {} {:.1}초 · 용량 {:.0}MB{}\n",
                 dir.display(),
                 ok.branch,
                 ok.commit.chars().take(8).collect::<String>(),
@@ -1298,7 +1298,7 @@ mod tests {
         let files = vec![f];
         let slices = rank(pack_slices(&files, &w, 1000), RankBy::Sum);
         let r = report(&files, &slices, &w, 5);
-        assert!(r.contains("소스 1개 · 900줄 · 조각 1개"), "{r}");
+        assert!(r.contains("소스 1개 · 900줄 · 점검 구간 1개"), "{r}");
         assert!(r.contains("mcds-prefix 1"), "{r}");
         assert!(r.contains("| 1 | layers/features/a/src/x.tsx | 900 | 12 |"), "{r}");
     }

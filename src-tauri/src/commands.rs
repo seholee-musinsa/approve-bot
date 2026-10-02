@@ -210,11 +210,11 @@ pub async fn test_jira_connection(state: State<'_, Arc<AppState>>) -> Result<Str
     let (c, j) = jira_client(&state.config_dir)?;
     let me = j.myself().await.map_err(|e| format!("{e:#}"))?;
     let epic = match &c.parent_key {
-        None => "부모 Epic 미설정(부모 없이 만들고 나중에 지정)".to_string(),
+        None => "상위 에픽 미설정(상위 에픽 없이 만들고 나중에 지정)".to_string(),
         Some(k) => match j.issue_brief(k).await {
-            Ok((t, true)) => format!("⚠️ 부모 Epic {k} 가 완료 상태입니다: {t}"),
-            Ok((t, false)) => format!("부모 Epic {k}: {t}"),
-            Err(e) => format!("⚠️ 부모 Epic {k} 를 읽지 못함: {e:#}"),
+            Ok((t, true)) => format!("⚠️ 상위 에픽 {k} 가 완료 상태입니다: {t}"),
+            Ok((t, false)) => format!("상위 에픽 {k}: {t}"),
+            Err(e) => format!("⚠️ 상위 에픽 {k} 를 읽지 못함: {e:#}"),
         },
     };
     Ok(format!("연결됨: {me} · {epic}"))
@@ -271,10 +271,10 @@ pub async fn assign_parent_bulk(state: State<'_, Arc<AppState>>, keys: Vec<Strin
     if !c.allow_create {
         return Err("Jira 쓰기가 꺼져 있습니다(sweep-jira.json 의 allow_create)".into());
     }
-    let parent = c.parent_key.clone().ok_or_else(|| "부모 Epic 이 설정되어 있지 않습니다".to_string())?;
+    let parent = c.parent_key.clone().ok_or_else(|| "상위 에픽이 설정되어 있지 않습니다".to_string())?;
     let (title, done) = j.issue_brief(&parent).await.map_err(|e| format!("{e:#}"))?;
     if done {
-        return Err(format!("부모 Epic {parent} 가 완료 상태라 지정하지 않았습니다: {title}"));
+        return Err(format!("상위 에픽 {parent} 가 완료 상태라 지정하지 않았습니다: {title}"));
     }
     // 화면에서 넘어온 키를 믿지 않고 지금 부모 없는 봇 티켓인지 다시 확인한다.
     let orphans = j.search(&crate::jira::jql_bot_orphans(&c), 500).await.map_err(|e| format!("{e:#}"))?;
@@ -292,7 +292,7 @@ pub async fn assign_parent_bulk(state: State<'_, Arc<AppState>>, keys: Vec<Strin
     }
     let mut msg = format!("{parent} 아래로 {ok}건 지정");
     if skipped > 0 {
-        msg.push_str(&format!(" · 건너뜀 {skipped}건(이미 부모가 있거나 봇 티켓이 아님)"));
+        msg.push_str(&format!(" · 건너뜀 {skipped}건(이미 상위 에픽이 있거나 자동 생성 티켓이 아님)"));
     }
     if !failed.is_empty() {
         msg.push_str(&format!(" · 실패 {}건: {}", failed.len(), failed.join(" / ")));
@@ -313,7 +313,7 @@ pub struct TicketRow {
     pub has_parent: bool,
 }
 
-/// The bot's tickets, newest first, with a link to open each in Jira (read only).
+/// The auto-created tickets, newest first, with a link to open each in Jira (read only).
 #[tauri::command]
 pub async fn list_bot_tickets(state: State<'_, Arc<AppState>>) -> Result<Vec<TicketRow>, String> {
     let (mut c, j) = jira_client(&state.config_dir)?;

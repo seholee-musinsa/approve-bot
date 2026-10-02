@@ -306,6 +306,10 @@ impl Category {
             _ => None,
         }
     }
+    /// 사람이 읽는 이름(티켓·리포트에 쓴다). 내부 식별자는 `name()`.
+    pub fn label(self) -> &'static str {
+        category_label(self.name())
+    }
     pub fn name(self) -> &'static str {
         match self {
             Category::Rule => "rule",
@@ -322,7 +326,25 @@ pub enum Effort {
     L,
 }
 
+/// 분류 식별자(rule/split/debt)의 사람이 읽는 이름. 모르는 값은 그대로 돌려준다.
+pub fn category_label(id: &str) -> &str {
+    match id {
+        "rule" => "규칙 위반",
+        "split" => "분리 필요",
+        "debt" => "정리 대상",
+        other => other,
+    }
+}
+
 impl Effort {
+    /// `M(1일)` 처럼 크기와 대략의 시간.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Effort::S => "S(반나절 이내)",
+            Effort::M => "M(1일)",
+            Effort::L => "L(2일 안팎)",
+        }
+    }
     fn parse(s: &str) -> Self {
         match s.trim().to_uppercase().as_str() {
             "S" => Effort::S,
@@ -604,7 +626,7 @@ pub fn group(findings: &[Finding], max_files: usize) -> Vec<TicketDraft> {
     drafts
 }
 
-const CLOSE_NOTE: &str = "거절(Won't Do)로 닫을 때는 코멘트 첫 줄에 `사유: 사실 틀림 | 가치 낮음 | 크기·시점 | 중복 | 이미 해결` 중 하나를 적어 주세요.";
+const CLOSE_NOTE: &str = "거절(Won't Do)로 닫을 때는 코멘트 첫 줄에 `사유: 내용이 틀림 | 가치 낮음 | 지금은 어려움(크기·시점) | 중복 | 이미 해결` 중 하나를 적어 주세요.";
 
 /// A draft body in the five sections of the team's ticket convention.
 pub fn render_ticket(d: &TicketDraft, findings: &[Finding], slice: &str, commit: &str) -> String {
@@ -631,11 +653,11 @@ pub fn render_ticket(d: &TicketDraft, findings: &[Finding], slice: &str, commit:
         }
     }
     match d.category {
-        Category::Rule => s.push_str("- 위 파일에서 해당 규칙 위반이 없어진다(재점검에서 같은 지적이 나오지 않는다).\n"),
+        Category::Rule => s.push_str("- 위 파일에서 해당 규칙 위반이 없어진다(다시 점검해도 같은 항목이 나오지 않는다).\n"),
         Category::Debt => s.push_str("- 위 마커를 없애거나, 남기는 이유를 코드 옆에 적는다.\n"),
         Category::Split => s.push_str("- 제안한 방향으로 나뉘고, 동작은 바뀌지 않으며 기존 시험이 통과한다.\n"),
     }
-    s.push_str(&format!("\n### 리뷰 관점\n- {} · 작업 크기 {} (예상 {} MD)\n", d.category.name(), d.effort.name(), d.effort.md()));
+    s.push_str(&format!("\n### 리뷰 관점\n- 분류: {} · 작업 크기 {} (예상 {} MD)\n", d.category.label(), d.effort.describe(), d.effort.md()));
     s.push_str("\n### 참고\n");
     for f in &fs {
         if !f.evidence.is_empty() {
@@ -650,7 +672,7 @@ pub fn render_ticket(d: &TicketDraft, findings: &[Finding], slice: &str, commit:
         }
     }
     let keys: Vec<&str> = fs.iter().map(|f| f.key.as_str()).collect();
-    s.push_str(&format!("- 조각 {slice} · 기준 커밋 {} · 안정 키 {}\n\n{CLOSE_NOTE}\n", commit.chars().take(8).collect::<String>(), keys.join(", ")));
+    s.push_str(&format!("- 점검 구간 {slice} · 점검한 시점(커밋) {} · 중복 방지 식별값 {}\n\n{CLOSE_NOTE}\n", commit.chars().take(8).collect::<String>(), keys.join(", ")));
     s
 }
 
@@ -1185,8 +1207,9 @@ mod tests {
             assert!(body.contains(sec), "{sec}");
         }
         assert!(body.contains("`layers/a/X.tsx:3` `sym`") && body.contains("근거: .claude/rules/mcds.md"), "{body}");
-        assert!(body.contains("작업 크기 S (예상 0.5 MD)"));
-        assert!(body.contains("사유: 사실 틀림 | 가치 낮음 | 크기·시점 | 중복 | 이미 해결"));
+        assert!(body.contains("작업 크기 S(반나절 이내) (예상 0.5 MD)") && body.contains("분류: "));
+        assert!(body.contains("사유: 내용이 틀림 | 가치 낮음 | 지금은 어려움(크기·시점) | 중복 | 이미 해결"));
+        assert!(body.contains("점검 구간 layers/a") && body.contains("중복 방지 식별값"));
         assert!(body.contains(&fs[0].key) && body.contains("be718036"));
         assert!(!body.contains("be718036aa"), "the commit is shortened");
     }
