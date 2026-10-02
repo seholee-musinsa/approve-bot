@@ -39,6 +39,9 @@ pub struct JiraConfig {
     /// accountId → 표시 이름(화면용).
     #[serde(default)]
     pub assignee_names: std::collections::BTreeMap<String, String>,
+    /// Jira 사이트 주소(티켓 링크용). 비어 있으면 처음 필요할 때 API 로 알아내 저장한다.
+    #[serde(default)]
+    pub site_url: String,
     /// 한 사람의 열린 봇 티켓 상한(5.5).
     #[serde(default = "d_open_cap")]
     pub open_cap: usize,
@@ -182,6 +185,8 @@ pub struct Issue {
     /// 생성 시각, unix 초(읽지 못하면 0).
     pub created: u64,
     pub parent: Option<String>,
+    pub status: String,
+    pub assignee: Option<String>,
 }
 
 fn adf_text(v: &Value, out: &mut String) {
@@ -238,6 +243,8 @@ pub fn parse_issues(v: &Value) -> Vec<Issue> {
                         summary: f.get("summary").and_then(Value::as_str).unwrap_or("").to_string(),
                         created: f.get("created").and_then(Value::as_str).map_or(0, parse_jira_time),
                         parent: f.pointer("/parent/key").and_then(Value::as_str).map(String::from),
+                        status: f.pointer("/status/name").and_then(Value::as_str).unwrap_or("").to_string(),
+                        assignee: f.pointer("/assignee/displayName").and_then(Value::as_str).map(String::from),
                     })
                 })
                 .collect()
@@ -363,6 +370,11 @@ pub fn jql_bot_orphans(c: &JiraConfig) -> String {
     format!("labels = \"{}\" AND parent is EMPTY", c.bot_label)
 }
 
+/// 티켓 키로 만든 링크. 사이트 주소가 없으면 빈 문자열.
+pub fn browse_url(site: &str, key: &str) -> String {
+    if site.is_empty() { String::new() } else { format!("{}/browse/{key}", site.trim_end_matches('/')) }
+}
+
 pub fn parse_users(v: &Value) -> Vec<(String, String)> {
     v.as_array()
         .map(|a| {
@@ -430,7 +442,7 @@ impl Jira {
         loop {
             let mut q = vec![
                 ("jql", jql.to_string()),
-                ("fields", "labels,status,resolution,comment,summary,created,parent".to_string()),
+                ("fields", "labels,status,resolution,comment,summary,created,parent,assignee".to_string()),
                 ("maxResults", limit.min(100).to_string()),
             ];
             if let Some(t) = &token {
@@ -457,6 +469,13 @@ impl Jira {
         let resp = self.http.get(format!("{}/myself", self.base)).basic_auth(&self.email, Some(&self.token)).send().await?;
         let v = Self::check(resp).await?;
         Ok(v.get("displayName").and_then(Value::as_str).unwrap_or("?").to_string())
+    }
+
+    /// 읽기: 사이트 주소(`https://….atlassian.net`).
+    pub async fn site_url(&self) -> Result<String> {
+        let resp = self.http.get(format!("{}/serverInfo", self.base)).basic_auth(&self.email, Some(&self.token)).send().await?;
+        let v = Self::check(resp).await?;
+        v.get("baseUrl").and_then(Value::as_str).map(|s| s.trim_end_matches('/').to_string()).ok_or_else(|| anyhow!("응답에 baseUrl 이 없다"))
     }
 
     /// 읽기: 담당자 후보 검색. (accountId, 표시 이름)
@@ -606,6 +625,8 @@ mod tests {
             summary: "t".into(),
             created: 0,
             parent: None,
+            status: String::new(),
+            assignee: None,
         }
     }
 
@@ -656,6 +677,12 @@ mod tests {
         let low: Vec<_> = (0..10).map(|n| mk(true, Some(if n < 3 { "Done" } else { "Won't Do" }), 1, &[])).collect();
         assert!(!results(&low, now, 30).ready_to_expand);
         assert_eq!(results(&[], now, 30).adoption_percent, None);
+    }
+
+    #[test]
+    fn browse_url_needs_a_site() {
+        assert_eq!(browse_url("https://x.atlassian.net/", "SID-1"), "https://x.atlassian.net/browse/SID-1");
+        assert_eq!(browse_url("", "SID-1"), "");
     }
 
     #[test]

@@ -299,3 +299,42 @@ pub async fn assign_parent_bulk(state: State<'_, Arc<AppState>>, keys: Vec<Strin
     }
     Ok(msg)
 }
+
+#[derive(serde::Serialize)]
+pub struct TicketRow {
+    pub key: String,
+    pub summary: String,
+    pub status: String,
+    pub resolution: Option<String>,
+    pub assignee: Option<String>,
+    /// unix seconds
+    pub created: u64,
+    pub url: String,
+    pub has_parent: bool,
+}
+
+/// The bot's tickets, newest first, with a link to open each in Jira (read only).
+#[tauri::command]
+pub async fn list_bot_tickets(state: State<'_, Arc<AppState>>) -> Result<Vec<TicketRow>, String> {
+    let (mut c, j) = jira_client(&state.config_dir)?;
+    if c.site_url.is_empty() {
+        c.site_url = j.site_url().await.map_err(|e| format!("{e:#}"))?;
+        // Best effort: remember it so the next call skips the lookup.
+        let _ = crate::jira::save_config(&state.config_dir, &c);
+    }
+    let mut issues = j.search(&crate::jira::jql_bot_all(&c), 200).await.map_err(|e| format!("{e:#}"))?;
+    issues.sort_by(|a, b| b.created.cmp(&a.created).then_with(|| b.key.cmp(&a.key)));
+    Ok(issues
+        .into_iter()
+        .map(|i| TicketRow {
+            url: crate::jira::browse_url(&c.site_url, &i.key),
+            has_parent: i.parent.is_some(),
+            key: i.key,
+            summary: i.summary,
+            status: i.status,
+            resolution: i.resolution,
+            assignee: i.assignee,
+            created: i.created,
+        })
+        .collect())
+}
