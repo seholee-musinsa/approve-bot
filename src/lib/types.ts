@@ -170,3 +170,12 @@ export interface ReportMeta {
   /** null = not published yet; "" = published, address unknown */
   published_url: string | null;
 }
+
+export interface WaitingCandidate {
+  id: string;
+  title: string;
+  category: string;
+  effort: string;
+  files: string[];
+  slice: string;
+}

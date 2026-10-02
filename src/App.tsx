@@ -4,6 +4,7 @@ import { RepositoriesPanel } from "./components/RepositoriesPanel";
 import { AuthorsPanel } from "./components/AuthorsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
 import { ReportsTab, ReportViewer } from "./components/ReportsTab";
+import { WaitingPanel } from "./components/WaitingPanel";
 import { TicketLog } from "./components/TicketLog";
 import { SweepTab } from "./components/SweepTab";
 import { ActivityLog } from "./components/ActivityLog";
@@ -133,6 +134,7 @@ export default function App() {
             {err && <div className="error-text">{err}</div>}
           </div>
           <div className="col">
+            <WaitingPanel />
             <TicketLog />
           </div>
         </div>

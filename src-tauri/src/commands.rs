@@ -376,3 +376,36 @@ pub async fn check_report_parent(state: State<'_, Arc<AppState>>) -> Result<Stri
     });
     rx.await.map_err(|_| "확인이 중단됐다".to_string())?
 }
+
+/// The candidates waiting for a free slot (read only, from the ledger).
+#[tauri::command]
+pub async fn list_waiting_candidates(state: State<'_, Arc<AppState>>) -> Result<Vec<crate::sweep_day::WaitingView>, String> {
+    let max_files = state.config.lock().await.sweep.max_files_per_ticket;
+    let l = crate::sweep_state::load(&state.config_dir);
+    Ok(crate::sweep_day::waiting_views(&l.carryover, max_files))
+}
+
+/// Write: create the chosen waiting candidates in Jira now (no new slice is read).
+#[tauri::command]
+pub async fn create_waiting_candidates(state: State<'_, Arc<AppState>>, ids: Vec<String>) -> Result<String, String> {
+    if state.sweep_running.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("점검이 실행 중입니다. 끝난 뒤에 다시 시도해 주세요".into());
+    }
+    let max_files = state.config.lock().await.sweep.max_files_per_ticket;
+    let dir = state.config_dir.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::sweep::create_waiting(&dir, &ids, max_files).map_err(|e| format!("{e:#}")));
+    });
+    let r = rx.await.map_err(|_| "생성이 중단됐다".to_string());
+    state.sweep_running.store(false, std::sync::atomic::Ordering::SeqCst);
+    r?
+}
+
+#[tauri::command]
+pub async fn discard_waiting_candidates(state: State<'_, Arc<AppState>>, ids: Vec<String>) -> Result<usize, String> {
+    if state.sweep_running.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("점검이 실행 중입니다. 끝난 뒤에 다시 시도해 주세요".into());
+    }
+    crate::sweep::discard_waiting(&state.config_dir, &ids).map_err(|e| format!("{e:#}"))
+}

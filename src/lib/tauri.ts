@@ -14,6 +14,7 @@ import type {
   SweepRun,
   SweepStatus,
   TicketRow,
+  WaitingCandidate,
 } from "./types";
 
 export const ACTIVITY_EVENT = "approve-bot://activity";
@@ -44,6 +45,12 @@ export const api = {
     invoke<Assignee[]>("search_jira_users", { query }),
   testJiraConnection: () => invoke<string>("test_jira_connection"),
   collectSweepResults: () => invoke<ResultsView>("collect_sweep_results"),
+  listWaitingCandidates: () =>
+    invoke<WaitingCandidate[]>("list_waiting_candidates"),
+  createWaitingCandidates: (ids: string[]) =>
+    invoke<string>("create_waiting_candidates", { ids }),
+  discardWaitingCandidates: (ids: string[]) =>
+    invoke<number>("discard_waiting_candidates", { ids }),
   listBotTickets: () => invoke<TicketRow[]>("list_bot_tickets"),
   listReports: () => invoke<ReportMeta[]>("list_reports"),
   readReport: (title: string) => invoke<string>("read_report", { title }),

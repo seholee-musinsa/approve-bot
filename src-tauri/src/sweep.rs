@@ -801,7 +801,7 @@ fn now_secs() -> u64 {
 /// (`--create`, or the screen's "티켓 자동 생성" setting).
 /// A ticket that fails is reported and left out of the ledger; the ones made
 /// before it stay recorded (their key labels also let the next run find them).
-fn create_tickets(
+pub(crate) fn create_tickets(
     dir: &Path,
     plan: &crate::sweep_day::DayPlan,
     slice: &str,
@@ -845,6 +845,92 @@ fn origin(kept: &[crate::sweep_review::Finding], d: &crate::sweep_review::Ticket
     let f = d.findings.first().and_then(|&i| kept.get(i));
     let pick = |v: Option<&String>, dflt: &str| v.filter(|s| !s.is_empty()).cloned().unwrap_or_else(|| dflt.to_string());
     (pick(f.map(|f| &f.slice), slice), pick(f.map(|f| &f.commit), commit))
+}
+
+/// Create the chosen waiting candidates now, without reading a new slice.
+/// Applies the open-ticket cap and skips candidates whose key already has a ticket.
+/// The caller has the user's explicit confirm.
+pub(crate) fn create_waiting(dir: &Path, ids: &[String], max_files: usize) -> anyhow::Result<String> {
+    use crate::{jira, sweep_day as sd, sweep_state::KeyOutcome};
+    let mut ledger = crate::sweep_state::load(dir);
+    let chosen: Vec<crate::sweep_state::Carried> = ledger.carryover.iter().filter(|c| ids.contains(&sd::carried_id(c))).cloned().collect();
+    if chosen.is_empty() {
+        return Err(anyhow::anyhow!("선택한 후보가 대기 목록에 없다(이미 만들었거나 만료됐을 수 있다)"));
+    }
+    let cfg = jira::load_config(dir)?;
+    let client = jira::Jira::connect(&cfg)?;
+    let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    let now = now_secs();
+    // 읽기: 열린 자동 생성 티켓 수와, 이 후보의 식별값을 이미 가진 티켓.
+    let (open, found) = rt.block_on(async {
+        let open = match cfg.assignees.first() {
+            Some(a) => client.count_open_bot(&cfg, a).await?,
+            None => 0,
+        };
+        let keys: Vec<String> = chosen.iter().flat_map(|c| c.findings.iter().map(|f| f.key.clone())).collect();
+        let mut found = Vec::new();
+        for chunk in keys.chunks(50) {
+            for issue in client.search(&jira::jql_by_keys(chunk), 200).await? {
+                found.extend(jira::outcomes(&issue, now));
+            }
+        }
+        Ok::<_, anyhow::Error>((open, found))
+    })?;
+    for (k, o) in found {
+        ledger.merge_outcome(&k, o);
+    }
+    // 이미 티켓이 있는 후보는 대기 목록에서 뺀다.
+    let ticketed = |c: &crate::sweep_state::Carried| c.findings.iter().any(|f| matches!(ledger.keys.get(&f.key), Some(KeyOutcome::Created { .. })));
+    let (skip, todo): (Vec<_>, Vec<_>) = chosen.into_iter().partition(|c| ticketed(c));
+    let skipped_ids: Vec<String> = skip.iter().map(sd::carried_id).collect();
+    let room = cfg.open_cap.saturating_sub(open);
+    let mut out = String::new();
+    if !skip.is_empty() {
+        out.push_str(&format!("이미 티켓이 있는 후보 {}건은 대기 목록에서 뺐다\n", skip.len()));
+    }
+    // 예전에 저장돼 지적에 커밋이 비어 있는 후보는 보관 당시 커밋으로 채운다.
+    let todo: Vec<_> = todo
+        .into_iter()
+        .take(room)
+        .map(|mut c| {
+            for f in &mut c.findings {
+                if f.commit.is_empty() {
+                    f.commit = c.commit.clone();
+                }
+            }
+            c
+        })
+        .collect();
+    if todo.is_empty() {
+        ledger.carryover.retain(|c| !skipped_ids.contains(&sd::carried_id(c)));
+        crate::sweep_state::save(dir, &ledger)?;
+        out.push_str(&format!("열린 자동 생성 티켓 {open}건이 상한 {} 에 닿아 새로 만들지 않았다\n", cfg.open_cap));
+        return Ok(out);
+    }
+    let (plan, owner) = sd::plan_from_carried(&todo, max_files);
+    let (text, failed) = create_tickets(dir, &plan, "", "", now, &mut ledger)?;
+    out.push_str(&text);
+    // 만든 후보만 대기 목록에서 뺀다(한 후보의 초안이 하나라도 실패했으면 남긴다).
+    let mut failed_owner: Vec<usize> = failed.iter().map(|&i| owner[i]).collect();
+    failed_owner.sort_unstable();
+    let done_ids: Vec<String> = todo.iter().enumerate().filter(|(i, _)| !failed_owner.contains(i)).map(|(_, c)| sd::carried_id(c)).collect();
+    ledger.carryover.retain(|c| {
+        let id = sd::carried_id(c);
+        !done_ids.contains(&id) && !skipped_ids.contains(&id)
+    });
+    crate::sweep_state::save(dir, &ledger)?;
+    out.push_str(&format!("만든 후보 {}건을 대기 목록에서 뺐다\n", done_ids.len()));
+    Ok(out)
+}
+
+/// Drop the chosen waiting candidates for good. Returns how many were removed.
+pub(crate) fn discard_waiting(dir: &Path, ids: &[String]) -> anyhow::Result<usize> {
+    let mut ledger = crate::sweep_state::load(dir);
+    let before = ledger.carryover.len();
+    ledger.carryover.retain(|c| !ids.contains(&crate::sweep_day::carried_id(c)));
+    let n = before - ledger.carryover.len();
+    crate::sweep_state::save(dir, &ledger)?;
+    Ok(n)
 }
 
 /// Read-only Jira lookups for a day: (open bot tickets of the first assignee unless
