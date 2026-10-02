@@ -108,7 +108,10 @@ pub struct RateLimit {
 #[derive(Debug, Clone)]
 pub struct ReviewComment {
     pub path: String,
+    /// Last line of the comment (the only line for a single-line comment).
     pub line: u64,
+    /// First line of a multi-line comment, so a `suggestion` can replace a range.
+    pub start_line: Option<u64>,
     pub body: String,
 }
 
@@ -370,12 +373,17 @@ impl GitHubClient {
                 let arr = comments
                     .iter()
                     .map(|c| {
-                        serde_json::json!({
+                        let mut v = serde_json::json!({
                             "path": c.path,
                             "line": c.line,
                             "side": "RIGHT",
                             "body": c.body,
-                        })
+                        });
+                        if let Some(s) = c.start_line {
+                            v["start_line"] = serde_json::json!(s);
+                            v["start_side"] = serde_json::json!("RIGHT");
+                        }
+                        v
                     })
                     .collect::<Vec<_>>();
                 payload.insert("comments".into(), serde_json::Value::Array(arr));
