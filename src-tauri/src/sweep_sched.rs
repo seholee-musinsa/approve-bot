@@ -159,12 +159,21 @@ async fn tick(state: &Arc<AppState>) {
     // 실행 기록을 먼저 남겨 같은 시각에 다시 돌지 않게 한다(실패해도 다음 예정 시각까지 기다린다).
     ledger.last_run_at = Some(now);
     let _ = crate::sweep_state::save(&dir, &ledger);
+    run_once(state, &s).await;
+}
 
+/// 설정대로 한 번 돌리고 결과를 로그에 남긴다. 이미 도는 중이면 false.
+pub async fn run_once(state: &Arc<AppState>, s: &SweepSettings) -> bool {
+    if state.sweep_running.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    let dir = state.config_dir.clone();
+    let now = now_secs();
     let started = std::time::Instant::now();
     let mut text = String::new();
     let mut ok = true;
     for n in 0..s.slices_per_run {
-        let flags = run_flags(&s);
+        let flags = run_flags(s);
         let (tx, rx) = tokio::sync::oneshot::channel();
         // 모델 호출과 Jira 호출이 자체 런타임을 쓰므로 별도 스레드에서 돌린다.
         std::thread::spawn(move || {
@@ -193,6 +202,55 @@ async fn tick(state: &Arc<AppState>) {
         &dir,
         RunEntry { at: now, ok, seconds: started.elapsed().as_secs(), text: text.chars().take(20_000).collect() },
     );
+    state.sweep_running.store(false, Ordering::SeqCst);
+    true
+}
+
+// ---- 화면용 상태 --------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Status {
+    pub running: bool,
+    /// 진행 중인 바퀴: (번호, 읽은 조각, 전체 조각, 다음 조각 이름)
+    pub cycle_no: Option<u32>,
+    pub slices_done: usize,
+    pub slices_total: usize,
+    pub next_slice: Option<String>,
+    pub carryover: usize,
+    pub created_keys: usize,
+    pub done_keys: usize,
+    pub rejected_keys: usize,
+    pub finished_cycles: u32,
+    pub last_run: Option<String>,
+    pub next_run: Option<String>,
+}
+
+fn fmt(t: NaiveDateTime) -> String {
+    t.format("%Y-%m-%d %H:%M").to_string()
+}
+
+pub fn status(dir: &std::path::Path, s: &SweepSettings, running: bool, now: NaiveDateTime) -> Status {
+    use crate::sweep_state::KeyOutcome;
+    let l = crate::sweep_state::load(dir);
+    let count = |f: fn(&KeyOutcome) -> bool| l.keys.values().filter(|o| f(o)).count();
+    Status {
+        running,
+        cycle_no: l.cycle.as_ref().map(|c| c.no),
+        slices_done: l.cycle.as_ref().map_or(0, |c| c.done_count()),
+        slices_total: l.cycle.as_ref().map_or(0, |c| c.slices.len()),
+        next_slice: l.next().map(|e| e.name.clone()),
+        carryover: l.carryover.len(),
+        created_keys: count(|o| matches!(o, KeyOutcome::Created { .. })),
+        done_keys: count(|o| matches!(o, KeyOutcome::Done { .. })),
+        rejected_keys: count(|o| matches!(o, KeyOutcome::Rejected { .. })),
+        finished_cycles: l.finished_cycles,
+        last_run: l.last_run_at.map(|t| fmt(to_local(t))),
+        next_run: (s.enabled && !s.repo.is_empty()).then(|| fmt(next_slot(s, now))),
+    }
+}
+
+pub fn status_now(dir: &std::path::Path, s: &SweepSettings, running: bool) -> Status {
+    status(dir, s, running, to_local(now_secs()))
 }
 
 #[cfg(test)]
@@ -285,6 +343,26 @@ mod tests {
         s.create_mode = CreateMode::Auto;
         assert!(run_flags(&s).contains(&"--create".to_string()));
         assert_eq!(&run_flags(&s)[..2], ["--repo", "o/r"]);
+    }
+
+    #[test]
+    fn status_reports_progress_and_next_run() {
+        use crate::sweep_state::{KeyOutcome, Ledger};
+        let dir = std::env::temp_dir().join(format!("sweep-status-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut l = Ledger::default();
+        l.start_cycle(&[("a".to_string(), 1), ("b".to_string(), 1)], "c1", 0);
+        l.mark_read("a", "c1", 1);
+        l.record("k1", KeyOutcome::Created { ticket: "T-1".into(), at: 1 });
+        crate::sweep_state::save(&dir, &l).unwrap();
+        let s = on(Frequency::Daily);
+        let st = status(&dir, &s, false, dt(2026, 10, 2, 3, 0));
+        assert_eq!((st.slices_done, st.slices_total, st.next_slice.as_deref()), (1, 2, Some("b")));
+        assert_eq!((st.created_keys, st.done_keys, st.rejected_keys), (1, 0, 0));
+        assert_eq!(st.next_run.as_deref(), Some("2026-10-03 02:30"));
+        let off = status(&dir, &SweepSettings::default(), false, dt(2026, 10, 2, 3, 0));
+        assert!(off.next_run.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { ConnectionStatus } from "./components/ConnectionStatus";
 import { RepositoriesPanel } from "./components/RepositoriesPanel";
 import { AuthorsPanel } from "./components/AuthorsPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
+import { SweepTab } from "./components/SweepTab";
 import { ActivityLog } from "./components/ActivityLog";
 import { ToastHost } from "./components/ToastHost";
 import { api } from "./lib/tauri";
@@ -20,6 +21,19 @@ const DEFAULT_CFG: AppConfig = {
   review_deep: true,
   approve_only_after_review: true,
   inline_comments_enabled: true,
+  sweep: {
+    enabled: false,
+    repo: "",
+    frequency: "daily",
+    weekday: 0,
+    month_day: 1,
+    hour: 2,
+    minute: 0,
+    slices_per_run: 1,
+    max_slice_lines: 25000,
+    max_files_per_ticket: 10,
+    create_mode: "draft",
+  },
 };
 
 function eq(a: AppConfig, b: AppConfig): boolean {
@@ -27,6 +41,7 @@ function eq(a: AppConfig, b: AppConfig): boolean {
 }
 
 export default function App() {
+  const [tab, setTab] = useState<"review" | "sweep">("review");
   const [saved, setSaved] = useState<AppConfig>(DEFAULT_CFG);
   const [draft, setDraft] = useState<AppConfig>(DEFAULT_CFG);
   const [busy, setBusy] = useState(false);
@@ -63,12 +78,43 @@ export default function App() {
     setErr(null);
   }
 
+  const saveBar = dirty ? (
+    <div className="dirty-bar">
+      <span>You have unsaved changes.</span>
+      <span className="row">
+        <button onClick={reset} disabled={busy}>
+          Discard
+        </button>
+        <button className="primary" onClick={save} disabled={busy}>
+          {busy ? "Saving…" : "Save"}
+        </button>
+      </span>
+    </div>
+  ) : null;
+
   return (
     <div className="app">
       <div className="header">
         <ConnectionStatus />
         <div className="muted">approve-bot</div>
       </div>
+      <div className="tabs">
+        <button className={tab === "review" ? "tab active" : "tab"} onClick={() => setTab("review")}>
+          PR 리뷰
+        </button>
+        <button className={tab === "sweep" ? "tab active" : "tab"} onClick={() => setTab("sweep")}>
+          정기 스윕
+        </button>
+      </div>
+      {tab === "sweep" ? (
+        <div className="body">
+          <div className="col">
+            <SweepTab value={draft} onChange={setDraft} dirty={dirty} />
+            {saveBar}
+            {err && <div className="error-text">{err}</div>}
+          </div>
+        </div>
+      ) : (
       <div className="body">
         <div className="col">
           <RepositoriesPanel
@@ -82,25 +128,14 @@ export default function App() {
             }
           />
           <SettingsPanel value={draft} onChange={setDraft} />
-          {dirty && (
-            <div className="dirty-bar">
-              <span>You have unsaved changes.</span>
-              <span className="row">
-                <button onClick={reset} disabled={busy}>
-                  Discard
-                </button>
-                <button className="primary" onClick={save} disabled={busy}>
-                  {busy ? "Saving…" : "Save"}
-                </button>
-              </span>
-            </div>
-          )}
+          {saveBar}
           {err && <div className="error-text">{err}</div>}
         </div>
         <div className="col">
           <ActivityLog />
         </div>
       </div>
+      )}
       <ToastHost />
     </div>
   );

@@ -84,3 +84,48 @@ pub async fn search_users(
     let client = GitHubClient::new(token);
     client.search_users(&query, 8).await.map_err(|e| e.to_string())
 }
+
+#[tauri::command]
+pub async fn get_sweep_status(state: State<'_, Arc<AppState>>) -> Result<crate::sweep_sched::Status, String> {
+    let s = state.config.lock().await.sweep.clone();
+    let running = state.sweep_running.load(std::sync::atomic::Ordering::SeqCst);
+    Ok(crate::sweep_sched::status_now(&state.config_dir, &s, running))
+}
+
+#[tauri::command]
+pub async fn get_sweep_log(
+    state: State<'_, Arc<AppState>>,
+    limit: Option<usize>,
+) -> Result<Vec<crate::sweep_sched::RunEntry>, String> {
+    let mut log = crate::sweep_sched::load_log(&state.config_dir);
+    log.truncate(limit.unwrap_or(30));
+    Ok(log)
+}
+
+/// Starts a run now (in the background). Returns false when one is already running.
+#[tauri::command]
+pub async fn run_sweep_now(state: State<'_, Arc<AppState>>) -> Result<bool, String> {
+    let s = state.config.lock().await.sweep.clone();
+    if s.repo.is_empty() {
+        return Err("대상 repo 를 먼저 입력해 주세요".into());
+    }
+    if state.sweep_running.load(std::sync::atomic::Ordering::SeqCst) {
+        return Ok(false);
+    }
+    let st = Arc::clone(state.inner());
+    tauri::async_runtime::spawn(async move {
+        crate::sweep_sched::run_once(&st, &s).await;
+    });
+    Ok(true)
+}
+
+/// Back to the start of a cycle: slices unread, carry-over dropped, key history kept.
+#[tauri::command]
+pub async fn reset_sweep_cycle(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    if state.sweep_running.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err("실행 중에는 초기화할 수 없습니다".into());
+    }
+    let mut l = crate::sweep_state::load(&state.config_dir);
+    l.reset_cycle();
+    crate::sweep_state::save(&state.config_dir, &l).map_err(|e| e.to_string())
+}
