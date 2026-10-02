@@ -258,6 +258,67 @@ impl Confluence {
 mod tests {
     use super::*;
 
+    impl Confluence {
+        /// 시험용: 페이지를 휴지통으로 보낸다(앱 기능에는 삭제가 없다).
+        async fn delete_page(&self, id: &str) -> Result<()> {
+            let resp = self.http.delete(format!("{}/content/{id}", self.base)).basic_auth(&self.email, Some(&self.token)).send().await?;
+            let status = resp.status();
+            if !status.is_success() {
+                return Err(anyhow!("Confluence {status}: {}", resp.text().await.unwrap_or_default().chars().take(200).collect::<String>()));
+            }
+            Ok(())
+        }
+
+        async fn count_pages(&self, space: &str, title: &str) -> Result<usize> {
+            let resp = self
+                .http
+                .get(format!("{}/content", self.base))
+                .basic_auth(&self.email, Some(&self.token))
+                .query(&[("spaceKey", space), ("title", title), ("type", "page"), ("limit", "10")])
+                .send()
+                .await?;
+            Ok(Self::check(resp).await?.get("results").and_then(Value::as_array).map_or(0, |a| a.len()))
+        }
+    }
+
+    /// 실제 Confluence 에 시험 페이지를 만들고 → 같은 제목으로 다시 게시(갱신)하고 → 지운다.
+    /// `cargo test --lib live_confluence -- --ignored --nocapture` 로만 돈다. 쓰기라 승인 후에만 실행한다.
+    /// APPROVEBOT_LIVE_SPACE / APPROVEBOT_LIVE_PARENT / APPROVEBOT_LIVE_CLOUD 환경변수가 필요하다.
+    #[test]
+    #[ignore]
+    fn live_confluence_create_update_delete() {
+        let (space, parent, cloud) = match (std::env::var("APPROVEBOT_LIVE_SPACE"), std::env::var("APPROVEBOT_LIVE_PARENT"), std::env::var("APPROVEBOT_LIVE_CLOUD")) {
+            (Ok(s), Ok(p), Ok(c)) => (s, p, c),
+            _ => panic!("환경변수가 없다"),
+        };
+        let title = format!("[시험] approve-bot 게시 확인 {}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs());
+        let md1 = "# 시험 리포트\n\n기간: 2026-09-28 ~ 2026-10-04\n\n## 3. 결과\n\n| 구분 | 완료 | 거절 |\n|---|--:|--:|\n| 누적 | 4 | 1 |\n\n- 항목 **굵게** [링크](https://example.com)\n";
+        let md2 = format!("{md1}\n두 번째 게시(갱신)\n");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let c = Confluence::connect(&cloud).unwrap();
+            let url1 = c.publish(&space, &parent, &title, &md_to_storage(md1)).await.expect("생성");
+            println!("생성: {url1}");
+            let p1 = c.find_page(&space, &title).await.unwrap().expect("만든 페이지를 찾음");
+            let result = async {
+                let url2 = c.publish(&space, &parent, &title, &md_to_storage(&md2)).await?;
+                let p2 = c.find_page(&space, &title).await?.ok_or_else(|| anyhow!("갱신 뒤 페이지가 없다"))?;
+                let n = c.count_pages(&space, &title).await?;
+                println!("갱신: {url2} · 버전 {} → {} · 같은 제목 페이지 {n}개", p1.version, p2.version);
+                assert_eq!(p1.id, p2.id, "같은 페이지를 갱신해야 한다");
+                assert_eq!(p2.version, p1.version + 1);
+                assert_eq!(n, 1, "중복 페이지가 생기면 안 된다");
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            // 결과와 상관없이 시험 페이지는 지운다.
+            let del = c.delete_page(&p1.id).await;
+            println!("삭제: {del:?}");
+            result.expect("갱신 확인");
+            del.expect("삭제");
+        });
+    }
+
     #[test]
     fn headings_lists_paragraphs() {
         let h = md_to_storage("# 제목\n\n본문 한 줄\n\n## 1. 요약\n\n- 하나\n- 둘 **굵게**\n\n끝");
