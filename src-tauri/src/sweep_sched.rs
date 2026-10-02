@@ -89,7 +89,13 @@ pub fn run_flags(s: &SweepSettings) -> Vec<String> {
         "--max-files".to_string(),
         s.max_files_per_ticket.to_string(),
     ];
-    f.push(if s.create_mode == CreateMode::Auto { "--create".to_string() } else { "--save".to_string() });
+    if s.create_mode == CreateMode::Auto {
+        f.push("--create".to_string());
+        f.push("--create-max".to_string());
+        f.push(s.max_create_per_run.max(1).to_string());
+    } else {
+        f.push("--save".to_string());
+    }
     f
 }
 
@@ -198,6 +204,10 @@ pub async fn run_once(state: &Arc<AppState>, s: &SweepSettings) -> bool {
                 break;
             }
         }
+    }
+    // 티켓을 만들려다 실패한 실행은 정상으로 보이지 않게 한다.
+    if text.contains("⚠️ 생성하지 못했다") || text.contains("⚠️ 생성 실패") {
+        ok = false;
     }
     let _ = append_log(
         &dir,
@@ -405,6 +415,14 @@ mod tests {
         s.create_mode = CreateMode::Auto;
         assert!(run_flags(&s).contains(&"--create".to_string()));
         assert_eq!(&run_flags(&s)[..2], ["--repo", "o/r"]);
+        // 한 번에 만드는 건수 제한도 함께 넘어간다.
+        let f = run_flags(&s);
+        let at = f.iter().position(|x| x == "--create-max").unwrap();
+        assert_eq!(f[at + 1], "3");
+        let mut s2 = s.clone();
+        s2.max_create_per_run = 0;
+        s2.clamp();
+        assert_eq!(s2.max_create_per_run, 1);
     }
 
     #[test]

@@ -529,7 +529,7 @@ pub fn report(files: &[FileStat], slices: &[Slice], w: &Weights, top: usize) -> 
 /// `--day [--save] [--open-tickets n]` takes the next slice of the cycle in the ledger (`sweep-state.json` in the config dir), reads it, and prints what would be created today and what is carried over; `--save` also writes the ledger (nothing else is written; Jira is not touched, so the open-ticket count is given by hand).
 /// `--report weekly|monthly` builds the report of the last full week/month (reads Jira, writes `reports/<title>.md` locally).
 /// `--reset-cycle` starts the cycle over (slices unread, carry-over dropped; the key history stays).
-/// `--create [--create-max n]` (with `--day`) really creates the day's tickets in Jira, only when `sweep-jira.json` has `allow_create: true`; it implies `--save` so the created keys are recorded.
+/// `--create [--create-max n]` (with `--day`) really creates the day's tickets in Jira; it implies `--save` so the created keys are recorded.
 /// `--slice <rank|name part> --dry-run [--model m] [--thinking n] [--max-candidates n]` has the model read that slice and prints ticket drafts (nothing is written anywhere); `--print-prompt` shows the prompt without calling the model.
 pub fn run_cli(flags: &[String]) -> anyhow::Result<String> {
     let mut local = String::new();
@@ -797,7 +797,8 @@ fn now_secs() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// The only place that writes to Jira. Needs `allow_create` in the Jira config.
+/// The only place that writes to Jira. The caller has the user's explicit choice
+/// (`--create`, or the screen's "티켓 자동 생성" setting).
 /// A ticket that fails is reported and left out of the ledger; the ones made
 /// before it stay recorded (their key labels also let the next run find them).
 fn create_tickets(
@@ -810,9 +811,6 @@ fn create_tickets(
 ) -> anyhow::Result<(String, Vec<usize>)> {
     use crate::{jira, sweep_review as sr, sweep_state::KeyOutcome};
     let cfg = jira::load_config(dir)?;
-    if !cfg.allow_create {
-        return Err(anyhow::anyhow!("sweep-jira.json 의 allow_create 가 false 라 만들지 않았다"));
-    }
     let client = jira::Jira::connect(&cfg)?;
     let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
     let mut text = String::new();
@@ -992,10 +990,12 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
         let (sl, cm) = origin(&plan.kept, d, &input.name, c.commit);
         out.push_str(&format!("\n### 생성: {}\n{}\n", d.title, sr::render_ticket(d, &plan.kept, &sl, &cm)));
     }
+    let mut created_n = 0usize;
     if c.create && !plan.create.is_empty() {
         match create_tickets(&dir, &plan, &input.name, c.commit, now, &mut ledger) {
             Ok((text, failed)) => {
                 out.push_str(&text);
+                created_n = plan.create.len() - failed.len();
                 for i in failed.into_iter().rev() {
                     let d = plan.create.remove(i);
                     plan.carry.push(d);
@@ -1021,7 +1021,13 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     }
     if c.save {
         st::save(&dir, &ledger)?;
-        out.push_str(if c.create { "장부를 저장했다(만든 티켓의 키 기록)\n" } else { "장부를 저장했다(Jira 에는 아무것도 쓰지 않았다)\n" });
+        out.push_str(&if created_n > 0 {
+            format!("장부를 저장했다(만든 티켓 {created_n}건의 키 기록)\n")
+        } else if c.create {
+            "장부를 저장했다(만든 티켓 없음, 후보는 대기 중으로 보관)\n".to_string()
+        } else {
+            "장부를 저장했다(Jira 에는 아무것도 쓰지 않았다)\n".to_string()
+        });
     } else {
         out.push_str("\n(저장하지 않았다: 장부 변경 없음. --save 로 기록)\n");
     }

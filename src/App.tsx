@@ -36,6 +36,7 @@ const DEFAULT_CFG: AppConfig = {
     max_slice_lines: 25000,
     max_files_per_ticket: 10,
     create_mode: "draft",
+    max_create_per_run: 3,
   },
 };
 

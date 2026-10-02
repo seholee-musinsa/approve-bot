@@ -39,6 +39,8 @@ export interface SweepSettings {
   max_slice_lines: number;
   max_files_per_ticket: number;
   create_mode: CreateMode;
+  /** most tickets one run creates in auto mode */
+  max_create_per_run: number;
 }
 
 export interface SweepStatus {
@@ -110,8 +112,6 @@ export interface JiraView {
   parent_key: string;
   open_cap: number;
   assignees: Assignee[];
-  /** read only: the second lock on writing to Jira, changed in the file by hand */
-  allow_create: boolean;
 }
 
 export interface SweepResults {
@@ -139,7 +139,6 @@ export interface ResultsView {
   results: SweepResults;
   orphans: OrphanTicket[];
   parent_key: string;
-  allow_create: boolean;
 }
 
 export interface TicketRow {

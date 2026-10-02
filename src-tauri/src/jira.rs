@@ -2,7 +2,7 @@
 //!
 //! 자격은 `~/.config/jira.env` 를 호출 시점에 읽고 로그·오류에 남기지 않는다.
 //! 사이트 고유 값(cloud id, 프로젝트, 상위 에픽 등)은 설정 폴더의 `sweep-jira.json` 에 둔다(공개 repo 에 넣지 않는다).
-//! 쓰기는 설정의 `allow_create` 가 true 일 때만 호출부가 부를 수 있다.
+//! 쓰기(생성·상위 에픽 지정)는 호출부가 사용자의 명시적 선택(생성 방식 "자동", `--create`, 화면의 확인 클릭)을 확인한 뒤에만 부른다.
 
 use crate::sweep_state::{KeyOutcome, RejectReason};
 use anyhow::{anyhow, Result};
@@ -52,9 +52,6 @@ pub struct JiraConfig {
     /// 한 사람의 열린 자동 생성 티켓 상한(5.5).
     #[serde(default = "d_open_cap")]
     pub open_cap: usize,
-    /// 쓰기 허용. 기본 false.
-    #[serde(default)]
-    pub allow_create: bool,
 }
 
 fn d_open_cap() -> usize {
@@ -518,11 +515,8 @@ impl Jira {
         Ok((title, done))
     }
 
-    /// 쓰기: 티켓의 상위 에픽 지정. 호출부가 `allow_create` 를 확인한다.
-    pub async fn set_parent(&self, c: &JiraConfig, key: &str, parent: &str) -> Result<()> {
-        if !c.allow_create {
-            return Err(anyhow!("sweep-jira.json 의 allow_create 가 false 다"));
-        }
+    /// 쓰기: 티켓의 상위 에픽 지정. 호출부가 사용자의 확인을 거친다.
+    pub async fn set_parent(&self, key: &str, parent: &str) -> Result<()> {
         let resp = self
             .http
             .put(format!("{}/issue/{key}", self.base))
@@ -533,11 +527,8 @@ impl Jira {
         Self::check(resp).await.map(|_| ())
     }
 
-    /// 쓰기: 티켓 생성. 호출부가 `allow_create` 를 확인한다.
+    /// 쓰기: 티켓 생성. 호출부가 사용자의 명시적 선택을 확인한다.
     pub async fn create(&self, c: &JiraConfig, t: &NewTicket<'_>) -> Result<String> {
-        if !c.allow_create {
-            return Err(anyhow!("sweep-jira.json 의 allow_create 가 false 다"));
-        }
         let resp = self.http.post(format!("{}/issue", self.base)).basic_auth(&self.email, Some(&self.token)).json(&build_create_body(c, t)).send().await?;
         let v = Self::check(resp).await?;
         v.get("key").and_then(Value::as_str).map(String::from).ok_or_else(|| anyhow!("응답에 key 가 없다"))
@@ -550,6 +541,12 @@ mod tests {
 
     fn cfg() -> JiraConfig {
         serde_json::from_str(r#"{"cloud_id":"x","parent_key":"SID-1","assignees":["acc"]}"#).unwrap()
+    }
+
+    #[test]
+    fn old_config_with_allow_create_still_loads() {
+        let c: JiraConfig = serde_json::from_str(r#"{"cloud_id":"x","allow_create":false,"open_cap":7}"#).unwrap();
+        assert_eq!(c.open_cap, 7);
     }
 
     #[test]
@@ -567,7 +564,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("jira-cfg-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let d = load_or_default(&dir);
-        assert_eq!((d.cloud_id.as_str(), d.open_cap, d.allow_create), ("", 10, false));
+        assert_eq!((d.cloud_id.as_str(), d.open_cap), ("", 10));
         let mut c = cfg();
         c.open_cap = 7;
         c.assignee_names.insert("acc".into(), "나".into());
@@ -581,7 +578,6 @@ mod tests {
     fn config_defaults_and_create_is_off() {
         let c = cfg();
         assert_eq!((c.project.as_str(), c.issue_type.as_str(), c.work_label.as_str()), ("SID", "Dev", "KTLO"));
-        assert!(!c.allow_create);
     }
 
     #[test]
