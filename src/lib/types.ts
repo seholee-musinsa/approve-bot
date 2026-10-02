@@ -19,6 +19,7 @@ export interface AppConfig {
   inline_comments_enabled: boolean;
   /** Regular repo sweep. Always sent back whole so saving never resets it. */
   sweep: SweepSettings;
+  report: ReportSettings;
 }
 
 export type Frequency = "daily" | "weekly" | "monthly";
@@ -151,4 +152,18 @@ export interface TicketRow {
   created: number;
   url: string;
   has_parent: boolean;
+}
+
+export interface ReportSettings {
+  weekly_enabled: boolean;
+  monthly_enabled: boolean;
+  hour: number;
+  space_key: string;
+  parent_page_id: string;
+}
+
+export interface ReportMeta {
+  title: string;
+  /** unix seconds */
+  generated_at: number;
 }

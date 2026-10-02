@@ -70,7 +70,7 @@ pub fn due(s: &SweepSettings, last_run: NaiveDateTime, now: NaiveDateTime) -> bo
     s.enabled && !s.repo.is_empty() && last_slot(s, now) > last_run
 }
 
-fn to_local(secs: u64) -> NaiveDateTime {
+pub(crate) fn to_local(secs: u64) -> NaiveDateTime {
     Local.timestamp_opt(secs as i64, 0).single().map(|d| d.naive_local()).unwrap_or_default()
 }
 
@@ -136,6 +136,7 @@ pub fn spawn(state: Arc<AppState>) {
 }
 
 async fn tick(state: &Arc<AppState>) {
+    tick_reports(state).await;
     let s = state.config.lock().await.sweep.clone();
     if !s.enabled || s.repo.is_empty() {
         return;
@@ -204,6 +205,52 @@ pub async fn run_once(state: &Arc<AppState>, s: &SweepSettings) -> bool {
     );
     state.sweep_running.store(false, Ordering::SeqCst);
     true
+}
+
+/// 주간(월요일)·월간(1일) 리포트 시각이 지났으면 지난 기간 리포트를 만든다. Jira 읽기만 한다.
+async fn tick_reports(state: &Arc<AppState>) {
+    use crate::sweep_report::Kind;
+    let cfg = state.config.lock().await.clone();
+    if !cfg.report.weekly_enabled && !cfg.report.monthly_enabled {
+        return;
+    }
+    let dir = state.config_dir.clone();
+    let now = now_secs();
+    let mut ledger = crate::sweep_state::load(&dir);
+    let mut changed = false;
+    let mut todo: Vec<Kind> = Vec::new();
+    for (kind, on) in [(Kind::Weekly, cfg.report.weekly_enabled), (Kind::Monthly, cfg.report.monthly_enabled)] {
+        if !on {
+            continue;
+        }
+        let slot = if kind == Kind::Weekly { &mut ledger.last_weekly_at } else { &mut ledger.last_monthly_at };
+        match *slot {
+            // 처음 켠 시점: 소급해 만들지 않고 여기서부터 센다.
+            None => {
+                *slot = Some(now);
+                changed = true;
+            }
+            Some(last) if due(&crate::report_job::slot_settings(kind, cfg.report.hour), to_local(last), to_local(now)) => {
+                *slot = Some(now);
+                changed = true;
+                todo.push(kind);
+            }
+            Some(_) => {}
+        }
+    }
+    if changed {
+        let _ = crate::sweep_state::save(&dir, &ledger);
+    }
+    for kind in todo {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (d, c) = (dir.clone(), cfg.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::report_job::generate(&d, &c, kind, to_local(now), now).map_err(|e| format!("{e:#}")));
+        });
+        if let Ok(Err(e)) = rx.await {
+            let _ = append_log(&dir, RunEntry { at: now, ok: false, seconds: 0, text: format!("리포트 만들기 실패: {e}") });
+        }
+    }
 }
 
 // ---- 화면용 상태 --------------------------------------------------------------------

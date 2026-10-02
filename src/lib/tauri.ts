@@ -9,6 +9,7 @@ import type {
   Assignee,
   GhUserHint,
   JiraView,
+  ReportMeta,
   ResultsView,
   SweepRun,
   SweepStatus,
@@ -44,6 +45,10 @@ export const api = {
   testJiraConnection: () => invoke<string>("test_jira_connection"),
   collectSweepResults: () => invoke<ResultsView>("collect_sweep_results"),
   listBotTickets: () => invoke<TicketRow[]>("list_bot_tickets"),
+  listReports: () => invoke<ReportMeta[]>("list_reports"),
+  readReport: (title: string) => invoke<string>("read_report", { title }),
+  generateReport: (kind: "weekly" | "monthly") =>
+    invoke<string>("generate_report", { kind }),
   assignParentBulk: (keys: string[]) =>
     invoke<string>("assign_parent_bulk", { keys }),
 };
