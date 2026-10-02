@@ -647,7 +647,6 @@ async fn handle_pr(
         // A failed run gets its own marker so the next commit is re-reviewed.
         let marker = if outcome.finished_cleanly { REVIEW_MARKER } else { FAILED_MARKER };
         // Only the copy sent to GitHub is folded; `detail` below keeps the original.
-        let posted_body = format!("{marker}\n{}", crate::layout::fold_sections(&body));
         let inline: &[crate::github::ReviewComment] = if cfg.inline_comments_enabled {
             &outcome.inline
         } else {
@@ -655,6 +654,10 @@ async fn handle_pr(
         };
         let file_comments: &[crate::github::FileComment] =
             if cfg.inline_comments_enabled { &outcome.file_comments } else { &[] };
+        let posted_body = format!(
+            "{marker}\n{}",
+            crate::layout::with_reply_hint(&crate::layout::fold_sections(&body), inline.len() + file_comments.len())
+        );
         let mut inline_str = if inline.is_empty() {
             String::new()
         } else {
