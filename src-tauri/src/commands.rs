@@ -362,3 +362,27 @@ pub async fn generate_report(state: State<'_, Arc<AppState>>, kind: String) -> R
     });
     rx.await.map_err(|_| "리포트 만들기가 중단됐다".to_string())?
 }
+
+/// Write: publish a saved report to Confluence (updates the page when the title exists).
+#[tauri::command]
+pub async fn publish_report(state: State<'_, Arc<AppState>>, title: String) -> Result<String, String> {
+    let cfg = state.config.lock().await.clone();
+    let dir = state.config_dir.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::report_job::publish(&dir, &cfg, &title).map_err(|e| format!("{e:#}")));
+    });
+    rx.await.map_err(|_| "게시가 중단됐다".to_string())?
+}
+
+/// Read only: does the configured Confluence space / parent page exist?
+#[tauri::command]
+pub async fn check_report_parent(state: State<'_, Arc<AppState>>) -> Result<String, String> {
+    let cfg = state.config.lock().await.clone();
+    let dir = state.config_dir.clone();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::report_job::check_parent(&dir, &cfg).map_err(|e| format!("{e:#}")));
+    });
+    rx.await.map_err(|_| "확인이 중단됐다".to_string())?
+}

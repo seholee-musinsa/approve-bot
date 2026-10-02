@@ -49,6 +49,8 @@ export const api = {
   readReport: (title: string) => invoke<string>("read_report", { title }),
   generateReport: (kind: "weekly" | "monthly") =>
     invoke<string>("generate_report", { kind }),
+  publishReport: (title: string) => invoke<string>("publish_report", { title }),
+  checkReportParent: () => invoke<string>("check_report_parent"),
   assignParentBulk: (keys: string[]) =>
     invoke<string>("assign_parent_bulk", { keys }),
 };

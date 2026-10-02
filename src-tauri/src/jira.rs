@@ -408,7 +408,7 @@ pub struct Jira {
     token: String,
 }
 
-fn read_env_file() -> Result<(String, String)> {
+pub(crate) fn read_env_file() -> Result<(String, String)> {
     let home = std::env::var("HOME").map_err(|_| anyhow!("HOME 이 없다"))?;
     let raw = std::fs::read_to_string(Path::new(&home).join(".config/jira.env")).map_err(|_| anyhow!("~/.config/jira.env 를 읽지 못함"))?;
     let get = |k: &str| {

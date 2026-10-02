@@ -23,7 +23,7 @@ const DEFAULT_CFG: AppConfig = {
   review_deep: true,
   approve_only_after_review: true,
   inline_comments_enabled: true,
-  report: { weekly_enabled: false, monthly_enabled: false, hour: 9, space_key: "", parent_page_id: "" },
+  report: { weekly_enabled: false, monthly_enabled: false, hour: 9, space_key: "", parent_page_id: "", publish_enabled: false },
   sweep: {
     enabled: false,
     repo: "",

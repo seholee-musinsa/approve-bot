@@ -87,11 +87,13 @@ pub struct ReportSettings {
     /// Confluence space key and parent page id (used when publishing).
     pub space_key: String,
     pub parent_page_id: String,
+    /// Publish new reports to Confluence by themselves (off until switched on).
+    pub publish_enabled: bool,
 }
 
 impl Default for ReportSettings {
     fn default() -> Self {
-        Self { weekly_enabled: false, monthly_enabled: false, hour: 9, space_key: String::new(), parent_page_id: String::new() }
+        Self { weekly_enabled: false, monthly_enabled: false, hour: 9, space_key: String::new(), parent_page_id: String::new(), publish_enabled: false }
     }
 }
 

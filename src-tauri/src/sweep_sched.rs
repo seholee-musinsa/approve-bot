@@ -4,7 +4,7 @@
 //! 앱이 꺼져 있던 동안 지나간 시각은 켜질 때 한 번만 보정한다(밀린 횟수만큼 돌지 않는다).
 //! 스윕을 처음 켠 시점에는 과거 시각을 소급해 돌지 않고, 켠 시각부터 센다.
 
-use crate::config::{CreateMode, Frequency, SweepSettings};
+use crate::config::{AppConfig, CreateMode, Frequency, SweepSettings};
 use crate::state::AppState;
 use chrono::{Datelike, Duration, Local, NaiveDate, NaiveDateTime, TimeZone};
 use std::sync::atomic::Ordering;
@@ -241,7 +241,18 @@ async fn tick_reports(state: &Arc<AppState>) {
     if changed {
         let _ = crate::sweep_state::save(&dir, &ledger);
     }
-    for kind in todo {
+    // 게시 대기 리포트(R.7): 자동 게시가 켜져 있으면 못 올린 것도 이번에 다시 시도한다.
+    let publish_pending = |dir: std::path::PathBuf, cfg: AppConfig, at: u64| {
+        std::thread::spawn(move || {
+            for t in crate::report_job::unpublished(&dir) {
+                if let Err(e) = crate::report_job::publish(&dir, &cfg, &t) {
+                    let _ = append_log(&dir, RunEntry { at, ok: false, seconds: 0, text: format!("리포트 게시 실패({t}): {e:#}") });
+                    break;
+                }
+            }
+        });
+    };
+    for kind in todo.clone() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let (d, c) = (dir.clone(), cfg.clone());
         std::thread::spawn(move || {
@@ -250,6 +261,10 @@ async fn tick_reports(state: &Arc<AppState>) {
         if let Ok(Err(e)) = rx.await {
             let _ = append_log(&dir, RunEntry { at: now, ok: false, seconds: 0, text: format!("리포트 만들기 실패: {e}") });
         }
+    }
+    if cfg.report.publish_enabled && (!todo.is_empty() || (now / 60) % 60 == 0) {
+        // 새로 만들었을 때, 그리고 매시 정각에 한 번 밀린 것을 다시 시도한다.
+        publish_pending(dir.clone(), cfg.clone(), now);
     }
 }
 

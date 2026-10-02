@@ -1,6 +1,7 @@
 mod auth;
 mod commands;
 mod config;
+mod confluence;
 mod context;
 mod diffprep;
 mod eval_cli;
@@ -91,6 +92,8 @@ pub fn run() {
             commands::list_reports,
             commands::read_report,
             commands::generate_report,
+            commands::publish_report,
+            commands::check_report_parent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

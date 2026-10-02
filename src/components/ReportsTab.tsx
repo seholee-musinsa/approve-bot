@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { api } from "../lib/tauri";
+import { api, openExternal } from "../lib/tauri";
 import type { AppConfig, ReportMeta, ReportSettings } from "../lib/types";
 
 interface Props {
@@ -19,6 +19,8 @@ export function ReportsTab({ open, onOpen, value, onChange, dirty }: Props) {
   const [reports, setReports] = useState<ReportMeta[]>([]);
   const [busy, setBusy] = useState<"weekly" | "monthly" | null>(null);
   const [msg, setMsg] = useState<string | null>(null);
+  const [confirmPub, setConfirmPub] = useState<string | null>(null);
+  const [pubBusy, setPubBusy] = useState(false);
 
   async function load() {
     try {
@@ -30,6 +32,34 @@ export function ReportsTab({ open, onOpen, value, onChange, dirty }: Props) {
   useEffect(() => {
     void load();
   }, []);
+
+  async function checkParent() {
+    setMsg(null);
+    try {
+      setMsg(await api.checkReportParent());
+    } catch (e) {
+      setMsg(`⚠️ ${String(e)}`);
+    }
+  }
+
+  async function publish(title: string) {
+    if (confirmPub !== title) {
+      setConfirmPub(title);
+      return;
+    }
+    setConfirmPub(null);
+    setPubBusy(true);
+    setMsg(null);
+    try {
+      const url = await api.publishReport(title);
+      setMsg(`게시했습니다: ${url || title}`);
+      await load();
+    } catch (e) {
+      setMsg(`⚠️ 게시 실패(리포트는 로컬에 남아 있습니다): ${String(e)}`);
+    } finally {
+      setPubBusy(false);
+    }
+  }
 
   async function generate(kind: "weekly" | "monthly") {
     setBusy(kind);
@@ -82,7 +112,18 @@ export function ReportsTab({ open, onOpen, value, onChange, dirty }: Props) {
           <span className="field-label">부모 페이지 ID</span>
           <input type="text" placeholder="리포트를 모아 둘 페이지의 ID" value={r.parent_page_id} onChange={(e) => patch({ parent_page_id: e.target.value })} />
         </div>
-        <div className="muted">space와 부모 페이지는 Confluence 게시 단계에서 쓰입니다. 지금은 저장만 합니다.</div>
+        <label className="toggle">
+          <input type="checkbox" checked={r.publish_enabled} onChange={(e) => patch({ publish_enabled: e.target.checked })} />
+          만든 리포트를 Confluence 에 자동 게시
+        </label>
+        <div className="muted">
+          자동 게시를 켜면 새 리포트와, 게시에 실패해 남아 있는 리포트를 부모 페이지 아래에 올립니다. 같은 제목의 페이지가 있으면 새로 만들지 않고 내용을 갱신합니다. 끄면 아래 목록에서 직접 게시합니다.
+        </div>
+        <div className="row">
+          <button onClick={checkParent} disabled={dirty || r.space_key === "" || r.parent_page_id === ""}>
+            부모 페이지 확인(읽기)
+          </button>
+        </div>
         <div className="row">
           <button className="primary" onClick={() => generate("weekly")} disabled={busy !== null || dirty}>
             {busy === "weekly" ? "만드는 중…" : "지난주 리포트 지금 생성"}
@@ -103,7 +144,33 @@ export function ReportsTab({ open, onOpen, value, onChange, dirty }: Props) {
             {reports.map((x) => (
               <li key={x.title} style={{ cursor: "pointer" }} onClick={() => onOpen(x.title)}>
                 <span>{open === x.title ? "▼ " : "▶ "}{x.title}</span>
-                <span className="muted">{new Date(x.generated_at * 1000).toLocaleString("ko-KR")}</span>
+                <span className="row" onClick={(e) => e.stopPropagation()}>
+                  {x.published_url === null ? (
+                    <>
+                      <span className="muted">미게시</span>
+                      <button
+                        onClick={() => void publish(x.title)}
+                        disabled={pubBusy || dirty || r.space_key === "" || r.parent_page_id === ""}
+                      >
+                        {confirmPub === x.title ? "정말 게시" : "Confluence 에 게시"}
+                      </button>
+                      {confirmPub === x.title && <button onClick={() => setConfirmPub(null)}>취소</button>}
+                    </>
+                  ) : x.published_url ? (
+                    <a
+                      href={x.published_url}
+                      onClick={(ev) => {
+                        ev.preventDefault();
+                        openExternal(x.published_url!).catch(() => {});
+                      }}
+                    >
+                      게시됨 ↗
+                    </a>
+                  ) : (
+                    <span className="muted">게시됨</span>
+                  )}
+                  <span className="muted">{new Date(x.generated_at * 1000).toLocaleString("ko-KR")}</span>
+                </span>
               </li>
             ))}
           </ul>
