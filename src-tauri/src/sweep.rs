@@ -951,7 +951,7 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     }
     if c.save {
         st::save(&dir, &ledger)?;
-        out.push_str("장부를 저장했다(Jira 에는 아무것도 쓰지 않았다)\n");
+        out.push_str(if c.create { "장부를 저장했다(만든 티켓의 키 기록)\n" } else { "장부를 저장했다(Jira 에는 아무것도 쓰지 않았다)\n" });
     } else {
         out.push_str("\n(저장하지 않았다: 장부 변경 없음. --save 로 기록)\n");
     }
