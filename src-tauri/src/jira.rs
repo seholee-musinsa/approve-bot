@@ -379,36 +379,45 @@ pub fn jql_bot_orphans(c: &JiraConfig) -> String {
     format!("labels = \"{}\" AND parent is EMPTY", c.bot_label)
 }
 
-/// 담당자 배정(요구 5장): 열린 자동 생성 티켓이 가장 적은 사람에게, 같으면 무작위로 고른다.
-/// 열린 티켓이 상한에 닿은 사람은 후보에서 뺀다. 아무도 남지 않으면 None.
+/// 담당자 배정: **이번 실행에서 만드는 티켓을 담당자에게 고르게 나눈다.**
+/// 4건·2명이면 2건씩, 3건이면 2/1(누가 2건인지는 무작위). 기존에 쌓여 있던 열린 티켓 수는
+/// 나누는 데 쓰지 않는다. 다만 사람마다 열린 티켓 상한(`cap`)은 안전장치로 지켜서,
+/// 기존 열린 수 + 이번에 받은 수가 상한에 닿은 사람은 건너뛴다. 모두 상한이면 None.
 pub struct AssigneeBook {
+    /// (담당자, 기존 열린 수)
     open: Vec<(String, usize)>,
+    /// 이번 실행에서 각자 받은 수(open 과 같은 순서).
+    given: Vec<usize>,
     cap: usize,
 }
 
 impl AssigneeBook {
     pub fn new(open: Vec<(String, usize)>, cap: usize) -> Self {
-        Self { open, cap }
+        let given = vec![0; open.len()];
+        Self { open, given, cap }
     }
 
-    /// 한 명을 골라 그 사람의 열린 수를 하나 올린다. `rand` 는 같은 수일 때 고르는 데 쓴다.
+    /// 이번 실행에서 가장 적게 받은 사람 중 한 명을 고른다. 같으면 `rand` 로 고른다.
     pub fn pick(&mut self, rand: u64) -> Option<String> {
-        let min = self.open.iter().filter(|(_, n)| *n < self.cap).map(|(_, n)| *n).min()?;
-        let ties: Vec<usize> = self.open.iter().enumerate().filter(|(_, (_, n))| *n == min).map(|(i, _)| i).collect();
+        let eligible = |i: usize| self.open[i].1 + self.given[i] < self.cap;
+        let min = (0..self.open.len()).filter(|&i| eligible(i)).map(|i| self.given[i]).min()?;
+        let ties: Vec<usize> = (0..self.open.len()).filter(|&i| eligible(i) && self.given[i] == min).collect();
         let i = ties[(rand % ties.len() as u64) as usize];
-        self.open[i].1 += 1;
+        self.given[i] += 1;
         Some(self.open[i].0.clone())
     }
 
     /// 생성에 실패한 배정을 되돌린다.
     pub fn release(&mut self, id: &str) {
-        if let Some(e) = self.open.iter_mut().find(|(a, _)| a == id) {
-            e.1 = e.1.saturating_sub(1);
+        if let Some(i) = self.open.iter().position(|(a, _)| a == id) {
+            self.given[i] = self.given[i].saturating_sub(1);
         }
     }
 
-    pub fn total_open(&self) -> usize {
-        self.open.iter().map(|(_, n)| n).sum()
+    /// 이번 실행에서 각자 받은 수.
+    #[allow(dead_code)]
+    pub fn given_counts(&self) -> Vec<(String, usize)> {
+        self.open.iter().zip(&self.given).map(|((a, _), g)| (a.clone(), *g)).collect()
     }
 }
 
@@ -594,36 +603,62 @@ mod tests {
         assert_eq!(c.open_cap, 7);
     }
 
-    #[test]
-    fn assignees_are_spread_evenly_and_the_cap_is_respected() {
-        let mut b = AssigneeBook::new(vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)], 10);
-        let picks: Vec<String> = (0..6).map(|_| b.pick(0).unwrap()).collect();
-        // 같은 수에서는 앞에서부터, 하나씩 번갈아 간다.
-        assert_eq!(picks, ["a", "b", "c", "a", "b", "c"]);
-        // 이미 많이 가진 사람은 건너뛰고 가장 적은 사람에게 간다.
-        let mut b = AssigneeBook::new(vec![("a".into(), 5), ("b".into(), 1), ("c".into(), 3)], 10);
-        assert_eq!(b.pick(0).unwrap(), "b");
-        assert_eq!(b.pick(0).unwrap(), "b");
-        // b 가 3건이 되면 c(3건)와 같아지고, 같을 때는 목록에서 앞선 b 가 뽑힌다.
-        assert_eq!(b.pick(0).unwrap(), "b");
-        assert_eq!(b.pick(0).unwrap(), "c");
+    fn book(open: &[(&str, usize)], cap: usize) -> AssigneeBook {
+        AssigneeBook::new(open.iter().map(|(a, n)| (a.to_string(), *n)).collect(), cap)
+    }
+
+    fn tally(b: &mut AssigneeBook, n: usize) -> std::collections::BTreeMap<String, usize> {
+        let mut m = std::collections::BTreeMap::new();
+        for i in 0..n {
+            if let Some(a) = b.pick(i as u64) {
+                *m.entry(a).or_insert(0) += 1;
+            }
+        }
+        m
     }
 
     #[test]
-    fn ties_use_the_random_value_and_full_people_are_skipped() {
-        let mut b = AssigneeBook::new(vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)], 10);
-        assert_eq!(b.pick(1).unwrap(), "b");
-        let mut b = AssigneeBook::new(vec![("a".into(), 0), ("b".into(), 0), ("c".into(), 0)], 10);
+    fn four_tickets_two_people_is_two_each_whatever_the_open_counts() {
+        // 기존 열린 수가 6 대 3 이어도 이번 실행의 4건은 2/2 로 나뉜다.
+        let mut b = book(&[("a", 6), ("b", 3)], 10);
+        let m = tally(&mut b, 4);
+        assert_eq!((m["a"], m["b"]), (2, 2));
+        // 열린 수가 같거나 0 이어도 같다.
+        let mut b = book(&[("a", 0), ("b", 0)], 10);
+        let m = tally(&mut b, 4);
+        assert_eq!((m["a"], m["b"]), (2, 2));
+    }
+
+    #[test]
+    fn odd_counts_split_with_at_most_one_difference_and_ties_are_random() {
+        let mut b = book(&[("a", 0), ("b", 0), ("c", 0)], 10);
+        let m = tally(&mut b, 7);
+        let counts: Vec<usize> = m.values().copied().collect();
+        assert_eq!(counts.iter().sum::<usize>(), 7);
+        assert!(counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1, "{m:?}");
+        // 같을 때는 rand 로 고른다.
+        let mut b = book(&[("a", 0), ("b", 0), ("c", 0)], 10);
         assert_eq!(b.pick(5).unwrap(), "c"); // 5 % 3 = 2
-        // 상한(3)에 닿은 사람은 후보에서 빠진다.
-        let mut b = AssigneeBook::new(vec![("a".into(), 3), ("b".into(), 2)], 3);
-        assert_eq!(b.pick(0).unwrap(), "b");
-        assert_eq!(b.pick(0), None, "둘 다 상한이면 아무에게도 배정하지 않는다");
+        let mut b = book(&[("a", 0), ("b", 0), ("c", 0)], 10);
+        assert_eq!(b.pick(1).unwrap(), "b");
+    }
+
+    #[test]
+    fn the_per_person_cap_still_applies_and_failed_assignments_are_returned() {
+        // a 는 열린 9건이라 이번에 1건만 더 받을 수 있다.
+        let mut b = book(&[("a", 9), ("b", 0)], 10);
+        let m = tally(&mut b, 6);
+        assert_eq!(m["a"], 1, "cap 10 - open 9 = 1");
+        assert_eq!(m["b"], 5);
+        // 둘 다 상한이면 아무에게도 배정하지 않는다.
+        let mut full = book(&[("a", 10), ("b", 10)], 10);
+        assert_eq!(full.pick(0), None);
         // 실패한 배정은 되돌린다.
-        b.release("b");
-        assert_eq!(b.pick(0).unwrap(), "b");
-        assert_eq!(b.total_open(), 6);
-        assert_eq!(AssigneeBook::new(vec![], 10).pick(0), None);
+        let mut b = book(&[("a", 0), ("b", 0)], 10);
+        let first = b.pick(0).unwrap();
+        b.release(&first);
+        assert_eq!(b.given_counts().iter().map(|(_, g)| g).sum::<usize>(), 0);
+        assert_eq!(book(&[], 10).pick(0), None);
     }
 
     #[test]
