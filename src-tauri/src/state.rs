@@ -92,6 +92,10 @@ pub struct AppState {
     /// (e.g. diff fetch). Skipped until the head moves, so one broken PR does
     /// not retry and log every poll.
     pub failed_heads: Mutex<std::collections::HashMap<String, String>>,
+    /// `owner/repo#n` → head sha deliberately left without a new review (only
+    /// docs/tests changed since a review that held). Lets later polls return
+    /// before re-fetching the round; lost on restart, which costs one fetch.
+    pub settled_heads: Mutex<std::collections::HashMap<String, String>>,
     /// True while a PR poll pass (including its reviews) is running. The sweep
     /// scheduler waits for it to be false so the two never compete.
     pub pass_running: std::sync::atomic::AtomicBool,
@@ -112,6 +116,7 @@ impl AppState {
             poll_signal: Notify::new(),
             gh_login_busy: Mutex::new(false),
             failed_heads: Mutex::new(std::collections::HashMap::new()),
+            settled_heads: Mutex::new(std::collections::HashMap::new()),
             pass_running: std::sync::atomic::AtomicBool::new(false),
             sweep_running: std::sync::atomic::AtomicBool::new(false),
         })

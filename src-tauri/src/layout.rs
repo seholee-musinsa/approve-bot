@@ -10,8 +10,9 @@
 //! output and the follow-up parser all see the original.
 
 /// Sections that are folded. `# 미확인` and `# 질문` stay open: the author has
-/// to act on them.
-const FOLDED: &[&str] = &["검증 근거", "산입하지 않은 것"];
+/// to act on them. The second pass's re-check is audit trail too — anything it
+/// overturned is already a finding above, and the ❌ count stays on the summary.
+const FOLDED: &[&str] = &["검증 근거", "산입하지 않은 것", "권한·계약 재점검"];
 
 fn folded_title(line: &str) -> Option<&'static str> {
     let rest = line.strip_prefix("# ")?.trim();
@@ -145,5 +146,12 @@ mod tests {
         assert!(!out.contains("<details>"), "{out}");
         let out = fold_sections("# 검증 근거\n\n문장으로만 적은 근거입니다.");
         assert!(out.contains("<summary>검증 근거</summary>"), "{out}");
+    }
+
+    #[test]
+    fn recheck_section_is_folded_with_its_fail_count() {
+        let out = fold_sections("# 총평\n\n요약\n\n# 권한·계약 재점검\n\n- ✅ 첫째\n- ❌ 둘째\n");
+        assert!(out.contains("<summary>권한·계약 재점검 2건 · ❌ 1</summary>"), "{out}");
+        assert!(!out.contains("# 권한·계약 재점검"));
     }
 }

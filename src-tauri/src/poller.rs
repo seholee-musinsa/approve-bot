@@ -73,6 +73,28 @@ enum ReviewAction {
     Review,
 }
 
+/// What a follow-up does when the commits since my last review touch only
+/// docs or tests.
+#[derive(Debug, PartialEq, Eq)]
+enum DocsOnlyStep {
+    /// My last review approved: the approval stands, renew it without a review.
+    Reapprove,
+    /// My last review held (blockers, a sensitive file, a low score). A
+    /// docs/tests-only push cannot change that, so nothing is posted — PR #1
+    /// spent a full review and re-check on a README wording change.
+    Skip,
+    /// Code changed (or this is not a follow-up): review as usual.
+    Review,
+}
+
+fn docs_only_step(action: &ReviewAction, docs_only: bool) -> DocsOnlyStep {
+    match (action, docs_only) {
+        (ReviewAction::ApproveOnly, true) => DocsOnlyStep::Reapprove,
+        (ReviewAction::FollowUp, true) => DocsOnlyStep::Skip,
+        _ => DocsOnlyStep::Review,
+    }
+}
+
 /// Pure dedup decision. `reviews` = my prior reviews, oldest first, as (state,
 /// commit_id, marker). Only a finished engine review counts as "reviewed" — a
 /// blind 👍 approve, another bot's review or a failed run must not suppress a
@@ -222,6 +244,19 @@ impl Gate {
             Gate::HoldVerdict => "판정이 approve 아님".to_string(),
             Gate::HoldScore => format!("점수 {score}/5 < {min:.1}"),
         }
+    }
+}
+
+/// The one-line outcome a follow-up summary opens with. Stated from the gate,
+/// not the model, so a held review never reads "Approve 합니다" — PR #1 said
+/// that in every round while the .npmrc gate kept it a comment.
+fn outcome_line(decision: &Gate, blocking: usize, score: &str, min: f64) -> String {
+    match decision {
+        Gate::Approve => format!("✅ **승인** · 점수 {score}/5"),
+        Gate::HoldSensitive(files) => {
+            format!("👤 **사람 승인 필요** — 민감 파일 변경({}) · 점수 {score}/5", files.join(", "))
+        }
+        other => format!("⏸ **승인 보류** — {}", other.reason(blocking, score, min)),
     }
 }
 
@@ -506,20 +541,47 @@ async fn handle_pr(
         match decide_review_action(&tuples, head_sha, cfg.approve_only_after_review) {
             ReviewAction::Skip => return,
             action @ (ReviewAction::ApproveOnly | ReviewAction::FollowUp) => {
+                let pr_key = format!("{repo_full}#{}", pr.number);
+                if state.settled_heads.lock().await.get(&pr_key).map(String::as_str) == Some(head_sha) {
+                    return;
+                }
                 round = build_round(client, owner, repo, pr, &my_reviews, me).await;
-                // An earlier approval still stands when the new commits only
-                // touch docs/tests. Anything else is followed up, not waved through.
+                // Docs/tests-only commits never get a new review. Anything else
+                // is followed up, not waved through.
                 let docs_only = round
                     .as_ref()
                     .is_some_and(|r| crate::rereview::only_docs_or_tests(&r.delta_diff));
-                if action == ReviewAction::ApproveOnly && docs_only {
-                    let prior = my_reviews
-                        .iter()
-                        .rev()
-                        .find(|r| marker_of(&r.body) == Marker::Reviewed)
-                        .map(|r| r.body.replace(REVIEW_MARKER, "").trim().to_string());
-                    approve_only(app, state, client, cfg, repo_full, owner, repo, pr, prior).await;
-                    return;
+                match docs_only_step(&action, docs_only) {
+                    DocsOnlyStep::Reapprove => {
+                        let prior = my_reviews
+                            .iter()
+                            .rev()
+                            .find(|r| marker_of(&r.body) == Marker::Reviewed)
+                            .map(|r| r.body.replace(REVIEW_MARKER, "").trim().to_string());
+                        approve_only(app, state, client, cfg, repo_full, owner, repo, pr, prior).await;
+                        return;
+                    }
+                    DocsOnlyStep::Skip => {
+                        state.settled_heads.lock().await.insert(pr_key, head_sha.to_string());
+                        push_and_emit(
+                            app,
+                            state,
+                            ActivityEntry {
+                                timestamp: Utc::now(),
+                                kind: ActivityKind::Skipped,
+                                repo: Some(repo_full.to_string()),
+                                pr_number: Some(pr.number),
+                                pr_title: Some(pr.title.clone()),
+                                author: Some(pr.user.login.clone()),
+                                url: Some(pr.html_url.clone()),
+                                message: "문서·테스트만 바뀌어 재리뷰 생략 (직전 리뷰 결과 유지)".into(),
+                                detail: None,
+                            },
+                        )
+                        .await;
+                        return;
+                    }
+                    DocsOnlyStep::Review => {}
                 }
             }
             // Fall through to the review engine below.
@@ -593,8 +655,10 @@ async fn handle_pr(
         )
         .await;
         let round_block = round.as_ref().map(crate::rereview::render).unwrap_or_default();
+        // The round block is kept apart: the deep review hands it to the main
+        // pass only, never to the authorization re-check.
         let meta = format!(
-            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}\n\n{context}\n\n{round_block}",
+            "Repository: {owner}/{repo}  PR #{}\nAuthor: {}\nTitle: {}\nBody:\n{pr_body}\n\n{context}",
             pr.number, pr.user.login, pr.title
         );
         let diff_for_gate = diff.clone();
@@ -615,10 +679,11 @@ async fn handle_pr(
         let outcome = match tokio::task::spawn_blocking(move || {
             if deep {
                 crate::review::review_pr_deep_at(
-                    &guide, &meta, &diff, &model, tk, &owner_s, &repo_s, number, &token, None, second, trace,
+                    &guide, &meta, &round_block, &diff, &model, tk, &owner_s, &repo_s, number, &token, None, second,
+                    trace,
                 )
             } else {
-                crate::review::review_pr(&guide, &meta, &diff, &model, tk)
+                crate::review::review_pr(&guide, &format!("{meta}\n\n{round_block}"), &diff, &model, tk)
             }
         })
         .await
@@ -666,10 +731,29 @@ async fn handle_pr(
         // Every code-side hold reason goes on top, not just the first one the
         // gate hit, so the body's own verdict is not mistaken for the outcome.
         let notes = gate_notes(&sensitive, &outcome.omitted_files, outcome.continued);
-        let body = if notes.is_empty() || !outcome.finished_cleanly {
-            outcome.body.clone()
-        } else {
-            format!("{notes}\n{}", outcome.body)
+        let body = match &round {
+            // From the second review on, post a short summary of what changed
+            // and fold the model's full review under it.
+            Some(r) if outcome.finished_cleanly => {
+                let new_findings: Vec<&crate::review::Finding> = outcome
+                    .findings
+                    .iter()
+                    .filter(|f| {
+                        let id = crate::review::finding_id(&f.path, &f.symbol, &f.claim);
+                        !r.prev.iter().any(|p| p.id == id)
+                    })
+                    .collect();
+                crate::rereview::followup_summary(
+                    r,
+                    head_sha,
+                    &outcome_line(&decision, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
+                    &outcome.followups,
+                    &new_findings,
+                    &outcome.body,
+                )
+            }
+            _ if notes.is_empty() || !outcome.finished_cleanly => outcome.body.clone(),
+            _ => format!("{notes}\n{}", outcome.body),
         };
         // Posted to GitHub with the marker; the in-app detail keeps the clean body.
         // A failed run gets its own marker so the next commit is re-reviewed.
@@ -971,6 +1055,28 @@ mod tests {
     fn gate_holds_when_files_were_not_reviewed() {
         let omitted = vec!["src/big.ts".to_string()];
         assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, false, 4.0), Gate::HoldOmitted(omitted));
+    }
+
+    #[test]
+    fn docs_only_push_after_a_held_review_is_skipped() {
+        use super::{docs_only_step, DocsOnlyStep, ReviewAction};
+        // PR #1 round 8: README-only push on a PR held by the .npmrc gate.
+        assert_eq!(docs_only_step(&ReviewAction::FollowUp, true), DocsOnlyStep::Skip);
+        assert_eq!(docs_only_step(&ReviewAction::ApproveOnly, true), DocsOnlyStep::Reapprove);
+        // Code changed → review as before, whatever the last outcome was.
+        assert_eq!(docs_only_step(&ReviewAction::FollowUp, false), DocsOnlyStep::Review);
+        assert_eq!(docs_only_step(&ReviewAction::ApproveOnly, false), DocsOnlyStep::Review);
+        assert_eq!(docs_only_step(&ReviewAction::Review, true), DocsOnlyStep::Review);
+    }
+
+    #[test]
+    fn outcome_line_follows_the_gate_not_the_model() {
+        use super::{outcome_line, Gate};
+        assert_eq!(outcome_line(&Gate::Approve, 0, "4.5", 4.0), "✅ **승인** · 점수 4.5/5");
+        let held = outcome_line(&Gate::HoldSensitive(vec![".npmrc".into()]), 0, "5.0", 4.0);
+        assert_eq!(held, "👤 **사람 승인 필요** — 민감 파일 변경(.npmrc) · 점수 5.0/5");
+        assert!(!held.contains("Approve"));
+        assert_eq!(outcome_line(&Gate::HoldBlocking, 2, "3.0", 4.0), "⏸ **승인 보류** — blocking 2건");
     }
 
     #[test]
