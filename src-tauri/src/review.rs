@@ -44,13 +44,11 @@ score(0~5, team guide scoring), blocking_issues and findings. Follow the engine 
 /// The exact output contract: markdown review first, tiny JSON verdict last.
 const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — 팀 가이드의 "본문 양식"보다 우선한다) ===
 1) 먼저 사람이 읽을 리뷰 본문을 **마크다운**으로 쓴다. 본문에는 아래 섹션만 쓴다.
-   판정·점수·지적 개수·지적 목록은 본문에 쓰지 않는다. 코드가 판정 줄과 목록을 따로 붙인다.
+   요약·판정·점수·지적 개수·지적 목록은 본문에 쓰지 않는다. 요약은 JSON `summary` 에 쓰고, 코드가 판정 줄·요약 표·목록을 붙인다.
    (2차 재점검처럼 위 지시가 본문 섹션을 따로 정한 호출은 그 섹션만 쓴다.)
 ```
-# 총평
-{이 PR 이 하는 일 1문장}
-{판정 근거 1~2문장}
-{Feature Flag PR 이거나 변경 파일 15개 이상이면 ```mermaid 흐름도 하나. 단순하면 생략}
+# 흐름
+{Feature Flag PR 이거나 변경 파일 15개 이상이면 ```mermaid 흐름도 하나. 단순하면 이 섹션을 생략}
 
 # 검증 근거
 - ✅/⚠️/❌ {확인한 질문} — {방법: 열어 본 파일:라인, grep 패턴, 대조한 코드} → {결과}
@@ -58,7 +56,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 
 # 미확인
 - {못 본 것} — {이유와 확인 방법}
-(없으면 생략)
+(지적으로 낸 것은 다시 쓰지 않는다. 없으면 생략)
 
 # 산입하지 않은 것
 - {diff 밖 동종 결함, 이 PR 탓이 아닌 것, 다른 리뷰어가 이미 짚은 것} — 이유
@@ -67,6 +65,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 2) 출력의 맨 마지막에 아래 펜스로 **판정 + 지적 목록**만 내보낸다. 마크다운 본문은 이 JSON 안에 넣지 않는다:
 ```json
 {"verdict":"approve|comment|request_changes","score":<0-5>,"blocking_issues":["suspicious-instruction 같은 엔진 규칙 위반만"],
+ "summary":{"changes":["<이 PR 이 바꾼 것, 짧은 구절 2~4개>"],"judgement":"<판단 한두 구절: 결함이 있는지와 가장 중요한 근거>","checks":["<머지 전에 사람이 확인할 것, 짧은 구절. 없으면 []>"]},
  "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
    "symbol":"<함수·컴포넌트 이름>",
    "title":"<스레드 제목 한 줄: 작성자나 사용자가 겪게 될 일. 35자 안팎>",
@@ -82,10 +81,20 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 - title 은 원인이 아니라 겪게 될 일로 쓴다.
   예) "redirect 에 pathname 만 담아 쿼리가 사라진다" 대신 "로그인하고 돌아오면 필터와 페이지가 초기화됩니다".
 - claim·fix·repro 는 한 문장에 한 가지만, 60자 안팎으로 쓴다. "~합니다"체로 쓴다. 코드는 백틱으로 감싼다.
+- summary 는 표 칸에 들어간다. 문장이 아니라 짧은 구절로 쓰고(예: "배경색 추천 기준 변경"), 한 항목은 40자 안팎으로 쓴다.
+- 읽는 사람은 이 PR 의 설계를 모를 수 있다. 쉬운 말로 쓴다.
+  - 이 PR 에서만 쓰는 용어·약어는 처음 쓸 때 한 번 풀어 쓴다. 예) "채도(Chroma)", "C40" 대신 "채도 40".
+  - 코드 이름(함수·변수·파일)은 백틱으로 감싸고, 일반 개념은 한국어로 쓴다. 예) "hex 값", "호스트", "요청".
+  - 영어 단어에 조사를 바로 붙여 명사처럼 쓰지 않는다. 예) "추천 칩 hex가 다른 Hue에서도" 대신 "추천 색의 hex 값이 다른 색상에서도".
+  - 명사를 세 개 넘게 이어 붙이지 않는다. 예) "추천 칩 hex 반올림 오차" 대신 "추천 색을 hex 로 바꿀 때 생기는 반올림 오차".
+  - 결과를 먼저 쓰고 원리는 다음 문장에 쓴다. 예) "추천 색을 골라도 저장할 때 막힐 수 있습니다. 반올림 때문에 채도가 상한을 넘습니다."
+  - 기각·수용·소관 같은 딱딱한 말이나 대시(—)로 문장을 잇는 표현을 쓰지 않는다.
 - repro_case 는 동작이 틀린 지적에만 쓴다. 상황·기대·실제는 각각 짧은 구절로 쓴다.
 - refs 는 지적을 이해하는 데 필요한 다른 곳(호출부, 같은 패턴을 쓰는 곳)만 넣는다. 지적한 그 줄 자체는 넣지 않는다.
 지적 규칙:
 - 지적은 findings 에만 쓴다. 본문에 지적 목록(# 발견, # 질문)을 쓰지 않는다. 질문은 severity "question" 으로 넣는다.
+- 질문도 line 이 있으면 그 줄에 스레드로 달린다. 작성자가 답할 수 있게 무엇을 확인하고 싶은지 분명히 쓴다.
+- 같은 우려를 findings 와 `# 미확인` 에 함께 쓰지 않는다. 줄을 짚을 수 있으면 findings, 짚을 수 없으면 `# 미확인` 에 쓴다.
 - blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 코드가 본문 목록에 적는다.
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
@@ -170,6 +179,29 @@ pub struct ReviewOutcome {
     pub findings: Vec<Finding>,
     /// Status of each earlier finding on a follow-up round (empty on round 1).
     pub followups: Vec<crate::rereview::Followup>,
+    /// The report rows the model filled (what changed, the judgement, what
+    /// to check before merging). Empty when the model left them out.
+    pub summary: ReviewSummary,
+    /// True when the authorization/contract second pass ran and finished.
+    pub rechecked: bool,
+}
+
+/// What the model says the PR does and how it judged it, as short phrases.
+/// Rendered as the report table at the top of the body.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct ReviewSummary {
+    #[serde(default, deserialize_with = "strings_skip_null")]
+    pub changes: Vec<String>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub judgement: String,
+    #[serde(default, deserialize_with = "strings_skip_null")]
+    pub checks: Vec<String>,
+}
+
+impl ReviewSummary {
+    pub fn is_empty(&self) -> bool {
+        self.changes.iter().all(|c| c.trim().is_empty()) && self.judgement.trim().is_empty()
+    }
 }
 
 impl ReviewOutcome {
@@ -188,6 +220,8 @@ impl ReviewOutcome {
             file_comments: vec![],
             findings: vec![],
             followups: vec![],
+            summary: ReviewSummary::default(),
+            rechecked: false,
         }
     }
 }
@@ -344,6 +378,7 @@ fn merge_second_pass(first: &mut ReviewOutcome, second: ReviewOutcome) {
             first.verdict = "comment".into();
         }
     }
+    first.rechecked = true;
     let added = new_findings.len();
     first.findings.extend(new_findings);
     let checks = recheck_section(&second.body);
@@ -435,6 +470,16 @@ where
     Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
 }
 
+/// A list of strings where the list itself or any element may be null.
+/// Null elements are dropped — `["a", null]` is `["a"]`, not a parse failure.
+pub(crate) fn strings_skip_null<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let v: Option<Vec<Option<String>>> = Option::deserialize(de)?;
+    Ok(v.unwrap_or_default().into_iter().flatten().collect())
+}
+
 #[derive(Debug, Deserialize)]
 struct Envelope {
     #[serde(default, deserialize_with = "null_as_default")]
@@ -460,6 +505,8 @@ struct Verdict {
     findings: Vec<Finding>,
     #[serde(default, deserialize_with = "null_as_default")]
     followups: Vec<crate::rereview::Followup>,
+    #[serde(default, deserialize_with = "null_as_default")]
+    summary: ReviewSummary,
 }
 
 impl Verdict {
@@ -515,7 +562,7 @@ pub struct Finding {
     pub rule: String,
     /// Same-repo code locations worth seeing (`path:10-14`). Posted as
     /// permalinks, which GitHub expands into code snippets.
-    #[serde(default, deserialize_with = "null_as_default")]
+    #[serde(default, deserialize_with = "strings_skip_null")]
     pub refs: Vec<String>,
     /// A behavior bug's case, shown as a one-row table.
     #[serde(default)]
@@ -851,12 +898,14 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
             let at = if f.path.is_empty() { String::new() } else { format!(" ({})", f.path) };
             split.blockers.push(format!("{}{at}", f.claim.trim()));
         }
-        let postable = matches!(f.severity.as_str(), "blocker" | "major" | "minor")
+        let postable = matches!(f.severity.as_str(), "blocker" | "major" | "minor" | "question")
             && f.confidence.unwrap_or(0.0) >= INLINE_MIN_CONFIDENCE
-            // A blocker is always posted; lesser findings need a way to fix
-            // them. Recent human threads show fixes attached get applied far
-            // more often than bare complaints.
-            && (f.severity == "blocker" || f.has_fix());
+            // A blocker is always posted, and a question asks rather than
+            // fixes; other findings need a way to fix them. Recent human
+            // threads show fixes attached get applied far more often than
+            // bare complaints. A question with a line used to be listed only
+            // in the body (#6074), where the author cannot answer it.
+            && (matches!(f.severity.as_str(), "blocker" | "question") || f.has_fix());
         let anchored = f
             .line
             .is_some_and(|l| allowed.get(&f.path).is_some_and(|set| set.contains(&l)));
@@ -1169,6 +1218,8 @@ fn run_claude(
                 file_comments: split.file_level,
                 findings: v.findings,
                 followups: v.followups,
+                summary: v.summary,
+                rechecked: false,
             }
         }
         Err(e) => ReviewOutcome::fail_closed(format!("판정 파싱 실패: {e}")),
@@ -1548,6 +1599,27 @@ mod tests {
     }
 
     #[test]
+    fn a_question_without_a_line_or_with_low_confidence_stays_in_the_body() {
+        let fs = vec![
+            finding("question", 95.0, "src/x.ts", None, "줄 없는 질문"),
+            finding("question", 50.0, "src/x.ts", Some(11), "확신 낮은 질문"),
+        ];
+        assert!(split_findings(&fs, SAMPLE_DIFF).inline.is_empty());
+    }
+
+    #[test]
+    fn summary_is_read_from_the_verdict_and_tolerates_nulls() {
+        let out = "본문\n```json\n{\"verdict\":\"approve\",\"score\":5,\"summary\":{\"changes\":[\"a\",null],\"judgement\":\"결함 없음\",\"checks\":null}}\n```";
+        let (_b, v) = extract_review(out).unwrap();
+        assert_eq!(v.summary.judgement, "결함 없음");
+        assert_eq!(v.summary.changes, vec!["a".to_string()], "a null element is dropped, not a parse failure");
+        assert!(v.summary.checks.is_empty());
+        assert!(!v.summary.is_empty());
+        let none = "본문\n```json\n{\"verdict\":\"approve\",\"score\":5}\n```";
+        assert!(extract_review(none).unwrap().1.summary.is_empty());
+    }
+
+    #[test]
     fn findings_split_by_severity_confidence_and_anchor() {
         let fs = vec![
             finding("blocker", 90.0, "src/x.ts", Some(11), "빈 목록이 통과"),
@@ -1557,7 +1629,11 @@ mod tests {
             finding("nit", 95.0, "src/x.ts", Some(11), "이름"),
         ];
         let s = split_findings(&fs, SAMPLE_DIFF);
-        assert_eq!(s.inline.len(), 1, "only the confident, anchored blocker goes inline");
+        // The confident, anchored blocker and question go inline; the nit and
+        // the weak or off-diff majors do not.
+        assert_eq!(s.inline.len(), 2, "blocker + question");
+        assert!(s.inline[1].body.starts_with("❔ **의도인가요**"), "{}", s.inline[1].body);
+        assert!(s.inline[1].body.contains("의도한 동작인지 답글로 알려 주세요."));
         assert!(s.inline[0].body.starts_with("> [!CAUTION]\n> 🔴 **빈 목록이 통과**"), "{}", s.inline[0].body);
         assert!(s.inline[0].body.contains("\n\n빈 배열이면 통과\n\n"));
         assert!(s.inline[0].body.contains("<!-- meta sev:blocker c:90 -->"));
@@ -1582,6 +1658,8 @@ mod tests {
             file_comments: vec![],
             findings,
             followups: vec![],
+            summary: ReviewSummary::default(),
+            rechecked: false,
         }
     }
 
