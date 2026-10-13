@@ -213,7 +213,9 @@ pub fn followup_summary(
         out.push_str(&format!("\n{list}"));
     }
 
-    let full = crate::layout::fold_sections(full_body.trim());
+    // Same cleanup as a first review's body: small headings, no duplicate
+    // finding lists, audit sections folded one by one.
+    let full = crate::layout::compose_body(full_body.trim(), "", "", "", &[]);
     if !full.is_empty() {
         out.push_str(&format!("\n<details>\n<summary>전체 리뷰 보기</summary>\n\n{full}\n\n</details>\n"));
     }
@@ -356,6 +358,17 @@ mod tests {
         // The model's own review is still there, folded.
         assert!(out.contains("<summary>전체 리뷰 보기</summary>") && out.contains("긴 총평"), "{out}");
         assert!(out.contains("<summary>검증 근거 1건</summary>"), "{out}");
+    }
+
+    #[test]
+    fn the_folded_full_review_is_cleaned_like_a_first_review() {
+        let round = Round { number: 2, prev_sha: "a".into(), prev: vec![], delta_diff: DELTA.into() };
+        let full = "# 총평\n\n요약입니다. 5/5점, Approve 합니다.\n\n# 발견\n\n- 중복 목록\n\n# 미확인\n\n- 못 봄";
+        let out = followup_summary(&round, "abc", "✅ **승인** · 새 지적 없음", "", &[], &[], full);
+        let inner = out.split("<summary>전체 리뷰 보기</summary>").nth(1).unwrap();
+        assert!(inner.contains("### 미확인"), "{out}");
+        assert!(!inner.contains("# 발견") && !inner.contains("중복 목록") && !inner.contains("Approve"), "{out}");
+        assert!(!inner.lines().any(|l| l.starts_with("# ")), "{out}");
     }
 
     #[test]

@@ -249,19 +249,8 @@ impl GitHubClient {
         number: u64,
     ) -> Result<Vec<Review>> {
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100");
-        let resp = self
-            .send_get(
-                self.http
-                    .get(&url)
-                    .headers(self.headers())
-            )
-            .await?;
-        if !resp.status().is_success() {
-            let s = resp.status();
-            let b = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("list reviews failed: {s} {b}"));
-        }
-        Ok(resp.json().await?)
+        self.get_all_pages(&url).await
+            .map_err(|e| anyhow!("list reviews failed: {e}"))
     }
 
     pub async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<GhUserHint>> {
@@ -292,39 +281,45 @@ impl GitHubClient {
         Ok(parsed.items)
     }
 
+    /// `commit_id` is the head the review looked at (see `submit_review`).
     pub async fn approve_pull(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
+        commit_id: &str,
         body: Option<&str>,
     ) -> Result<()> {
-        self.submit_review(owner, repo, number, "APPROVE", body, &[]).await
+        self.submit_review(owner, repo, number, commit_id, "APPROVE", body, &[]).await
     }
 
     /// Approve with inline line comments attached (creates resolvable threads).
+    #[allow(clippy::too_many_arguments)]
     pub async fn approve_pull_with_comments(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
+        commit_id: &str,
         body: Option<&str>,
         comments: &[ReviewComment],
     ) -> Result<()> {
-        self.submit_review(owner, repo, number, "APPROVE", body, comments).await
+        self.submit_review(owner, repo, number, commit_id, "APPROVE", body, comments).await
     }
 
     /// Post a non-approving COMMENT review carrying the review body (+ optional
     /// inline line comments). Used when the score is below the approve threshold.
+    #[allow(clippy::too_many_arguments)]
     pub async fn comment_pull(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
+        commit_id: &str,
         body: &str,
         comments: &[ReviewComment],
     ) -> Result<()> {
-        self.submit_review(owner, repo, number, "COMMENT", Some(body), comments).await
+        self.submit_review(owner, repo, number, commit_id, "COMMENT", Some(body), comments).await
     }
 
     /// Post a file-level comment. The reviews API has no such comment, so it goes
@@ -380,19 +375,27 @@ impl GitHubClient {
     /// Submit a review. Inline `comments` reference diff lines; if GitHub rejects
     /// them (422 — a line not in the diff), retry once WITHOUT comments so the
     /// review body still lands.
+    ///
+    /// The review is pinned to `commit_id`, the head it actually looked at.
+    /// Without it GitHub files the review on whatever the head is when it is
+    /// submitted: on core-partner-frontend#5243 three commits landed during a
+    /// five-minute review, the approval went onto the newest one, and the bot
+    /// then treated that unread commit as reviewed. Pinned, the newer head
+    /// stays unreviewed and the next poll picks it up.
+    #[allow(clippy::too_many_arguments)]
     async fn submit_review(
         &self,
         owner: &str,
         repo: &str,
         number: u64,
+        commit_id: &str,
         event: &str,
         body: Option<&str>,
         comments: &[ReviewComment],
     ) -> Result<()> {
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews");
         let build = |with_comments: bool| -> serde_json::Value {
-            let mut payload = serde_json::Map::new();
-            payload.insert("event".into(), serde_json::Value::String(event.into()));
+            let mut payload = review_payload_base(event, commit_id);
             if let Some(b) = body.filter(|s| !s.trim().is_empty()) {
                 payload.insert("body".into(), serde_json::Value::String(b.to_string()));
             }
@@ -534,6 +537,37 @@ impl GitHubClient {
         Ok(out)
     }
 
+    /// GET every page of a JSON list by following the `Link: rel="next"`
+    /// header. Capped at `MAX_PAGES` so a broken header cannot loop forever.
+    ///
+    /// A first-page-only read let a PR with 146 reviews hide the bot's own
+    /// approvals past #100, and the bot re-reviewed the same commit 35 times.
+    async fn get_all_pages<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<Vec<T>> {
+        let mut out: Vec<T> = Vec::new();
+        let mut next = Some(url.to_string());
+        let mut pages = 0;
+        while let Some(u) = next.take() {
+            pages += 1;
+            if pages > MAX_PAGES {
+                return Err(anyhow!("GET {url}: more than {MAX_PAGES} pages"));
+            }
+            let resp = self.send_get(self.http.get(&u).headers(self.headers())).await?;
+            let status = resp.status();
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(anyhow!("GET {u} failed: {status} {body}"));
+            }
+            next = resp
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|v| v.to_str().ok())
+                .and_then(next_link);
+            let mut page: Vec<T> = resp.json().await?;
+            out.append(&mut page);
+        }
+        Ok(out)
+    }
+
     /// GET a JSON list, following nothing past the first page (`per_page=100`).
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let resp = self.http.get(url).headers(self.headers()).send().await?;
@@ -575,7 +609,7 @@ impl GitHubClient {
             message: String,
         }
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/commits?per_page=100");
-        let cs: Vec<C> = self.get_json(&url).await?;
+        let cs: Vec<C> = self.get_all_pages(&url).await?;
         Ok(cs
             .into_iter()
             .map(|c| c.commit.message.lines().next().unwrap_or("").to_string())
@@ -585,7 +619,7 @@ impl GitHubClient {
     /// Inline review comments (people and bots), oldest first.
     pub async fn list_review_comments(&self, owner: &str, repo: &str, number: u64) -> Result<Vec<InlineThreadComment>> {
         let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100");
-        self.get_json(&url).await
+        self.get_all_pages(&url).await
     }
 
     /// Most recently updated closed PRs (merged or not), newest first.
@@ -666,6 +700,28 @@ pub fn split_repo(full: &str) -> Result<(&str, &str)> {
     Ok((owner, repo))
 }
 
+/// The fields every submitted review carries: the event and, when known, the
+/// commit it is pinned to.
+fn review_payload_base(event: &str, commit_id: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut payload = serde_json::Map::new();
+    payload.insert("event".into(), serde_json::Value::String(event.into()));
+    if !commit_id.is_empty() {
+        payload.insert("commit_id".into(), serde_json::Value::String(commit_id.into()));
+    }
+    payload
+}
+
+/// Pages followed by `get_all_pages` (100 items each).
+const MAX_PAGES: usize = 30;
+
+/// The `rel="next"` URL of a GitHub `Link` header, if any.
+fn next_link(header: &str) -> Option<String> {
+    header.split(',').find_map(|part| {
+        let (url, rel) = part.split_once(';')?;
+        rel.contains("rel=\"next\"").then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+    })
+}
+
 fn is_transient_status(s: StatusCode) -> bool {
     matches!(s.as_u16(), 502 | 503 | 504)
 }
@@ -718,3 +774,29 @@ mod resilience_tests {
         assert_eq!(r.status(), StatusCode::OK);
     }
 }
+
+#[cfg(test)]
+mod paging_tests {
+    use super::{next_link, review_payload_base};
+
+    #[test]
+    fn next_link_follows_rel_next_only() {
+        let h = r#"<https://api.github.com/repositories/1/pulls/3/reviews?per_page=100&page=2>; rel="next", <https://api.github.com/repositories/1/pulls/3/reviews?per_page=100&page=2>; rel="last""#;
+        assert_eq!(
+            next_link(h).as_deref(),
+            Some("https://api.github.com/repositories/1/pulls/3/reviews?per_page=100&page=2")
+        );
+        let last_page = r#"<https://x/?page=1>; rel="prev", <https://x/?page=1>; rel="first""#;
+        assert_eq!(next_link(last_page), None);
+        assert_eq!(next_link(""), None);
+    }
+
+    #[test]
+    fn a_review_is_pinned_to_the_commit_it_read() {
+        let p = review_payload_base("APPROVE", "e707f25abc");
+        assert_eq!(p["event"], "APPROVE");
+        assert_eq!(p["commit_id"], "e707f25abc");
+        assert!(!review_payload_base("COMMENT", "").contains_key("commit_id"));
+    }
+}
+
