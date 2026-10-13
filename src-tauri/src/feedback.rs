@@ -60,12 +60,6 @@ fn outcome_of(replies: &[&InlineThreadComment]) -> Outcome {
     Outcome::Replied
 }
 
-/// `🔴 **blocker** (확신 90) — …` → 90.
-fn confidence_of(first_line: &str) -> Option<u32> {
-    let rest = first_line.split_once("(확신 ")?.1;
-    rest.split(')').next()?.trim().parse().ok()
-}
-
 /// The bot's own finding threads in one PR, with how each ended.
 pub fn classify(comments: &[InlineThreadComment], me: &str) -> Vec<Posted> {
     let mut out: Vec<Posted> = Vec::new();
@@ -77,12 +71,10 @@ pub fn classify(comments: &[InlineThreadComment], me: &str) -> Vec<Posted> {
         if out.iter().any(|p| p.id == id) {
             continue;
         }
-        let first = root.body.lines().next().unwrap_or("");
-        let severity = ["blocker", "major", "minor", "nit"]
-            .into_iter()
-            .find(|s| first.contains(&format!("**{s}**")))
-            .unwrap_or("question")
-            .to_string();
+        // Severity and confidence come from the hidden meta line; threads
+        // posted before it are read from their first line.
+        let head = crate::review::parse_inline_head(&root.body);
+        let severity = head.severity;
         let replies: Vec<&InlineThreadComment> = comments
             .iter()
             .filter(|c| c.in_reply_to_id == Some(root.id) && !c.user.login.eq_ignore_ascii_case(me))
@@ -90,7 +82,7 @@ pub fn classify(comments: &[InlineThreadComment], me: &str) -> Vec<Posted> {
         out.push(Posted {
             id,
             severity,
-            confidence: confidence_of(first),
+            confidence: head.confidence,
             has_code: root.body.contains("```"),
             outcome: outcome_of(&replies),
         });
@@ -291,5 +283,18 @@ mod tests {
     #[test]
     fn empty_input_says_so() {
         assert!(summarize(&[]).contains("찾지 못함"));
+    }
+
+    #[test]
+    fn new_format_threads_keep_severity_and_confidence() {
+        let mut f = crate::review::Finding::default();
+        f.severity = "minor".into();
+        f.confidence = Some(77.0);
+        f.title = "쿼리가 사라집니다".into();
+        f.claim = "pathname 만 담습니다.".into();
+        f.fix = "search 도 담습니다.".into();
+        let body = crate::review::render_inline_for_test(&f);
+        let p = classify(&[c(1, "bot", &body, None)], "bot");
+        assert_eq!((p[0].severity.as_str(), p[0].confidence), ("minor", Some(77)));
     }
 }

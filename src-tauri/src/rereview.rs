@@ -52,13 +52,8 @@ pub fn prev_findings(comments: &[InlineThreadComment], me: &str) -> Vec<PrevFind
         if out.iter().any(|p| p.id == id) {
             continue;
         }
-        let first = c.body.lines().next().unwrap_or("");
-        let severity = ["blocker", "major", "minor", "nit"]
-            .into_iter()
-            .find(|s| first.contains(&format!("**{s}**")))
-            .unwrap_or("question")
-            .to_string();
-        let claim = first.split_once(" — ").map(|(_, c)| c.trim()).unwrap_or(first).to_string();
+        let head = crate::review::parse_inline_head(&c.body);
+        let (severity, claim) = (head.severity, head.title);
         out.push(PrevFinding {
             id,
             severity,
@@ -155,23 +150,28 @@ fn status_label(status: &str) -> &'static str {
 /// PR #1 got eight reviews of 3–4.6K characters each: every round repeated the
 /// overview, the gate banner and the seven already-resolved findings, while
 /// rounds 3–8 had nothing new. A follow-up only needs what changed — the
-/// outcome, earlier findings that are still open, and new findings — so that
-/// part is built here from structured data and the model's body is folded
+/// outcome, earlier findings that are still open, and new findings without a
+/// thread — so that part is built here and the model's body is folded
 /// underneath for anyone who wants it.
 pub fn followup_summary(
     round: &Round,
     head_sha: &str,
     outcome_line: &str,
+    notes: &str,
     followups: &[Followup],
-    new_findings: &[&crate::review::Finding],
+    unposted_new: &[&crate::review::Finding],
     full_body: &str,
 ) -> String {
     let files = crate::diffprep::changed_paths(&round.delta_diff).len();
-    let mut out = format!(
-        "# {}회차 재리뷰 · `{}` · 파일 {files}개 변경\n\n{outcome_line}\n",
+    let mut out = outcome_line.trim().to_string();
+    if !notes.trim().is_empty() {
+        out.push_str(&format!("\n{}", notes.trim()));
+    }
+    out.push_str(&format!(
+        "\n\n<sub>{}회차 재리뷰 · `{}` · 파일 {files}개 변경</sub>\n",
         round.number,
         &head_sha[..head_sha.len().min(7)],
-    );
+    ));
 
     if !round.prev.is_empty() {
         let mut counts = [0usize; 5];
@@ -190,7 +190,7 @@ pub fn followup_summary(
                 let (icon, _) = crate::review::severity_label(&p.severity);
                 let at = p.line.map(|l| format!(":{l}")).unwrap_or_default();
                 let note = if note.trim().is_empty() { String::new() } else { format!(" — {}", note.trim()) };
-                open.push(format!("- {icon} {} · `{}{at}` {}{note}", status_label(status), p.path, p.claim));
+                open.push(format!("- {icon} {} · **{}** · `{}{at}`{note}", status_label(status), p.claim, p.path));
             }
         }
         out.push_str(&format!(
@@ -208,19 +208,9 @@ pub fn followup_summary(
         }
     }
 
-    if new_findings.is_empty() {
-        out.push_str("\n**새 지적 없음**\n");
-    } else {
-        out.push_str(&format!("\n**새 지적 {}건**\n", new_findings.len()));
-        for f in new_findings {
-            let (icon, _) = crate::review::severity_label(&f.severity);
-            let at = match (f.path.is_empty(), f.line) {
-                (true, _) => String::new(),
-                (false, Some(l)) => format!(" `{}:{l}`", f.path),
-                (false, None) => format!(" `{}`", f.path),
-            };
-            out.push_str(&format!("- {icon}{at} {}\n", f.claim.trim()));
-        }
+    let list = crate::layout::findings_list("인라인에 달지 못한 새 지적", unposted_new);
+    if !list.is_empty() {
+        out.push_str(&format!("\n{list}"));
     }
 
     let full = crate::layout::fold_sections(full_body.trim());
@@ -347,21 +337,22 @@ mod tests {
         };
         let followups = vec![fu("f:1111", "resolved", "고침"), fu("2222", "partial", "쓰기만 막음")];
         let mut f = crate::review::Finding::default();
-        f.severity = "minor".into();
+        f.severity = "nit".into();
         f.path = "src/a.ts".into();
         f.line = Some(1);
+        f.title = "이름이 헷갈립니다".into();
         f.claim = "새로 생긴 문제".into();
         let full = "# 총평\n\n긴 총평\n\n# 검증 근거\n\n- ✅ 확인";
-        let out = followup_summary(&round, "0123456789", "✅ **승인**", &followups, &[&f], full);
+        let out = followup_summary(&round, "0123456789", "✅ **승인** · 새 지적 nit 1", "", &followups, &[&f], full);
 
-        assert!(out.starts_with("# 3회차 재리뷰 · `0123456` · 파일 2개 변경\n\n✅ **승인**"), "{out}");
+        assert!(out.starts_with("✅ **승인** · 새 지적 nit 1\n\n<sub>3회차 재리뷰 · `0123456` · 파일 2개 변경</sub>"), "{out}");
         assert!(out.contains("**이전 지적 3건** — 해소 1 · 부분 1 · 미해소 1 · 반영 안 함 0 · 철회 0"), "{out}");
         // Resolved items are counted, not re-listed.
         assert!(!out.contains("헤더가 사라짐"), "{out}");
-        assert!(out.contains("- 🟡 부분 · `src/b.ts:20` 권한 확인 없음 — 쓰기만 막음"), "{out}");
+        assert!(out.contains("- 🟡 부분 · **권한 확인 없음** · `src/b.ts:20` — 쓰기만 막음"), "{out}");
         // No followup for 3333 → unresolved, same as open_blockers.
-        assert!(out.contains("- 🔵 미해소 · `src/c.ts:30` 쿼리가 사라짐"), "{out}");
-        assert!(out.contains("**새 지적 1건**") && out.contains("- 🔵 `src/a.ts:1` 새로 생긴 문제"), "{out}");
+        assert!(out.contains("- 🔵 미해소 · **쿼리가 사라짐** · `src/c.ts:30`"), "{out}");
+        assert!(out.contains("**인라인에 달지 못한 새 지적 1건**\n- 🔘 **이름이 헷갈립니다** · `src/a.ts:1`"), "{out}");
         // The model's own review is still there, folded.
         assert!(out.contains("<summary>전체 리뷰 보기</summary>") && out.contains("긴 총평"), "{out}");
         assert!(out.contains("<summary>검증 근거 1건</summary>"), "{out}");
@@ -370,10 +361,24 @@ mod tests {
     #[test]
     fn quiet_round_is_a_few_lines_plus_the_folded_review() {
         let round = Round { number: 5, prev_sha: "a".into(), prev: vec![prev("1111", "minor", "a.ts", 1, "x")], delta_diff: DELTA.into() };
-        let out = followup_summary(&round, "abc", "👤 **사람 승인 필요**", &[fu("1111", "resolved", "")], &[], "# 총평\n\n본문");
+        let out = followup_summary(&round, "abc", "👤 **사람 승인 필요** · 새 지적 없음", "", &[fu("1111", "resolved", "")], &[], "# 총평\n\n본문");
         let before_fold = out.split("<details>").next().unwrap();
-        assert!(before_fold.contains("**새 지적 없음**"), "{out}");
+        assert!(before_fold.starts_with("👤 **사람 승인 필요** · 새 지적 없음"), "{out}");
         assert_eq!(before_fold.lines().filter(|l| l.starts_with("- ")).count(), 0, "{out}");
         assert!(before_fold.len() < 300, "summary part stays short: {}", before_fold.len());
+    }
+
+    #[test]
+    fn earlier_findings_are_recovered_from_the_new_thread_format() {
+        let mut fnd = crate::review::Finding::default();
+        fnd.severity = "major".into();
+        fnd.confidence = Some(88.0);
+        fnd.title = "권한 없이 저장됩니다".into();
+        fnd.claim = "쓰기 권한을 보지 않습니다.".into();
+        fnd.fix = "권한을 확인합니다.".into();
+        let body = crate::review::render_inline_for_test(&fnd);
+        let p = prev_findings(&[c("me", &body, false)], "me");
+        assert_eq!(p.len(), 1);
+        assert_eq!((p[0].severity.as_str(), p[0].claim.as_str()), ("major", "권한 없이 저장됩니다"));
     }
 }

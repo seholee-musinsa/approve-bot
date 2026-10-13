@@ -73,6 +73,9 @@ pub struct Review {
     /// ISO-8601 UTC; only used to cut threads off at a point in time (eval).
     #[serde(default)]
     pub submitted_at: Option<String>,
+    /// GraphQL id, needed to hide an outdated review (`minimize_review`).
+    #[serde(default)]
+    pub node_id: String,
 }
 
 /// One inline review comment as GitHub returns it (only the fields we feed the reviewer).
@@ -348,6 +351,30 @@ impl GitHubClient {
         }
         let b = resp.text().await.unwrap_or_default();
         Err(anyhow!("file comment failed: {status} {b}"))
+    }
+
+    /// Hide a review body as "Outdated". GitHub keeps it one click away; the
+    /// timeline shows a single collapsed line instead of the whole body.
+    /// Hiding an already hidden review is a no-op.
+    pub async fn minimize_review(&self, node_id: &str) -> Result<()> {
+        let payload = serde_json::json!({
+            "query": "mutation($id: ID!) { minimizeComment(input: {subjectId: $id, classifier: OUTDATED}) { minimizedComment { isMinimized } } }",
+            "variables": { "id": node_id },
+        });
+        let resp = self
+            .http
+            .post(format!("{API}/graphql"))
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        let b = resp.text().await.unwrap_or_default();
+        // GraphQL reports most failures as 200 with an `errors` array.
+        if status.is_success() && !b.contains("\"errors\"") {
+            return Ok(());
+        }
+        Err(anyhow!("minimize failed: {status} {}", b.chars().take(300).collect::<String>()))
     }
 
     /// Submit a review. Inline `comments` reference diff lines; if GitHub rejects
