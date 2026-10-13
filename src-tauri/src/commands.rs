@@ -52,10 +52,34 @@ pub async fn clear_activity_log(state: State<'_, Arc<AppState>>) -> Result<(), S
     Ok(())
 }
 
+/// What "Check now" did with the request, so the UI can say which one happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckNowAck {
+    /// The poller was waiting — the pass starts right away.
+    Started,
+    /// A pass is already running (a review can take minutes). The wake-up
+    /// signal is kept, so one more pass runs as soon as this one finishes.
+    Queued,
+}
+
+/// `Notify` holds at most one permit, so pressing "Check now" five times during
+/// a long review still queues exactly one extra pass. Report that instead of
+/// letting the UI present it as a failed check.
+pub fn ack_for(pass_running: bool) -> CheckNowAck {
+    if pass_running {
+        CheckNowAck::Queued
+    } else {
+        CheckNowAck::Started
+    }
+}
+
 #[tauri::command]
-pub async fn force_check_now(state: State<'_, Arc<AppState>>) -> Result<(), String> {
+pub async fn force_check_now(state: State<'_, Arc<AppState>>) -> Result<CheckNowAck, String> {
     state.poll_signal.notify_one();
-    Ok(())
+    Ok(ack_for(
+        state.pass_running.load(std::sync::atomic::Ordering::SeqCst),
+    ))
 }
 
 #[tauri::command]
@@ -408,4 +432,27 @@ pub async fn discard_waiting_candidates(state: State<'_, Arc<AppState>>, ids: Ve
         return Err("점검이 실행 중입니다. 끝난 뒤에 다시 시도해 주세요".into());
     }
     crate::sweep::discard_waiting(&state.config_dir, &ids).map_err(|e| format!("{e:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ack_for, CheckNowAck};
+
+    #[test]
+    fn check_now_reports_started_when_the_poller_is_idle() {
+        assert_eq!(ack_for(false), CheckNowAck::Started);
+    }
+
+    #[test]
+    fn check_now_reports_queued_while_a_pass_is_running() {
+        // The long case: a review is in flight, so the press only queues the
+        // next pass. The UI must not call this a failure.
+        assert_eq!(ack_for(true), CheckNowAck::Queued);
+    }
+
+    #[test]
+    fn ack_serializes_to_the_lowercase_names_the_ui_expects() {
+        assert_eq!(serde_json::to_string(&CheckNowAck::Started).unwrap(), "\"started\"");
+        assert_eq!(serde_json::to_string(&CheckNowAck::Queued).unwrap(), "\"queued\"");
+    }
 }

@@ -75,6 +75,15 @@ export interface ConnectionStatus {
   checked_at: string;
 }
 
+/// What "Check now" did with the press. "queued" means a pass is already
+/// running and one more will follow it.
+export type CheckNowAck = "started" | "queued";
+
+/// Emitted when a poll pass starts and when it ends.
+export interface PassState {
+  running: boolean;
+}
+
 export type ActivityKind = "approved" | "skipped" | "error" | "info";
 
 export interface GhUserHint {
