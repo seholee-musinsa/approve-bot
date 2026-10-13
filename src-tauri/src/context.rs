@@ -393,6 +393,7 @@ mod tests {
                 commit_id: Some("abcdef1234".into()),
                 body: "<!-- approve-bot:review -->\n# 요약\n좋아요".into(),
                 submitted_at: None,
+                node_id: String::new(),
             },
             Review {
                 user: GhUser { login: "someone".into() },
@@ -400,6 +401,7 @@ mod tests {
                 commit_id: None,
                 body: "".into(),
                 submitted_at: None,
+                node_id: String::new(),
             },
         ];
         let inline = vec![

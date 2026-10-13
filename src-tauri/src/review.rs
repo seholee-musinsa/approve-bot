@@ -42,20 +42,56 @@ OUTPUT: a human-readable Korean review body, then verdict(approve|comment|reques
 score(0~5, team guide scoring), blocking_issues and findings. Follow the engine output format below exactly. score is used by the approval gate, so be precise."#;
 
 /// The exact output contract: markdown review first, tiny JSON verdict last.
-const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것) ===
-1) 먼저 사람이 읽을 리뷰를 **마크다운**으로 쓴다. 팀 가이드의 "본문 양식"(# 총평, # 발견, # 검증 근거, # 미확인 ...)을 그대로 쓴다.
+const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — 팀 가이드의 "본문 양식"보다 우선한다) ===
+1) 먼저 사람이 읽을 리뷰 본문을 **마크다운**으로 쓴다. 본문에는 아래 섹션만 쓴다.
+   판정·점수·지적 개수·지적 목록은 본문에 쓰지 않는다. 코드가 판정 줄과 목록을 따로 붙인다.
+   (2차 재점검처럼 위 지시가 본문 섹션을 따로 정한 호출은 그 섹션만 쓴다.)
+```
+# 총평
+{이 PR 이 하는 일 1문장}
+{판정 근거 1~2문장}
+{Feature Flag PR 이거나 변경 파일 15개 이상이면 ```mermaid 흐름도 하나. 단순하면 생략}
+
+# 검증 근거
+- ✅/⚠️/❌ {확인한 질문} — {방법: 열어 본 파일:라인, grep 패턴, 대조한 코드} → {결과}
+(3~6개, 비자명한 것만)
+
+# 미확인
+- {못 본 것} — {이유와 확인 방법}
+(없으면 생략)
+
+# 산입하지 않은 것
+- {diff 밖 동종 결함, 이 PR 탓이 아닌 것, 다른 리뷰어가 이미 짚은 것} — 이유
+(없으면 생략)
+```
 2) 출력의 맨 마지막에 아래 펜스로 **판정 + 지적 목록**만 내보낸다. 마크다운 본문은 이 JSON 안에 넣지 않는다:
 ```json
 {"verdict":"approve|comment|request_changes","score":<0-5>,"blocking_issues":["suspicious-instruction 같은 엔진 규칙 위반만"],
  "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
-   "symbol":"<함수·컴포넌트 이름>","claim":"<한 문장: 무엇이 틀렸나>","repro":"<어떤 입력·상태에서 무엇이 잘못 나오나>",
-   "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>","fix":"<고치는 방법, 대안이 있으면 A/B>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>","end_line":<fix_code 가 line~end_line 구간을 통째로 바꿀 때 마지막 줄 번호, 아니면 null>,"fix_code":"<선택: 여러 줄 수정 후 코드>"}]}
+   "symbol":"<함수·컴포넌트 이름>",
+   "title":"<스레드 제목 한 줄: 작성자나 사용자가 겪게 될 일. 35자 안팎>",
+   "claim":"<왜 그런지 1~3문장>",
+   "repro_case":{"input":"<상황·입력>","expected":"<기대>","actual":"<실제>"} 또는 null,
+   "repro":"<표로 쓰기 어려운 재현이면 한두 문장, 아니면 빈 문자열>",
+   "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>",
+   "rule":"<근거가 된 팀 가이드·레포 규칙 한 줄, 없으면 빈 문자열>",
+   "refs":["<함께 보면 좋은 같은 레포 코드 위치 path:시작-끝, 최대 2개>"],
+   "fix":"<고치는 방법 한두 문장>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>","end_line":<fix_code 가 line~end_line 구간을 통째로 바꿀 때 마지막 줄 번호, 아니면 null>,"fix_code":"<선택: 여러 줄 수정 코드>"}]}
 ```
-- findings 는 본문 `# 발견`·`# 질문`에 적은 항목과 같아야 한다(없으면 []). blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
-- line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 본문에만 남는다.
+글쓰기 규칙:
+- title 은 원인이 아니라 겪게 될 일로 쓴다.
+  예) "redirect 에 pathname 만 담아 쿼리가 사라진다" 대신 "로그인하고 돌아오면 필터와 페이지가 초기화됩니다".
+- claim·fix·repro 는 한 문장에 한 가지만, 60자 안팎으로 쓴다. "~합니다"체로 쓴다. 코드는 백틱으로 감싼다.
+- repro_case 는 동작이 틀린 지적에만 쓴다. 상황·기대·실제는 각각 짧은 구절로 쓴다.
+- refs 는 지적을 이해하는 데 필요한 다른 곳(호출부, 같은 패턴을 쓰는 곳)만 넣는다. 지적한 그 줄 자체는 넣지 않는다.
+지적 규칙:
+- 지적은 findings 에만 쓴다. 본문에 지적 목록(# 발견, # 질문)을 쓰지 않는다. 질문은 severity "question" 으로 넣는다.
+- blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
+- line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 코드가 본문 목록에 적는다.
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
 - suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다.
-- fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 그러면 작성자가 버튼 한 번으로 적용할 수 있는 제안(suggestion)으로 달린다. 구간이 이어지지 않거나 diff 밖이거나 30줄을 넘으면 end_line 은 null 로 두고, fix_code 는 일반 코드 블록으로 달린다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
+- fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 그러면 작성자가 버튼 한 번으로 적용할 수 있는 제안(suggestion)으로 달린다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
+- end_line 이 null 이면 fix_code 는 바뀌는 줄만 diff 형식으로 쓴다(`-` 지울 줄, `+` 넣을 줄, 앞뒤 한두 줄은 공백으로 시작).
 - major·minor 는 fix·suggestion·fix_code 중 하나가 있어야 인라인으로 달린다. 고치는 방법을 모르면 question 으로 내린다.
 - 재리뷰 블록이 있으면 JSON 에 `"followups":[{"id":"<이전 지적 f:id>","status":"resolved|partial|unresolved|wont_fix|withdrawn","note":"<근거 한 줄>"}]` 를 이전 지적마다 하나씩 넣는다.
 - 이 JSON 은 게이트 판정과 인라인 코멘트 게시에 쓰인다."#;
@@ -470,6 +506,31 @@ pub struct Finding {
     /// Last line of the range `fix_code` replaces (`line` is the first).
     #[serde(default)]
     pub end_line: Option<u64>,
+    /// One-line headline: what the author or a user runs into. Shown bold as
+    /// the first line of the thread; falls back to the claim's first sentence.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub title: String,
+    /// The team-guide or repo rule the finding rests on, if any.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub rule: String,
+    /// Same-repo code locations worth seeing (`path:10-14`). Posted as
+    /// permalinks, which GitHub expands into code snippets.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub refs: Vec<String>,
+    /// A behavior bug's case, shown as a one-row table.
+    #[serde(default)]
+    pub repro_case: Option<ReproCase>,
+}
+
+/// Situation → expected → actual, for a finding about wrong behavior.
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct ReproCase {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub input: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub expected: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub actual: String,
 }
 
 impl Finding {
@@ -539,18 +600,188 @@ fn render_inline(f: &Finding) -> String {
     render_inline_with(f, false)
 }
 
-/// `as_range`: render `fix_code` as a `suggestion` (the caller verified the range).
-fn render_inline_with(f: &Finding, as_range: bool) -> String {
-    let (emoji, label) = severity_label(&f.severity);
-    let conf = f.confidence.map(|c| format!(" (확신 {c:.0})")).unwrap_or_default();
-    let mut out = format!("{emoji} **{label}**{conf} — {}", f.claim.trim());
-    // What breaks and how to fix it stay open; where it was verified is one
-    // click away, so the thread reads as a short comment rather than a report.
-    for (name, v) in [("재현", &f.repro), ("수정", &f.fix)] {
-        if !v.trim().is_empty() {
-            out.push_str(&format!("\n\n**{name}**: {}", v.trim()));
-        }
+#[cfg(test)]
+pub(crate) fn render_inline_for_test(f: &Finding) -> String {
+    render_inline(f)
+}
+
+/// Rank for ordering findings: blockers first, questions last.
+pub(crate) fn severity_rank(sev: &str) -> u8 {
+    match sev {
+        "blocker" => 0,
+        "major" => 1,
+        "minor" => 2,
+        "nit" => 3,
+        _ => 4,
     }
+}
+
+/// What the author is asked to do, stated in words rather than left to the
+/// severity icon. Chosen by code so every thread ends the same way.
+fn action_line(sev: &str) -> &'static str {
+    match sev {
+        "blocker" => "**머지 전에 고쳐 주세요.**",
+        "major" => "머지 전에 고치는 것을 권합니다.",
+        "minor" => "고치면 좋습니다. 이번 PR 에서 하지 않아도 됩니다.",
+        "nit" => "참고만 해 주세요.",
+        _ => "의도한 동작인지 답글로 알려 주세요.",
+    }
+}
+
+/// The bold headline of a finding: the model's `title`, else the claim's first
+/// sentence.
+pub(crate) fn finding_title(f: &Finding) -> String {
+    let t = f.title.trim();
+    if !t.is_empty() {
+        return t.trim_end_matches('.').to_string();
+    }
+    let claim = f.claim.trim();
+    let first = sentence_lines(claim);
+    first.lines().next().unwrap_or(claim).trim().trim_end_matches('.').to_string()
+}
+
+/// One sentence per line. GitHub keeps single newlines in comments, so a
+/// three-sentence paragraph reads as three short lines. Only Korean sentence
+/// ends (`다. ` `요. `) outside inline code are split, so `a.b` stays put.
+pub(crate) fn sentence_lines(text: &str) -> String {
+    let chars: Vec<char> = text.trim().chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut in_code = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '`' {
+            in_code = !in_code;
+        }
+        out.push(c);
+        let ends = !in_code
+            && c == '.'
+            && i > 0
+            && matches!(chars[i - 1], '다' | '요')
+            && chars.get(i + 1) == Some(&' ');
+        if ends {
+            out.push('\n');
+            i += 2; // drop the space that followed the period
+            continue;
+        }
+        i += 1;
+    }
+    out
+}
+
+fn table_cell(s: &str) -> String {
+    s.trim().replace('\n', " ").replace('|', "\\|")
+}
+
+/// Unified-diff shaped code: every non-empty line starts with `+`, `-`, a
+/// space or `@@`, and at least one is a change.
+fn looks_like_diff(code: &str) -> bool {
+    let lines: Vec<&str> = code.lines().filter(|l| !l.trim().is_empty()).collect();
+    !lines.is_empty()
+        && lines.iter().any(|l| l.starts_with('+') || l.starts_with('-'))
+        && lines.iter().all(|l| l.starts_with(['+', '-', ' ']) || l.starts_with("@@"))
+}
+
+/// `path:10` or `path:10-14` with a plausible repo path. Anything else is
+/// dropped rather than linked to a file that may not exist.
+fn valid_ref(r: &str) -> bool {
+    let Some((path, lines)) = r.trim().rsplit_once(':') else { return false };
+    let ok_path = !path.is_empty() && !path.contains(char::is_whitespace) && !path.contains("..") && !path.starts_with('/');
+    let nums: Vec<&str> = lines.split('-').collect();
+    let parsed: Vec<u64> = nums.iter().filter_map(|n| n.parse().ok()).collect();
+    ok_path
+        && (1..=2).contains(&nums.len())
+        && parsed.len() == nums.len()
+        && parsed[0] > 0
+        && parsed.last().is_some_and(|e| *e >= parsed[0] && e - parsed[0] <= 40)
+}
+
+/// Placeholder for a permalink; `layout::expand_permalinks` turns it into a
+/// URL once the repo and head commit are known.
+pub(crate) const PERMALINK_OPEN: &str = "{{permalink:";
+
+/// Hidden line with what the visible text no longer shows. The follow-up
+/// round and the feedback tally read severity and confidence from it.
+fn meta_line(f: &Finding) -> String {
+    let c = f.confidence.map(|c| format!(" c:{c:.0}")).unwrap_or_default();
+    format!("<!-- meta sev:{}{c} -->", f.severity)
+}
+
+/// What a posted finding thread says about itself: severity, confidence and
+/// headline. Reads the hidden meta line; threads posted before it existed
+/// (`🔴 **blocker** (확신 90) — claim`) are read from their first line.
+pub(crate) struct InlineHead {
+    pub severity: String,
+    pub confidence: Option<u32>,
+    pub title: String,
+}
+
+pub(crate) fn parse_inline_head(body: &str) -> InlineHead {
+    const SEVERITIES: [&str; 4] = ["blocker", "major", "minor", "nit"];
+    if let Some(start) = body.find("<!-- meta ") {
+        let rest = &body[start + "<!-- meta ".len()..];
+        let meta = rest.split("-->").next().unwrap_or("");
+        let mut severity = "question".to_string();
+        let mut confidence = None;
+        for tok in meta.split_whitespace() {
+            if let Some(v) = tok.strip_prefix("sev:") {
+                severity = v.to_string();
+            } else if let Some(v) = tok.strip_prefix("c:") {
+                confidence = v.parse().ok();
+            }
+        }
+        let title = body
+            .split("**")
+            .nth(1)
+            .filter(|t| !t.contains('\n'))
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        return InlineHead { severity, confidence, title };
+    }
+    let first = body.lines().next().unwrap_or("");
+    let severity = SEVERITIES
+        .into_iter()
+        .find(|s| first.contains(&format!("**{s}**")))
+        .unwrap_or("question")
+        .to_string();
+    let confidence = first
+        .split_once("(확신 ")
+        .and_then(|(_, r)| r.split(')').next()?.trim().parse().ok());
+    let title = first.split_once(" — ").map(|(_, c)| c.trim()).unwrap_or(first).to_string();
+    InlineHead { severity, confidence, title }
+}
+
+/// `as_range`: render `fix_code` as a `suggestion` (the caller verified the range).
+///
+/// Reads top to bottom as: headline (what goes wrong) → why, one sentence per
+/// line → the case → what to do → the code → evidence, folded. Confidence is
+/// for the gate, not the author, so it only lives in the hidden meta line.
+fn render_inline_with(f: &Finding, as_range: bool) -> String {
+    let (emoji, _) = severity_label(&f.severity);
+    let head = format!("{emoji} **{}**", finding_title(f));
+    // A blocker is the one thing that should stop the eye.
+    let mut out = if f.severity == "blocker" { format!("> [!CAUTION]\n> {head}") } else { head };
+    let claim = f.claim.trim();
+    if !claim.is_empty() && claim.trim_end_matches('.') != finding_title(f) {
+        out.push_str(&format!("\n\n{}", sentence_lines(claim)));
+    }
+    match &f.repro_case {
+        Some(r) if [&r.input, &r.expected, &r.actual].iter().all(|v| !v.trim().is_empty()) => {
+            out.push_str(&format!(
+                "\n\n| 상황 | 기대 | 실제 |\n|---|---|---|\n| {} | {} | {} |",
+                table_cell(&r.input),
+                table_cell(&r.expected),
+                table_cell(&r.actual)
+            ));
+        }
+        _ if !f.repro.trim().is_empty() => out.push_str(&format!("\n\n{}", sentence_lines(&f.repro))),
+        _ => {}
+    }
+    if !f.fix.trim().is_empty() {
+        out.push_str(&format!("\n\n{}", sentence_lines(&f.fix)));
+    }
+    out.push_str(&format!("\n\n{}", action_line(&f.severity)));
     if !f.suggestion.trim().is_empty() {
         let code = f.suggestion.trim_end();
         let fe = fence(code);
@@ -558,16 +789,45 @@ fn render_inline_with(f: &Finding, as_range: bool) -> String {
     } else if !f.fix_code.trim().is_empty() {
         let code = f.fix_code.trim_end();
         let fe = fence(code);
-        if as_range {
-            out.push_str(&format!("\n\n{fe}suggestion\n{code}\n{fe}"));
+        let lang = if as_range {
+            "suggestion"
+        } else if looks_like_diff(code) {
+            "diff"
         } else {
-            out.push_str(&format!("\n\n{fe}\n{code}\n{fe}"));
-        }
+            ""
+        };
+        out.push_str(&format!("\n\n{fe}{lang}\n{code}\n{fe}"));
+    }
+    let refs: Vec<&String> = f.refs.iter().filter(|r| valid_ref(r)).take(2).collect();
+    let mut evidence: Vec<String> = Vec::new();
+    if !f.rule.trim().is_empty() {
+        evidence.push(format!("팀 규칙: {}", f.rule.trim()));
     }
     if !f.evidence.trim().is_empty() {
-        out.push_str(&format!("\n\n<details>\n<summary>근거</summary>\n\n{}\n\n</details>", f.evidence.trim()));
+        evidence.push(sentence_lines(&f.evidence));
     }
-    out.push_str(&format!("\n\n<!-- f:{} -->", finding_id(&f.path, &f.symbol, &f.claim)));
+    for r in refs {
+        evidence.push(format!("{PERMALINK_OPEN}{}}}}}", r.trim()));
+    }
+    if !evidence.is_empty() {
+        out.push_str(&format!("\n\n<details>\n<summary>근거</summary>\n\n{}\n\n</details>", evidence.join("\n\n")));
+    }
+    out.push_str(&format!("\n\n{}", meta_line(f)));
+    out.push_str(&format!("\n<!-- f:{} -->", finding_id(&f.path, &f.symbol, &f.claim)));
+    out
+}
+
+/// Findings that did not become a thread (no inline line, below the inline
+/// confidence, a nit or question, or inline comments turned off). These are
+/// the only findings the review body lists — the rest already have a thread.
+pub fn unposted<'a>(findings: &'a [Finding], posted: &[&str]) -> Vec<&'a Finding> {
+    let ids: Vec<String> = posted.iter().filter_map(|b| crate::rereview::marker_id(b)).collect();
+    let mut out: Vec<&Finding> = findings
+        .iter()
+        .filter(|f| !f.claim.trim().is_empty())
+        .filter(|f| !ids.contains(&finding_id(&f.path, &f.symbol, &f.claim)))
+        .collect();
+    out.sort_by_key(|f| severity_rank(&f.severity));
     out
 }
 
@@ -873,15 +1133,8 @@ fn run_claude(
             // real blockers come from findings. Both stop the gate.
             let mut blocking_issues = v.blocking();
             blocking_issues.extend(split.blockers);
-            let mut body = body;
-            if !split.unanchored.is_empty() {
-                body.push_str("\n\n# 줄을 짚지 못한 지적\n\n");
-                for f in &split.unanchored {
-                    let (emoji, label) = severity_label(&f.severity);
-                    let at = if f.path.is_empty() { String::new() } else { format!("`{}` ", f.path) };
-                    body.push_str(&format!("- {emoji} **{label}** {at}— {}\n", f.claim.trim()));
-                }
-            }
+            // Findings without a thread are listed by `layout::compose_body`
+            // when the review is posted, so the body here stays the model's.
             // Legacy output (no findings) still posts its inline comments.
             let inline = if v.findings.is_empty() {
                 filter_inline(v.inline_comments, diff)
@@ -1305,8 +1558,9 @@ mod tests {
         ];
         let s = split_findings(&fs, SAMPLE_DIFF);
         assert_eq!(s.inline.len(), 1, "only the confident, anchored blocker goes inline");
-        assert!(s.inline[0].body.starts_with("🔴 **blocker** (확신 90) — 빈 목록이 통과"));
-        assert!(s.inline[0].body.contains("**재현**: 빈 배열이면 통과"));
+        assert!(s.inline[0].body.starts_with("> [!CAUTION]\n> 🔴 **빈 목록이 통과**"), "{}", s.inline[0].body);
+        assert!(s.inline[0].body.contains("\n\n빈 배열이면 통과\n\n"));
+        assert!(s.inline[0].body.contains("<!-- meta sev:blocker c:90 -->"));
         assert!(s.inline[0].body.contains("<!-- f:"));
         assert_eq!(s.blockers, vec!["빈 목록이 통과 (src/x.ts)".to_string()]);
         let un: Vec<&str> = s.unanchored.iter().map(|f| f.claim.as_str()).collect();
@@ -1474,21 +1728,88 @@ mod tests {
     }
 
     #[test]
-    fn inline_comment_leads_with_claim_repro_fix_and_folds_the_evidence() {
-        let mut f = finding("major", 85.0, "src/x.ts", Some(11), "빈 목록이 통과");
+    fn inline_reads_title_why_case_action_code_then_folded_evidence() {
+        let mut f = finding("major", 85.0, "src/x.ts", Some(11), "빈 배열을 거르지 않습니다. 그래서 빈 목록이 그대로 저장됩니다.");
+        f.title = "빈 목록이 저장됩니다".into();
+        f.repro = String::new();
+        f.repro_case = Some(ReproCase { input: "`items = []`".into(), expected: "저장 거부".into(), actual: "빈 목록 | 저장".into() });
         f.fix_code = "if (!a?.length) return;".into();
+        f.rule = "빈 입력은 서버 전에 막는다".into();
+        f.refs = vec!["src/save.ts:10-14".into(), "../etc/passwd:1".into(), "src/a.ts:1-100".into()];
         let body = render_inline(&f);
         let at = |needle: &str| body.find(needle).unwrap_or_else(|| panic!("{needle} missing in {body}"));
-        assert!(at("빈 목록이 통과") < at("**재현**"));
-        assert!(at("**재현**") < at("**수정**"));
-        assert!(at("**수정**") < at("if (!a?.length) return;"));
+
+        assert!(body.starts_with("🟡 **빈 목록이 저장됩니다**\n\n"), "{body}");
+        // One sentence per line.
+        assert!(body.contains("빈 배열을 거르지 않습니다.\n그래서 빈 목록이 그대로 저장됩니다."), "{body}");
+        assert!(body.contains("| 상황 | 기대 | 실제 |\n|---|---|---|\n| `items = []` | 저장 거부 | 빈 목록 \\| 저장 |"), "{body}");
+        assert!(at("빈 배열을") < at("| 상황") && at("| 상황") < at("length 도 검사"));
+        assert!(at("length 도 검사") < at("머지 전에 고치는 것을 권합니다."));
+        assert!(at("머지 전에 고치는 것을 권합니다.") < at("if (!a?.length) return;"));
         assert!(at("if (!a?.length) return;") < at("<summary>근거</summary>"));
-        assert!(at("<summary>근거</summary>") < at("<!-- f:"));
-        assert!(body.contains("<summary>근거</summary>\n\nsrc/x.ts:11 확인\n\n</details>"));
-        assert!(!body.contains("**근거**"), "no longer an open paragraph");
-        // No evidence, no empty fold.
+        assert!(body.contains("팀 규칙: 빈 입력은 서버 전에 막는다"));
+        // Only the valid ref survives as a permalink placeholder.
+        assert!(body.contains("{{permalink:src/save.ts:10-14}}"), "{body}");
+        assert!(!body.contains("passwd") && !body.contains("src/a.ts:1-100"), "{body}");
+        // Confidence and the old labels are gone from the visible text.
+        assert!(!body.contains("확신") && !body.contains("**재현**") && !body.contains("**수정**"), "{body}");
+        assert!(at("<!-- meta sev:major c:85 -->") < at("<!-- f:"));
+        // Nothing to fold, no fold.
         f.evidence = String::new();
+        f.rule = String::new();
+        f.refs = vec![];
         assert!(!render_inline(&f).contains("<details>"));
+    }
+
+    #[test]
+    fn title_falls_back_to_the_claims_first_sentence() {
+        let f = finding("minor", 80.0, "src/x.ts", Some(11), "쿼리가 사라집니다. 그래서 필터가 풀립니다.");
+        assert_eq!(finding_title(&f), "쿼리가 사라집니다");
+        let body = render_inline(&f);
+        assert!(body.starts_with("🔵 **쿼리가 사라집니다**"), "{body}");
+        assert!(body.contains("고치면 좋습니다. 이번 PR 에서 하지 않아도 됩니다."));
+    }
+
+    #[test]
+    fn non_range_fix_code_in_diff_shape_gets_a_diff_fence() {
+        let mut f = finding("minor", 80.0, "src/x.ts", Some(11), "c");
+        f.fix_code = " const a = 1;\n-run(a);\n+run(a ?? 0);".into();
+        assert!(render_inline(&f).contains("```diff\n const a = 1;\n-run(a);\n+run(a ?? 0);\n```"));
+        f.fix_code = "run(a ?? 0);\nlog(a);".into();
+        assert!(render_inline(&f).contains("```\nrun(a ?? 0);\nlog(a);\n```"));
+    }
+
+    #[test]
+    fn sentence_lines_split_korean_sentence_ends_outside_code() {
+        assert_eq!(sentence_lines("값이 없습니다. 그래서 깨져요. 끝"), "값이 없습니다.\n그래서 깨져요.\n끝");
+        // `a.b` and a period inside inline code stay put.
+        assert_eq!(sentence_lines("`x.다. y` 를 씁니다. 다음"), "`x.다. y` 를 씁니다.\n다음");
+        assert_eq!(sentence_lines("e.g. 이런 경우"), "e.g. 이런 경우");
+    }
+
+    #[test]
+    fn head_is_read_from_meta_and_from_old_threads() {
+        let f = finding("major", 85.0, "src/x.ts", Some(11), "c");
+        let new = parse_inline_head(&render_inline(&f));
+        assert_eq!((new.severity.as_str(), new.confidence, new.title.as_str()), ("major", Some(85), "c"));
+        let old = parse_inline_head("🔴 **blocker** (확신 90) — 빈 목록이 통과\n\n<!-- f:abcd -->");
+        assert_eq!((old.severity.as_str(), old.confidence, old.title.as_str()), ("blocker", Some(90), "빈 목록이 통과"));
+        let blocker = parse_inline_head(&render_inline(&finding("blocker", 95.0, "a", Some(1), "막힘")));
+        assert_eq!((blocker.severity.as_str(), blocker.title.as_str()), ("blocker", "막힘"));
+    }
+
+    #[test]
+    fn body_lists_only_findings_without_a_thread_most_severe_first() {
+        let posted = finding("major", 90.0, "src/x.ts", Some(11), "스레드 있음");
+        let fs = vec![
+            finding("nit", 90.0, "src/x.ts", Some(11), "이름"),
+            posted.clone(),
+            finding("question", 90.0, "src/x.ts", Some(11), "의도인가요"),
+            finding("blocker", 90.0, "src/z.ts", None, "줄 없음"),
+        ];
+        let thread = render_inline(&posted);
+        let un: Vec<&str> = unposted(&fs, &[thread.as_str()]).iter().map(|f| f.claim.as_str()).collect();
+        assert_eq!(un, vec!["줄 없음", "이름", "의도인가요"]);
     }
 
     #[test]

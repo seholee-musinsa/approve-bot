@@ -250,14 +250,49 @@ impl Gate {
 /// The one-line outcome a follow-up summary opens with. Stated from the gate,
 /// not the model, so a held review never reads "Approve 합니다" — PR #1 said
 /// that in every round while the .npmrc gate kept it a comment.
-fn outcome_line(decision: &Gate, blocking: usize, score: &str, min: f64) -> String {
+///
+/// `counts` is the findings tally (`minor 2 · nit 1`). A held blocker gets
+/// GitHub's red CAUTION box — the one case that should stop the eye.
+fn outcome_line(decision: &Gate, counts: &str, blocking: usize, score: &str, min: f64) -> String {
     match decision {
-        Gate::Approve => format!("✅ **승인** · 점수 {score}/5"),
+        Gate::Approve => format!("✅ **승인** · {counts}"),
         Gate::HoldSensitive(files) => {
-            format!("👤 **사람 승인 필요** — 민감 파일 변경({}) · 점수 {score}/5", files.join(", "))
+            format!("👤 **사람 승인 필요** — 민감 파일 변경({}) · {counts}", files.join(", "))
         }
-        other => format!("⏸ **승인 보류** — {}", other.reason(blocking, score, min)),
+        Gate::HoldBlocking => format!("> [!CAUTION]\n> **머지 전에 고쳐야 할 지적이 있습니다** · {counts}"),
+        other => format!("⏸ **승인 보류** — {} · {counts}", other.reason(blocking, score, min)),
     }
+}
+
+/// Hold reasons other than the one the first line already states.
+fn other_notes(decision: &Gate, sensitive: &[String], omitted: &[String], continued: bool) -> String {
+    let sensitive: &[String] = if matches!(decision, Gate::HoldSensitive(_)) { &[] } else { sensitive };
+    let omitted: &[String] = if matches!(decision, Gate::HoldOmitted(_)) { &[] } else { omitted };
+    let continued = continued && !matches!(decision, Gate::HoldContinued);
+    gate_notes(sensitive, omitted, continued)
+}
+
+/// Hide the earlier rounds once the new one is up. Best-effort: a failure
+/// leaves them visible, which is how it was before.
+async fn hide_outdated(client: &GitHubClient, my_reviews: &[&crate::github::Review], head_sha: &str) {
+    for id in outdated_reviews(my_reviews, head_sha) {
+        if let Err(e) = client.minimize_review(id).await {
+            warn!(error = %e, "could not hide an outdated review");
+        }
+    }
+}
+
+/// My earlier engine reviews that a new round makes outdated: every one not on
+/// the current head. Hidden after the new round is posted, so the timeline
+/// shows one live review instead of a stack of overviews.
+fn outdated_reviews<'a>(reviews: &[&'a crate::github::Review], head_sha: &str) -> Vec<&'a str> {
+    reviews
+        .iter()
+        .filter(|r| marker_of(&r.body) != Marker::None)
+        .filter(|r| r.commit_id.as_deref() != Some(head_sha))
+        .filter(|r| !r.node_id.is_empty())
+        .map(|r| r.node_id.as_str())
+        .collect()
 }
 
 /// Approve only when every condition holds. `blocking_issues` is checked here
@@ -728,9 +763,32 @@ async fn handle_pr(
             outcome.continued,
             cfg.min_approve_score,
         );
-        // Every code-side hold reason goes on top, not just the first one the
-        // gate hit, so the body's own verdict is not mistaken for the outcome.
-        let notes = gate_notes(&sensitive, &outcome.omitted_files, outcome.continued);
+        // The first line states the outcome from the gate; every other hold
+        // reason goes right under it, so the body's own wording is never
+        // mistaken for the outcome.
+        let notes = other_notes(&decision, &sensitive, &outcome.omitted_files, outcome.continued);
+        // Threads carry permalink placeholders; resolve them against this head.
+        let expand = |b: &str| crate::layout::expand_permalinks(b, owner, repo, head_sha);
+        let inline: Vec<crate::github::ReviewComment> = if cfg.inline_comments_enabled {
+            outcome
+                .inline
+                .iter()
+                .map(|c| crate::github::ReviewComment { body: expand(&c.body), ..c.clone() })
+                .collect()
+        } else {
+            vec![]
+        };
+        let file_comments: Vec<crate::github::FileComment> = if cfg.inline_comments_enabled {
+            outcome
+                .file_comments
+                .iter()
+                .map(|c| crate::github::FileComment { body: expand(&c.body), ..c.clone() })
+                .collect()
+        } else {
+            vec![]
+        };
+        // Findings that got no thread are the only ones the body lists.
+        let posted: Vec<&str> = inline.iter().map(|c| c.body.as_str()).chain(file_comments.iter().map(|c| c.body.as_str())).collect();
         let body = match &round {
             // From the second review on, post a short summary of what changed
             // and fold the model's full review under it.
@@ -743,33 +801,45 @@ async fn handle_pr(
                         !r.prev.iter().any(|p| p.id == id)
                     })
                     .collect();
+                let counts = match crate::layout::counts_line(&new_findings).as_str() {
+                    "지적 없음" => "새 지적 없음".to_string(),
+                    c => format!("새 지적 {c}"),
+                };
+                let unposted: Vec<&crate::review::Finding> = crate::review::unposted(&outcome.findings, &posted)
+                    .into_iter()
+                    .filter(|f| new_findings.iter().any(|n| std::ptr::eq(*n, *f)))
+                    .collect();
                 crate::rereview::followup_summary(
                     r,
                     head_sha,
-                    &outcome_line(&decision, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
+                    &outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
+                    &notes,
                     &outcome.followups,
-                    &new_findings,
+                    &unposted,
                     &outcome.body,
                 )
             }
-            _ if notes.is_empty() || !outcome.finished_cleanly => outcome.body.clone(),
-            _ => format!("{notes}\n{}", outcome.body),
+            _ if outcome.finished_cleanly => {
+                let all: Vec<&crate::review::Finding> = outcome.findings.iter().collect();
+                let counts = crate::layout::counts_line(&all);
+                crate::layout::compose_body(
+                    &outcome.body,
+                    &outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
+                    &notes,
+                    &crate::review::unposted(&outcome.findings, &posted),
+                )
+            }
+            _ => outcome.body.clone(),
         };
         // Posted to GitHub with the marker; the in-app detail keeps the clean body.
         // A failed run gets its own marker so the next commit is re-reviewed.
         let marker = if outcome.finished_cleanly { REVIEW_MARKER } else { FAILED_MARKER };
-        // Only the copy sent to GitHub is folded; `detail` below keeps the original.
-        let inline: &[crate::github::ReviewComment] = if cfg.inline_comments_enabled {
-            &outcome.inline
-        } else {
-            &[]
-        };
-        let file_comments: &[crate::github::FileComment] =
-            if cfg.inline_comments_enabled { &outcome.file_comments } else { &[] };
         let posted_body = format!(
             "{marker}\n{}",
             crate::layout::with_reply_hint(&crate::layout::fold_sections(&body), inline.len() + file_comments.len())
         );
+        let inline: &[crate::github::ReviewComment] = &inline;
+        let file_comments: &[crate::github::FileComment] = &file_comments;
         let mut inline_str = if inline.is_empty() {
             String::new()
         } else {
@@ -788,6 +858,9 @@ async fn handle_pr(
             {
                 Ok(()) => {
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
+                    if round.is_some() {
+                        hide_outdated(client, &my_reviews, head_sha).await;
+                    }
                     if n > 0 {
                         inline_str.push_str(&format!(", 파일 스레드 {n}건"));
                     }
@@ -828,6 +901,9 @@ async fn handle_pr(
             {
                 Ok(()) => {
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
+                    if round.is_some() {
+                        hide_outdated(client, &my_reviews, head_sha).await;
+                    }
                     if n > 0 {
                         inline_str.push_str(&format!(", 파일 스레드 {n}건"));
                     }
@@ -1072,11 +1148,45 @@ mod tests {
     #[test]
     fn outcome_line_follows_the_gate_not_the_model() {
         use super::{outcome_line, Gate};
-        assert_eq!(outcome_line(&Gate::Approve, 0, "4.5", 4.0), "✅ **승인** · 점수 4.5/5");
-        let held = outcome_line(&Gate::HoldSensitive(vec![".npmrc".into()]), 0, "5.0", 4.0);
-        assert_eq!(held, "👤 **사람 승인 필요** — 민감 파일 변경(.npmrc) · 점수 5.0/5");
-        assert!(!held.contains("Approve"));
-        assert_eq!(outcome_line(&Gate::HoldBlocking, 2, "3.0", 4.0), "⏸ **승인 보류** — blocking 2건");
+        assert_eq!(outcome_line(&Gate::Approve, "minor 2", 0, "4.5", 4.0), "✅ **승인** · minor 2");
+        let held = outcome_line(&Gate::HoldSensitive(vec![".npmrc".into()]), "minor 4 · 질문 1", 0, "5.0", 4.0);
+        assert_eq!(held, "👤 **사람 승인 필요** — 민감 파일 변경(.npmrc) · minor 4 · 질문 1");
+        assert!(!held.contains("Approve") && !held.contains("/5"), "no score on the first line");
+        assert_eq!(
+            outcome_line(&Gate::HoldBlocking, "blocker 1", 1, "3.0", 4.0),
+            "> [!CAUTION]\n> **머지 전에 고쳐야 할 지적이 있습니다** · blocker 1"
+        );
+        assert_eq!(outcome_line(&Gate::HoldScore, "minor 1", 0, "3.5", 4.0), "⏸ **승인 보류** — 점수 3.5/5 < 4.0 · minor 1");
+    }
+
+    #[test]
+    fn notes_skip_the_reason_the_first_line_states() {
+        use super::{other_notes, Gate};
+        let s = vec![".npmrc".to_string()];
+        let o = vec!["big.ts".to_string()];
+        let n = other_notes(&Gate::HoldSensitive(s.clone()), &s, &o, false);
+        assert!(!n.contains("민감 파일") && n.contains("보지 못했습니다"), "{n}");
+        assert!(other_notes(&Gate::HoldSensitive(s.clone()), &s, &[], false).is_empty());
+    }
+
+    #[test]
+    fn a_new_round_hides_every_earlier_engine_review() {
+        use super::outdated_reviews;
+        use crate::github::{GhUser, Review};
+        let r = |body: &str, sha: &str, id: &str| Review {
+            user: GhUser { login: "me".into() },
+            state: "COMMENTED".into(),
+            commit_id: Some(sha.into()),
+            body: body.into(),
+            submitted_at: None,
+            node_id: id.into(),
+        };
+        let old = r("<!-- approve-bot:review -->\n본문", "aaa", "R1");
+        let failed = r("<!-- approve-bot:review-failed -->\n실패", "bbb", "R2");
+        let human = r("사람이 쓴 코멘트", "aaa", "R3");
+        let current = r("<!-- approve-bot:review -->\n방금 것", "head", "R4");
+        let all = vec![&old, &failed, &human, &current];
+        assert_eq!(outdated_reviews(&all, "head"), vec!["R1", "R2"]);
     }
 
     #[test]
