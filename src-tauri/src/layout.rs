@@ -361,7 +361,7 @@ pub fn compose_body(
     if !rest.trim().is_empty() {
         out.push_str(&format!("\n\n{}", rest.trim()));
     }
-    out
+    out.trim().to_string()
 }
 
 /// Turn `{{permalink:path:10-14}}` placeholders into commit-pinned links on
@@ -382,7 +382,8 @@ pub fn expand_permalinks(text: &str, owner: &str, repo: &str, sha: &str) -> Stri
         let rendered = match r.rsplit_once(':') {
             Some((path, lines)) if !sha.is_empty() && !owner.is_empty() => {
                 let anchor = match lines.split_once('-') {
-                    Some((a, b)) => format!("L{a}-L{b}"),
+                    Some((a, b)) if a != b => format!("L{a}-L{b}"),
+                    Some((a, _)) => format!("L{a}"),
                     None => format!("L{lines}"),
                 };
                 format!("https://github.com/{owner}/{repo}/blob/{sha}/{path}#{anchor}")
@@ -566,6 +567,8 @@ mod tests {
         assert!(out.ends_with("https://github.com/musinsa/repo/blob/abc123/b.ts#L3"), "{out}");
         assert_eq!(expand_permalinks(t, "", "", ""), "근거\n\n`src/a.ts:10-14`\n\n`b.ts:3`");
         assert_eq!(expand_permalinks("그대로", "o", "r", "s"), "그대로");
+        // A one-line range is a plain line anchor.
+        assert_eq!(expand_permalinks("{{permalink:d.md:1192-1192}}", "o", "r", "s"), "https://github.com/o/r/blob/s/d.md#L1192");
     }
 
     fn summary() -> crate::review::ReviewSummary {

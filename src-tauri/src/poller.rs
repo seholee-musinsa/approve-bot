@@ -87,6 +87,14 @@ enum DocsOnlyStep {
     Review,
 }
 
+/// The commits since my last review change nothing a review would look at:
+/// only docs/tests, or no file at all (core-partner-frontend#5243 round 5 ran a
+/// full Opus review, $2.60, on an empty delta). A failed compare never gets
+/// here — `build_round` returns no round and the PR is reviewed in full.
+fn nothing_to_review(delta_diff: &str) -> bool {
+    crate::diffprep::changed_paths(delta_diff).is_empty() || crate::rereview::only_docs_or_tests(delta_diff)
+}
+
 fn docs_only_step(action: &ReviewAction, docs_only: bool) -> DocsOnlyStep {
     match (action, docs_only) {
         (ReviewAction::ApproveOnly, true) => DocsOnlyStep::Reapprove,
@@ -257,10 +265,21 @@ fn outcome_line(decision: &Gate, counts: &str, blocking: usize, score: &str, min
     match decision {
         Gate::Approve => format!("✅ **승인** · {counts}"),
         Gate::HoldSensitive(files) => {
-            format!("👤 **사람 승인 필요** — 민감 파일 변경({}) · {counts}", files.join(", "))
+            format!("👤 **사람 승인 필요** — 민감 파일 변경({}) · {counts}", short_files(files))
         }
         Gate::HoldBlocking => format!("> [!CAUTION]\n> **머지 전에 고쳐야 할 지적이 있습니다** · {counts}"),
         other => format!("⏸ **승인 보류** — {} · {counts}", other.reason(blocking, score, min)),
+    }
+}
+
+/// One file named, the rest counted: `` `release.yml` 외 3개 ``. The first line
+/// of ads-sdk#47 listed four full workflow paths.
+fn short_files(files: &[String]) -> String {
+    let name = |p: &String| p.rsplit('/').next().unwrap_or(p).to_string();
+    match files {
+        [] => String::new(),
+        [one] => format!("`{}`", name(one)),
+        [first, rest @ ..] => format!("`{}` 외 {}개", name(first), rest.len()),
     }
 }
 
@@ -583,9 +602,7 @@ async fn handle_pr(
                 round = build_round(client, owner, repo, pr, &my_reviews, me).await;
                 // Docs/tests-only commits never get a new review. Anything else
                 // is followed up, not waved through.
-                let docs_only = round
-                    .as_ref()
-                    .is_some_and(|r| crate::rereview::only_docs_or_tests(&r.delta_diff));
+                let docs_only = round.as_ref().is_some_and(|r| nothing_to_review(&r.delta_diff));
                 match docs_only_step(&action, docs_only) {
                     DocsOnlyStep::Reapprove => {
                         let prior = my_reviews
@@ -609,7 +626,7 @@ async fn handle_pr(
                                 pr_title: Some(pr.title.clone()),
                                 author: Some(pr.user.login.clone()),
                                 url: Some(pr.html_url.clone()),
-                                message: "문서·테스트만 바뀌어 재리뷰 생략 (직전 리뷰 결과 유지)".into(),
+                                message: "문서·테스트만 바뀌었거나 바뀐 파일이 없어 재리뷰 생략 (직전 리뷰 결과 유지)".into(),
                                 detail: None,
                             },
                         )
@@ -862,6 +879,7 @@ async fn handle_pr(
                     owner,
                     repo,
                     pr.number,
+                    head_sha,
                     Some(posted_body.as_str()),
                     inline,
                 )
@@ -907,7 +925,7 @@ async fn handle_pr(
             // COMMENT (substantive body still delivered), but do NOT approve.
             let why = decision.reason(outcome.blocking_issues.len(), &score_str, cfg.min_approve_score);
             match client
-                .comment_pull(owner, repo, pr.number, &posted_body, inline)
+                .comment_pull(owner, repo, pr.number, head_sha, &posted_body, inline)
                 .await
             {
                 Ok(()) => {
@@ -946,7 +964,7 @@ async fn handle_pr(
 
     // ── Legacy blind approve (review engine disabled) ──
     match client
-        .approve_pull(owner, repo, pr.number, Some(&cfg.approval_message))
+        .approve_pull(owner, repo, pr.number, &pr.head.sha, Some(&cfg.approval_message))
         .await
     {
         Ok(()) => {
@@ -994,7 +1012,7 @@ async fn approve_only(
 ) {
     // Already reviewed earlier — approve with NO body (a bare approval, no
     // comment on the PR). The prior review already carries the substance.
-    match client.approve_pull(owner, repo, pr.number, None).await {
+    match client.approve_pull(owner, repo, pr.number, &pr.head.sha, None).await {
         Ok(()) => {
             push_and_emit(
                 app,
@@ -1145,6 +1163,14 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_delta_has_nothing_to_review() {
+        use super::nothing_to_review;
+        assert!(nothing_to_review(""), "no file changed");
+        assert!(nothing_to_review("diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-a\n+b\n"));
+        assert!(!nothing_to_review("diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b\n"));
+    }
+
+    #[test]
     fn docs_only_push_after_a_held_review_is_skipped() {
         use super::{docs_only_step, DocsOnlyStep, ReviewAction};
         // PR #1 round 8: README-only push on a PR held by the .npmrc gate.
@@ -1161,7 +1187,15 @@ mod tests {
         use super::{outcome_line, Gate};
         assert_eq!(outcome_line(&Gate::Approve, "minor 2", 0, "4.5", 4.0), "✅ **승인** · minor 2");
         let held = outcome_line(&Gate::HoldSensitive(vec![".npmrc".into()]), "minor 4 · 질문 1", 0, "5.0", 4.0);
-        assert_eq!(held, "👤 **사람 승인 필요** — 민감 파일 변경(.npmrc) · minor 4 · 질문 1");
+        assert_eq!(held, "👤 **사람 승인 필요** — 민감 파일 변경(`.npmrc`) · minor 4 · 질문 1");
+        let many: Vec<String> = [".github/workflows/release.yml", ".github/workflows/version-sdk.yml", "scripts/setup.sh"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            outcome_line(&Gate::HoldSensitive(many), "새 지적 없음", 0, "5.0", 4.0),
+            "👤 **사람 승인 필요** — 민감 파일 변경(`release.yml` 외 2개) · 새 지적 없음"
+        );
         assert!(!held.contains("Approve") && !held.contains("/5"), "no score on the first line");
         assert_eq!(
             outcome_line(&Gate::HoldBlocking, "blocker 1", 1, "3.0", 4.0),
