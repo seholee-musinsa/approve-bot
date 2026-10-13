@@ -308,15 +308,43 @@ fn merge_second_pass(first: &mut ReviewOutcome, second: ReviewOutcome) {
             first.verdict = "comment".into();
         }
     }
+    let added = new_findings.len();
     first.findings.extend(new_findings);
-    let body = second.body.trim();
-    let body = body.strip_prefix("# 재점검").unwrap_or(body).trim();
-    first.body.push_str(&format!("
+    let checks = recheck_section(&second.body);
+    let body = match (checks.is_empty(), added) {
+        (true, 0) => "재점검 결과 추가 지적 없음.".to_string(),
+        (true, n) => format!("재점검에서 새 지적 {n}건을 찾았습니다."),
+        (false, _) => checks,
+    };
+    first.body.push_str(&format!("\n\n# 권한·계약 재점검\n\n{body}\n"));
+}
 
-# 권한·계약 재점검
-
-{body}
-"));
+/// The `# 재점검` section of a second-pass body, without its heading. The
+/// second pass is asked for that section only, but the model sometimes writes a
+/// whole review around it (`# 총평`, `# 이전 지적 처리`, `# 발견` …), which
+/// used to be pasted in verbatim and repeated the first review inside itself.
+/// Everything outside the section is dropped; the findings travel separately
+/// through the JSON fence. No such section → empty.
+fn recheck_section(body: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut inside = false;
+    let mut in_fence = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.starts_with("# ") {
+            if inside {
+                break;
+            }
+            inside = line.trim_start_matches("# ").trim().starts_with("재점검");
+            continue;
+        }
+        if inside {
+            out.push(line);
+        }
+    }
+    out.join("\n").trim().to_string()
 }
 
 /// Deep-mode `preview_prompt`: clones like a real review so the value-trace
@@ -466,7 +494,7 @@ pub fn finding_id(path: &str, symbol: &str, claim: &str) -> String {
     format!("{h:08x}")
 }
 
-fn severity_label(sev: &str) -> (&'static str, &'static str) {
+pub(crate) fn severity_label(sev: &str) -> (&'static str, &'static str) {
     match sev {
         "blocker" => ("🔴", "blocker"),
         "major" => ("🟡", "major"),
@@ -941,10 +969,16 @@ pub fn review_pr(
 /// model explores it read-only (Read/Grep/Glob). `second_pass` adds the
 /// authorization/contract re-check. Clone failure falls back to diff-only.
 /// Blocking.
+///
+/// `round_block` is the follow-up instructions (`rereview::render`), or empty.
+/// It goes to the main pass only: it tells the model to write `# 총평` and
+/// `# 이전 지적 처리`, and a second pass that saw it wrote a whole second
+/// review into the re-check section.
 #[allow(clippy::too_many_arguments)]
 pub fn review_pr_deep_at(
     guide: &str,
     meta: &str,
+    round_block: &str,
     diff: &str,
     model: &str,
     thinking_tokens: u32,
@@ -960,11 +994,19 @@ pub fn review_pr_deep_at(
         Some(sha) => sha.to_string(),
         None => format!("pull/{number}/head"),
     };
+    let base_meta = meta;
+    let with_round = |m: &str| {
+        if round_block.trim().is_empty() {
+            m.to_string()
+        } else {
+            format!("{m}\n\n{round_block}")
+        }
+    };
     let cloned = match clone_ref(owner, repo, &refspec, token) {
         Ok(dir) => dir,
         Err(e) => {
             eprintln!("[review] clone 실패 → diff-only 폴백: {e}");
-            return review_pr(guide, meta, diff, model, thinking_tokens);
+            return review_pr(guide, &with_round(base_meta), diff, model, thinking_tokens);
         }
     };
     let prepared = crate::diffprep::prepare(diff, crate::diffprep::DIFF_BUDGET);
@@ -975,7 +1017,8 @@ pub fn review_pr_deep_at(
     } else {
         String::new()
     };
-    let meta = if trace.is_empty() { meta.to_string() } else { format!("{meta}\n\n{trace}") };
+    let base_meta = if trace.is_empty() { base_meta.to_string() } else { format!("{base_meta}\n\n{trace}") };
+    let meta = with_round(&base_meta);
     let rendered = prepared.render();
     let prompt = build_prompt(guide, &meta, &rendered, true);
     let opts = RunOpts {
@@ -988,7 +1031,7 @@ pub fn review_pr_deep_at(
     let mut outcome = run_claude(&prompt, model, thinking_tokens, diff, &opts);
     if second_pass && outcome.finished_cleanly {
         let guide2 = second_pass_guide(&outcome);
-        let prompt2 = build_prompt(&guide2, &meta, &rendered, true);
+        let prompt2 = build_prompt(&guide2, &base_meta, &rendered, true);
         let second = run_claude(&prompt2, model, thinking_tokens, diff, &opts);
         merge_second_pass(&mut outcome, second);
     }
@@ -1345,6 +1388,39 @@ mod tests {
     }
 
     #[test]
+    fn second_pass_that_writes_a_whole_review_keeps_only_the_recheck() {
+        // PR #1 round 8: the second pass saw the follow-up instructions and wrote
+        // `# 총평` + `# 이전 지적 처리` again, which landed inside the re-check.
+        let mut first = outcome(vec![], vec![]);
+        first.body = "# 총평\n\n문서만 바뀜.".into();
+        let mut second = outcome(vec![], vec![]);
+        second.body = "# 총평\n\n두 번째 총평\n\n# 이전 지적 처리 — 해소 7\n\n- ~~a~~\n\n\
+                       # 재점검\n\n- ✅ redirect — grep → 읽는 곳 없음\n\n# 발견\n\n- 중복"
+            .into();
+        merge_second_pass(&mut first, second);
+        assert_eq!(first.body.matches("# 총평").count(), 1, "{}", first.body);
+        assert!(!first.body.contains("이전 지적 처리"), "{}", first.body);
+        assert!(!first.body.contains("- 중복"), "{}", first.body);
+        assert!(first.body.contains("# 권한·계약 재점검\n\n- ✅ redirect"), "{}", first.body);
+    }
+
+    #[test]
+    fn second_pass_without_a_recheck_section_leaves_one_line() {
+        let mut first = outcome(vec![], vec![]);
+        let mut second = outcome(vec![], vec![]);
+        second.body = "# 총평\n\n전체 리뷰를 다시 씀".into();
+        merge_second_pass(&mut first, second);
+        assert!(first.body.ends_with("# 권한·계약 재점검\n\n재점검 결과 추가 지적 없음.\n"), "{}", first.body);
+        assert!(!first.body.contains("전체 리뷰를 다시 씀"));
+    }
+
+    #[test]
+    fn recheck_section_ignores_headings_inside_code_fences() {
+        let body = "# 재점검\n\n- ✅ a\n```md\n# 총평\n```\n- ❌ b\n\n# 총평\n\n버림";
+        assert_eq!(recheck_section(body), "- ✅ a\n```md\n# 총평\n```\n- ❌ b");
+    }
+
+    #[test]
     fn failed_second_pass_keeps_first_review() {
         let mut first = outcome(vec![], vec![]);
         merge_second_pass(&mut first, ReviewOutcome::fail_closed("boom"));
@@ -1623,6 +1699,7 @@ mod tests {
         let out = review_pr_deep_at(
             guide,
             meta,
+            "",
             &diff,
             "claude-sonnet-5-5",
             0,

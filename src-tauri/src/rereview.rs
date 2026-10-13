@@ -130,6 +130,106 @@ pub fn open_blockers(prev: &[PrevFinding], followups: &[Followup]) -> Vec<String
         .collect()
 }
 
+/// The status the model gave an earlier finding. No followup counts as
+/// unresolved, the same rule `open_blockers` uses.
+fn status_of<'a>(p: &PrevFinding, followups: &'a [Followup]) -> (&'a str, &'a str) {
+    followups
+        .iter()
+        .find(|f| f.id.trim().trim_start_matches("f:") == p.id)
+        .map(|f| (f.status.as_str(), f.note.as_str()))
+        .unwrap_or(("unresolved", ""))
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "resolved" => "해소",
+        "partial" => "부분",
+        "wont_fix" => "반영 안 함",
+        "withdrawn" => "철회",
+        _ => "미해소",
+    }
+}
+
+/// Body posted for a follow-up round, in place of the model's full review.
+///
+/// PR #1 got eight reviews of 3–4.6K characters each: every round repeated the
+/// overview, the gate banner and the seven already-resolved findings, while
+/// rounds 3–8 had nothing new. A follow-up only needs what changed — the
+/// outcome, earlier findings that are still open, and new findings — so that
+/// part is built here from structured data and the model's body is folded
+/// underneath for anyone who wants it.
+pub fn followup_summary(
+    round: &Round,
+    head_sha: &str,
+    outcome_line: &str,
+    followups: &[Followup],
+    new_findings: &[&crate::review::Finding],
+    full_body: &str,
+) -> String {
+    let files = crate::diffprep::changed_paths(&round.delta_diff).len();
+    let mut out = format!(
+        "# {}회차 재리뷰 · `{}` · 파일 {files}개 변경\n\n{outcome_line}\n",
+        round.number,
+        &head_sha[..head_sha.len().min(7)],
+    );
+
+    if !round.prev.is_empty() {
+        let mut counts = [0usize; 5];
+        let mut open: Vec<String> = Vec::new();
+        for p in &round.prev {
+            let (status, note) = status_of(p, followups);
+            let i = match status {
+                "resolved" => 0,
+                "partial" => 1,
+                "wont_fix" => 3,
+                "withdrawn" => 4,
+                _ => 2,
+            };
+            counts[i] += 1;
+            if (1..=3).contains(&i) {
+                let (icon, _) = crate::review::severity_label(&p.severity);
+                let at = p.line.map(|l| format!(":{l}")).unwrap_or_default();
+                let note = if note.trim().is_empty() { String::new() } else { format!(" — {}", note.trim()) };
+                open.push(format!("- {icon} {} · `{}{at}` {}{note}", status_label(status), p.path, p.claim));
+            }
+        }
+        out.push_str(&format!(
+            "\n**이전 지적 {}건** — 해소 {} · 부분 {} · 미해소 {} · 반영 안 함 {} · 철회 {}\n",
+            round.prev.len(),
+            counts[0],
+            counts[1],
+            counts[2],
+            counts[3],
+            counts[4]
+        ));
+        for line in open {
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    if new_findings.is_empty() {
+        out.push_str("\n**새 지적 없음**\n");
+    } else {
+        out.push_str(&format!("\n**새 지적 {}건**\n", new_findings.len()));
+        for f in new_findings {
+            let (icon, _) = crate::review::severity_label(&f.severity);
+            let at = match (f.path.is_empty(), f.line) {
+                (true, _) => String::new(),
+                (false, Some(l)) => format!(" `{}:{l}`", f.path),
+                (false, None) => format!(" `{}`", f.path),
+            };
+            out.push_str(&format!("- {icon}{at} {}\n", f.claim.trim()));
+        }
+    }
+
+    let full = crate::layout::fold_sections(full_body.trim());
+    if !full.is_empty() {
+        out.push_str(&format!("\n<details>\n<summary>전체 리뷰 보기</summary>\n\n{full}\n\n</details>\n"));
+    }
+    out
+}
+
 /// True when every changed file in `diff` is a doc or a test, so an earlier
 /// approval still stands without a new review.
 pub fn only_docs_or_tests(diff: &str) -> bool {
@@ -220,5 +320,60 @@ mod tests {
         assert!(render(&r(2)).contains("델타"));
         assert!(render(&r(4)).contains("새로 만든 blocker 만"));
         assert!(render(&r(2)).contains("직전 리뷰 커밋 abcdef12"));
+    }
+
+    fn prev(id: &str, sev: &str, path: &str, line: u64, claim: &str) -> PrevFinding {
+        PrevFinding { id: id.into(), severity: sev.into(), path: path.into(), line: Some(line), claim: claim.into() }
+    }
+
+    fn fu(id: &str, status: &str, note: &str) -> Followup {
+        Followup { id: id.into(), status: status.into(), note: note.into() }
+    }
+
+    const DELTA: &str = "diff --git a/src/a.ts b/src/a.ts\n--- a/src/a.ts\n+++ b/src/a.ts\n@@ -1 +1 @@\n-a\n+b\n\
+                         diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-x\n+y\n";
+
+    #[test]
+    fn followup_summary_lists_only_what_is_still_open_and_new() {
+        let round = Round {
+            number: 3,
+            prev_sha: "aaaaaaaa".into(),
+            prev: vec![
+                prev("1111", "minor", "src/a.ts", 10, "헤더가 사라짐"),
+                prev("2222", "major", "src/b.ts", 20, "권한 확인 없음"),
+                prev("3333", "minor", "src/c.ts", 30, "쿼리가 사라짐"),
+            ],
+            delta_diff: DELTA.into(),
+        };
+        let followups = vec![fu("f:1111", "resolved", "고침"), fu("2222", "partial", "쓰기만 막음")];
+        let mut f = crate::review::Finding::default();
+        f.severity = "minor".into();
+        f.path = "src/a.ts".into();
+        f.line = Some(1);
+        f.claim = "새로 생긴 문제".into();
+        let full = "# 총평\n\n긴 총평\n\n# 검증 근거\n\n- ✅ 확인";
+        let out = followup_summary(&round, "0123456789", "✅ **승인**", &followups, &[&f], full);
+
+        assert!(out.starts_with("# 3회차 재리뷰 · `0123456` · 파일 2개 변경\n\n✅ **승인**"), "{out}");
+        assert!(out.contains("**이전 지적 3건** — 해소 1 · 부분 1 · 미해소 1 · 반영 안 함 0 · 철회 0"), "{out}");
+        // Resolved items are counted, not re-listed.
+        assert!(!out.contains("헤더가 사라짐"), "{out}");
+        assert!(out.contains("- 🟡 부분 · `src/b.ts:20` 권한 확인 없음 — 쓰기만 막음"), "{out}");
+        // No followup for 3333 → unresolved, same as open_blockers.
+        assert!(out.contains("- 🔵 미해소 · `src/c.ts:30` 쿼리가 사라짐"), "{out}");
+        assert!(out.contains("**새 지적 1건**") && out.contains("- 🔵 `src/a.ts:1` 새로 생긴 문제"), "{out}");
+        // The model's own review is still there, folded.
+        assert!(out.contains("<summary>전체 리뷰 보기</summary>") && out.contains("긴 총평"), "{out}");
+        assert!(out.contains("<summary>검증 근거 1건</summary>"), "{out}");
+    }
+
+    #[test]
+    fn quiet_round_is_a_few_lines_plus_the_folded_review() {
+        let round = Round { number: 5, prev_sha: "a".into(), prev: vec![prev("1111", "minor", "a.ts", 1, "x")], delta_diff: DELTA.into() };
+        let out = followup_summary(&round, "abc", "👤 **사람 승인 필요**", &[fu("1111", "resolved", "")], &[], "# 총평\n\n본문");
+        let before_fold = out.split("<details>").next().unwrap();
+        assert!(before_fold.contains("**새 지적 없음**"), "{out}");
+        assert_eq!(before_fold.lines().filter(|l| l.starts_with("- ")).count(), 0, "{out}");
+        assert!(before_fold.len() < 300, "summary part stays short: {}", before_fold.len());
     }
 }
