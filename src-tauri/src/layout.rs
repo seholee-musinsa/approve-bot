@@ -110,6 +110,89 @@ pub fn findings_list(heading: &str, findings: &[&crate::review::Finding]) -> Str
     out
 }
 
+/// What the review covered, filled by code so it cannot be overstated.
+#[derive(Debug, Clone, Default)]
+pub struct Scope {
+    pub files: usize,
+    pub added: usize,
+    pub deleted: usize,
+    /// The model read the checked-out code, not just the diff.
+    pub explored: bool,
+    /// The authorization/contract second pass ran.
+    pub rechecked: bool,
+    /// Files past the diff budget got their own passes.
+    pub continued: bool,
+    /// Files the review never saw.
+    pub omitted: usize,
+}
+
+/// Files changed and lines added/deleted in a unified diff.
+pub fn diff_stats(diff: &str) -> (usize, usize, usize) {
+    let files = crate::diffprep::changed_paths(diff).len();
+    let mut added = 0;
+    let mut deleted = 0;
+    for l in diff.lines() {
+        if l.starts_with("+++") || l.starts_with("---") {
+            continue;
+        }
+        if l.starts_with('+') {
+            added += 1;
+        } else if l.starts_with('-') {
+            deleted += 1;
+        }
+    }
+    (files, added, deleted)
+}
+
+fn cell(s: &str) -> String {
+    s.trim().replace('\n', " ").replace('|', "\\|")
+}
+
+/// The report table at the top of a first review.
+///
+/// ```text
+/// | 리뷰 요약 | |
+/// |---|---|
+/// | **변경** | 서버 스펙에 맞춤<br>배경색 추천 기준 변경 |
+/// | **판단** | 결함 없음. … |
+/// | **머지 전 확인** | 새 테스트 실행 |
+/// | **리뷰 범위** | 파일 26개 (+522 −217) · 코드 직접 열람 · 2차 재점검 포함 |
+/// ```
+///
+/// The model fills the first three as short phrases (`summary`); the scope
+/// row is code. Rows with nothing to say are left out. Empty when the model
+/// gave no summary, so the caller keeps the prose overview instead.
+pub fn report_table(summary: &crate::review::ReviewSummary, scope: &Scope) -> String {
+    if summary.is_empty() {
+        return String::new();
+    }
+    let list = |items: &[String]| {
+        items.iter().map(|c| cell(c)).filter(|c| !c.is_empty()).collect::<Vec<_>>().join("<br>")
+    };
+    let mut rows: Vec<(&str, String)> = vec![
+        ("변경", list(&summary.changes)),
+        ("판단", cell(&summary.judgement)),
+        ("머지 전 확인", list(&summary.checks)),
+    ];
+    let mut covered = vec![format!("파일 {}개 (+{} −{})", scope.files, scope.added, scope.deleted)];
+    covered.push(if scope.explored { "코드 직접 열람".into() } else { "diff 만 확인".into() });
+    if scope.rechecked {
+        covered.push("2차 재점검 포함".into());
+    }
+    if scope.continued {
+        covered.push("큰 PR 이라 나눠서 리뷰".into());
+    }
+    if scope.omitted > 0 {
+        covered.push(format!("{}개 파일 못 봄", scope.omitted));
+    }
+    rows.push(("리뷰 범위", covered.join(" · ")));
+    let mut out = String::from("| 리뷰 요약 | |\n|---|---|\n");
+    for (k, v) in rows.into_iter().filter(|(_, v)| !v.is_empty()) {
+        out.push_str(&format!("| **{k}** | {v} |\n"));
+    }
+    out.trim_end().to_string()
+}
+
 /// Sections the posted body drops: the findings are listed by code (only the
 /// ones without a thread), so the model's own list would repeat the threads.
 const DROPPED: &[&str] = &["발견", "질문", "줄을 짚지 못한 지적"];
@@ -154,6 +237,25 @@ fn clean_overview(lines: &[String]) -> String {
     collapse_blank(&out.join("\n"))
 }
 
+/// Only the fenced blocks of some lines (a mermaid diagram), in order.
+fn fenced_only(lines: &[String]) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut in_fence = false;
+    for line in lines {
+        let opens = line.trim_start().starts_with("```");
+        if opens || in_fence {
+            out.push(line);
+        }
+        if opens {
+            in_fence = !in_fence;
+            if !in_fence {
+                out.push("");
+            }
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
 fn collapse_blank(s: &str) -> String {
     let mut out = String::new();
     let mut blank = 0;
@@ -188,7 +290,13 @@ fn collapse_blank(s: &str) -> String {
 ///
 /// Big `#` headings become `###`: the body is short now, and an H1 on GitHub
 /// is louder than anything in it deserves.
-pub fn compose_body(model_body: &str, verdict_line: &str, notes: &str, unposted: &[&crate::review::Finding]) -> String {
+pub fn compose_body(
+    model_body: &str,
+    verdict_line: &str,
+    notes: &str,
+    report: &str,
+    unposted: &[&crate::review::Finding],
+) -> String {
     let mut overview: Vec<String> = Vec::new();
     let mut rest = String::new();
     let mut title: Option<String> = None; // None = before the first heading
@@ -237,7 +345,12 @@ pub fn compose_body(model_body: &str, verdict_line: &str, notes: &str, unposted:
     if !notes.trim().is_empty() {
         out.push_str(&format!("\n{}", notes.trim()));
     }
-    let overview = clean_overview(&overview);
+    // The report table replaces the prose overview; a diagram the model drew
+    // there (mermaid) is kept under it.
+    let overview = if report.trim().is_empty() { clean_overview(&overview) } else { fenced_only(&overview) };
+    if !report.trim().is_empty() {
+        out.push_str(&format!("\n\n{}", report.trim()));
+    }
     if !overview.is_empty() {
         out.push_str(&format!("\n\n{overview}"));
     }
@@ -398,7 +511,7 @@ mod tests {
     #[test]
     fn composed_body_opens_with_the_gate_and_drops_the_model_lists() {
         let nit = f("nit", "같은 테스트를 두 번 돌립니다", "package.json", Some(13));
-        let out = compose_body(OLD_STYLE, "👤 **사람 승인 필요** — 민감 파일 변경(.npmrc) · minor 4 · 질문 1", "", &[&nit]);
+        let out = compose_body(OLD_STYLE, "👤 **사람 승인 필요** — 민감 파일 변경(.npmrc) · minor 4 · 질문 1", "", "", &[&nit]);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "👤 **사람 승인 필요** — 민감 파일 변경(.npmrc) · minor 4 · 질문 1");
         // Overview: no heading, one sentence per line, no score/verdict sentence, no count line.
@@ -419,11 +532,11 @@ mod tests {
     #[test]
     fn composed_body_keeps_mermaid_and_works_without_headings() {
         let body = "# 총평\n\n흐름입니다. 아래를 보세요.\n\n```mermaid\nflowchart LR\n  A. --> B\n```\n";
-        let out = compose_body(body, "✅ **승인** · 지적 없음", "> ⚠️ **게이트**: 큰 PR", &[]);
+        let out = compose_body(body, "✅ **승인** · 지적 없음", "> ⚠️ **게이트**: 큰 PR", "", &[]);
         assert!(out.starts_with("✅ **승인** · 지적 없음\n> ⚠️ **게이트**: 큰 PR\n\n흐름입니다.\n아래를 보세요."), "{out}");
         assert!(out.contains("```mermaid\nflowchart LR\n  A. --> B\n```"), "{out}");
         assert!(!out.contains("인라인에 달지 못한"));
-        let plain = compose_body("헤딩 없이 쓴 본문입니다.", "✅ **승인** · 지적 없음", "", &[]);
+        let plain = compose_body("헤딩 없이 쓴 본문입니다.", "✅ **승인** · 지적 없음", "", "", &[]);
         assert_eq!(plain, "✅ **승인** · 지적 없음\n\n헤딩 없이 쓴 본문입니다.");
     }
 
@@ -453,5 +566,45 @@ mod tests {
         assert!(out.ends_with("https://github.com/musinsa/repo/blob/abc123/b.ts#L3"), "{out}");
         assert_eq!(expand_permalinks(t, "", "", ""), "근거\n\n`src/a.ts:10-14`\n\n`b.ts:3`");
         assert_eq!(expand_permalinks("그대로", "o", "r", "s"), "그대로");
+    }
+
+    fn summary() -> crate::review::ReviewSummary {
+        crate::review::ReviewSummary {
+            changes: vec!["브랜드 DA 광고 제출을 서버 스펙에 맞춤".into(), "배경색 추천 기준 변경".into(), " ".into()],
+            judgement: "결함 없음. 우회 주소 `a|b` 도 막음".into(),
+            checks: vec![],
+        }
+    }
+
+    #[test]
+    fn report_table_has_fixed_rows_and_code_filled_scope() {
+        let scope = Scope { files: 26, added: 522, deleted: 217, explored: true, rechecked: true, ..Default::default() };
+        let t = report_table(&summary(), &scope);
+        assert_eq!(
+            t,
+            "| 리뷰 요약 | |\n|---|---|\n\
+             | **변경** | 브랜드 DA 광고 제출을 서버 스펙에 맞춤<br>배경색 추천 기준 변경 |\n\
+             | **판단** | 결함 없음. 우회 주소 `a\\|b` 도 막음 |\n\
+             | **리뷰 범위** | 파일 26개 (+522 −217) · 코드 직접 열람 · 2차 재점검 포함 |"
+        );
+        let thin = Scope { files: 1, added: 2, deleted: 0, omitted: 3, ..Default::default() };
+        assert!(report_table(&summary(), &thin).ends_with("| **리뷰 범위** | 파일 1개 (+2 −0) · diff 만 확인 · 3개 파일 못 봄 |"));
+        assert_eq!(report_table(&crate::review::ReviewSummary::default(), &scope), "", "no summary, no table");
+    }
+
+    #[test]
+    fn report_replaces_the_prose_overview_but_keeps_a_diagram() {
+        let body = "# 총평\n\n긴 총평입니다. 두 번째 문장입니다.\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n# 미확인\n\n- 빌드 — 못 봄\n";
+        let table = report_table(&summary(), &Scope { files: 2, added: 3, deleted: 1, explored: true, ..Default::default() });
+        let out = compose_body(body, "✅ **승인** · 지적 없음", "", &table, &[]);
+        assert!(out.starts_with("✅ **승인** · 지적 없음\n\n| 리뷰 요약 | |"), "{out}");
+        assert!(!out.contains("긴 총평"), "{out}");
+        assert!(out.contains("|\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n### 미확인"), "{out}");
+    }
+
+    #[test]
+    fn diff_stats_count_files_and_lines() {
+        let d = "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1,2 +1,2 @@\n-x\n+y\n+z\n ctx\ndiff --git a/b.ts b/b.ts\n--- a/b.ts\n+++ b/b.ts\n@@ -1 +0,0 @@\n-gone\n";
+        assert_eq!(diff_stats(d), (2, 2, 2));
     }
 }

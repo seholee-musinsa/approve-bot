@@ -822,10 +822,21 @@ async fn handle_pr(
             _ if outcome.finished_cleanly => {
                 let all: Vec<&crate::review::Finding> = outcome.findings.iter().collect();
                 let counts = crate::layout::counts_line(&all);
+                let (files, added, deleted) = crate::layout::diff_stats(&diff_for_gate);
+                let scope = crate::layout::Scope {
+                    files,
+                    added,
+                    deleted,
+                    explored: outcome.explored,
+                    rechecked: outcome.rechecked,
+                    continued: outcome.continued,
+                    omitted: outcome.omitted_files.len(),
+                };
                 crate::layout::compose_body(
                     &outcome.body,
                     &outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
                     &notes,
+                    &crate::layout::report_table(&outcome.summary, &scope),
                     &crate::review::unposted(&outcome.findings, &posted),
                 )
             }
