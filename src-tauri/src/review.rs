@@ -358,11 +358,24 @@ fn build_prompt(guide: &str, meta: &str, diff: &str, deep: bool) -> String {
     )
 }
 
+/// `#[serde(default)]` only covers a *missing* key — an explicit `null` still
+/// fails with `invalid type: null, expected a string`. The model does emit
+/// nulls in the verdict fence (`"symbol": null`, `"blocking_issues": null`),
+/// and one null used to throw away the whole review. Every field the model
+/// fills goes through here, so null and missing both land on the default.
+pub(crate) fn null_as_default<'de, D, T>(de: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(de)?.unwrap_or_default())
+}
+
 #[derive(Debug, Deserialize)]
 struct Envelope {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     result: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     is_error: bool,
     #[serde(default)]
     total_cost_usd: Option<f64>,
@@ -370,47 +383,61 @@ struct Envelope {
 
 #[derive(Debug, Deserialize)]
 struct Verdict {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     verdict: String,
     #[serde(default)]
     score: Option<f64>,
-    #[serde(default)]
-    blocking_issues: Vec<String>,
-    #[serde(default)]
+    /// Elements may be null too, so they stay `Option` until `blocking()`.
+    #[serde(default, deserialize_with = "null_as_default")]
+    blocking_issues: Vec<Option<String>>,
+    #[serde(default, deserialize_with = "null_as_default")]
     inline_comments: Vec<InlineRaw>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     findings: Vec<Finding>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     followups: Vec<crate::rereview::Followup>,
+}
+
+impl Verdict {
+    /// Non-null, non-blank blocking issues.
+    fn blocking(&self) -> Vec<String> {
+        self.blocking_issues
+            .iter()
+            .flatten()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 /// One problem the review asserts. Code, not the model, turns these into
 /// inline comments, blocking issues and severity counts.
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
 pub struct Finding {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub severity: String,
     #[serde(default)]
     pub confidence: Option<f64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub path: String,
     #[serde(default)]
     pub line: Option<u64>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub symbol: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub claim: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub repro: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub evidence: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub fix: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub suggestion: String,
     /// Multi-line corrected code. A plain code block, unless `end_line` names
     /// the contiguous diff range it replaces (then a GitHub `suggestion`).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub fix_code: String,
     /// Last line of the range `fix_code` replaces (`line` is the first).
     #[serde(default)]
@@ -566,11 +593,12 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
 
 #[derive(Debug, Deserialize)]
 struct InlineRaw {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     path: String,
-    #[serde(default)]
+    /// `null` or a missing line → 0, which `filter_inline` drops.
+    #[serde(default, deserialize_with = "null_as_default")]
     line: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     comment: String,
 }
 
@@ -623,6 +651,7 @@ fn filter_inline(raw: Vec<InlineRaw>, diff: &str) -> Vec<ReviewComment> {
     raw.into_iter()
         .filter(|c| {
             !c.path.is_empty()
+                && c.line > 0
                 && !c.comment.trim().is_empty()
                 && allowed.get(&c.path).is_some_and(|set| set.contains(&c.line))
         })
@@ -814,7 +843,7 @@ fn run_claude(
             let split = split_findings(&v.findings, diff);
             // Engine-rule hits (suspicious-instruction) come as blocking_issues;
             // real blockers come from findings. Both stop the gate.
-            let mut blocking_issues = v.blocking_issues;
+            let mut blocking_issues = v.blocking();
             blocking_issues.extend(split.blockers);
             let mut body = body;
             if !split.unanchored.is_empty() {
@@ -1155,7 +1184,7 @@ mod tests {
         assert_eq!(body, "# 요약\n괜찮은 PR 입니다.");
         assert_eq!(v.verdict, "approve");
         assert_eq!(v.score, Some(4.5));
-        assert!(v.blocking_issues.is_empty());
+        assert!(v.blocking().is_empty());
     }
 
     #[test]
@@ -1163,7 +1192,7 @@ mod tests {
         let out = "설명 ```json\n{\"verdict\":\"comment\"}\n``` 중간\n```json\n{\"verdict\":\"request_changes\",\"score\":2,\"blocking_issues\":[\"버그\"]}\n```";
         let (_body, v) = extract_review(out).expect("should parse");
         assert_eq!(v.verdict, "request_changes");
-        assert_eq!(v.blocking_issues, vec!["버그".to_string()]);
+        assert_eq!(v.blocking(), vec!["버그".to_string()]);
     }
 
     #[test]
@@ -1498,6 +1527,55 @@ mod tests {
         let shallow = build_prompt("g", "m", "d", false);
         assert!(deep.contains("체크아웃되어 있습니다"));
         assert!(!shallow.contains("체크아웃되어 있습니다"));
+    }
+
+    #[test]
+    fn null_fields_parse_instead_of_killing_the_review() {
+        // The real failure: a null in the verdict fence made serde error out
+        // ("invalid type: null, expected a string") and extract_review returned
+        // Err, so the entire markdown review body was thrown away.
+        let out = concat!(
+            "# 요약\n본문\n\n```json\n",
+            r#"{"verdict":"comment","score":3,"blocking_issues":["규칙 위반",null],"#,
+            r#""findings":[{"severity":"major","confidence":80,"path":"src/x.ts","line":11,"#,
+            r#""symbol":null,"claim":"널 심볼","repro":null,"evidence":null,"fix":null,"#,
+            r#""suggestion":null,"fix_code":null}],"#,
+            r#""inline_comments":[{"path":"src/x.ts","line":11,"comment":null},"#,
+            r#"{"path":null,"line":null,"comment":"경로 없음"},"#,
+            r#"{"path":"src/x.ts","line":12,"comment":"정상"}],"#,
+            r#""followups":[{"id":"abc","status":null,"note":null}]}"#,
+            "\n```"
+        );
+        let (body, v) = extract_review(out).expect("null fields must not fail the parse");
+        assert_eq!(body, "# 요약\n본문");
+        assert_eq!(v.verdict, "comment");
+        assert_eq!(v.score, Some(3.0));
+        // null element dropped, real one kept.
+        assert_eq!(v.blocking(), vec!["규칙 위반".to_string()]);
+        // The finding survives with empty strings where the model sent null.
+        assert_eq!(v.findings.len(), 1);
+        assert_eq!(v.findings[0].claim, "널 심볼");
+        assert_eq!(v.findings[0].symbol, "");
+        assert_eq!(v.findings[0].fix_code, "");
+        assert_eq!(v.followups.len(), 1);
+        assert_eq!(v.followups[0].status, "");
+        // null comment / null path+line dropped; only the complete one survives.
+        let kept = filter_inline(v.inline_comments, SAMPLE_DIFF);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].line, 12);
+    }
+
+    #[test]
+    fn null_whole_fields_fall_back_to_defaults() {
+        let out = "본문\n```json\n{\"verdict\":null,\"score\":null,\"blocking_issues\":null,\"inline_comments\":null,\"findings\":null,\"followups\":null}\n```";
+        let (_b, v) = extract_review(out).expect("all-null verdict must still parse");
+        // Empty verdict → the gate maps it to "comment", so approve stays closed.
+        assert_eq!(v.verdict, "");
+        assert_eq!(v.score, None);
+        assert!(v.blocking().is_empty());
+        assert!(v.inline_comments.is_empty());
+        assert!(v.findings.is_empty());
+        assert!(v.followups.is_empty());
     }
 
     #[test]

@@ -256,11 +256,15 @@ async fn run_loop(app: AppHandle, state: Arc<AppState>) {
             cfg.polling_interval_seconds
         };
 
-        let token_opt = state.token.lock().await.clone();
-        if token_opt.is_none() {
-            // Not connected — try once, otherwise back off and wait.
+        // Not connected → connect first, then fall through to the pass in the
+        // SAME iteration. Connecting used to *replace* the pass, so a cold start
+        // (the token is None until the first connect) or a "Check now" on a
+        // disconnected app only reconnected and then slept out the whole
+        // interval before looking at a single PR.
+        if state.token.lock().await.is_none() {
             try_connect(&app, &state).await;
-        } else {
+        }
+        if state.token.lock().await.is_some() {
             state.pass_running.store(true, std::sync::atomic::Ordering::SeqCst);
             run_one_pass(&app, &state).await;
             state.pass_running.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -388,10 +392,16 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
         }
     }
 
-    if let Some((rem, lim)) = latest_rate {
+    // Always publish a status snapshot. The UI's "Check now" spinner clears on
+    // this event, so a pass with no repositories configured (or where every
+    // repo call failed) still has to report back instead of hanging until the
+    // frontend's timeout.
+    {
         let mut s = state.status.lock().await;
-        s.rate_limit_remaining = rem;
-        s.rate_limit_total = lim;
+        if let Some((rem, lim)) = latest_rate {
+            s.rate_limit_remaining = rem;
+            s.rate_limit_total = lim;
+        }
         s.checked_at = Utc::now();
         let snapshot = s.clone();
         drop(s);
