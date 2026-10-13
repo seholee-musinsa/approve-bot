@@ -22,11 +22,11 @@ pub struct PrevFinding {
 /// One status the model reports for an earlier finding.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 pub struct Followup {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::review::null_as_default")]
     pub id: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::review::null_as_default")]
     pub status: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::review::null_as_default")]
     pub note: String,
 }
 
