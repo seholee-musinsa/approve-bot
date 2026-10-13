@@ -10,6 +10,24 @@ use tracing::{debug, info, warn};
 
 pub const ACTIVITY_EVENT: &str = "approve-bot://activity";
 pub const STATUS_EVENT: &str = "approve-bot://status-changed";
+pub const PASS_EVENT: &str = "approve-bot://pass-state";
+
+/// Published when a poll pass starts and when it ends. A pass that runs the
+/// review engine takes minutes, so the UI needs the real start/end instead of
+/// guessing with a timeout.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PassState {
+    pub running: bool,
+}
+
+/// Flip the shared `pass_running` flag and tell the UI about it. The flag was
+/// already there for the sweep scheduler; the event is what the UI needs.
+fn set_pass_running(app: &AppHandle, state: &Arc<AppState>, running: bool) {
+    state
+        .pass_running
+        .store(running, std::sync::atomic::Ordering::SeqCst);
+    let _ = app.emit(PASS_EVENT, &PassState { running });
+}
 
 /// Hidden marker prepended to engine-posted review bodies so later polls can
 /// tell our own review apart from a blind approve or another bot's review.
@@ -265,9 +283,9 @@ async fn run_loop(app: AppHandle, state: Arc<AppState>) {
             try_connect(&app, &state).await;
         }
         if state.token.lock().await.is_some() {
-            state.pass_running.store(true, std::sync::atomic::Ordering::SeqCst);
+            set_pass_running(&app, &state, true);
             run_one_pass(&app, &state).await;
-            state.pass_running.store(false, std::sync::atomic::Ordering::SeqCst);
+            set_pass_running(&app, &state, false);
         }
 
         // Either sleep for the configured interval or wake early on user action.

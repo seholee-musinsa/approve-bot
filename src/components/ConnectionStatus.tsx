@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { api, onGhLoginProgress, onStatusChanged } from "../lib/tauri";
+import { api, onGhLoginProgress, onPassState, onStatusChanged } from "../lib/tauri";
 import { showToast } from "../lib/toast";
-import type { ConnectionStatus as Status } from "../lib/types";
+import type { CheckNowAck, ConnectionStatus as Status } from "../lib/types";
 
 export function ConnectionStatus() {
   const [status, setStatus] = useState<Status | null>(null);
@@ -12,30 +12,50 @@ export function ConnectionStatus() {
   const [loginError, setLoginError] = useState<string | null>(null);
   const [codeCopied, setCodeCopied] = useState(false);
 
-  // "Check now" is fire-and-forget on the backend; the poll runs async and reports
-  // completion via a STATUS_EVENT. Track the pending check with a ref (stable across
-  // the status listener closure) plus a timeout fallback in case no event arrives.
+  // "Check now" is fire-and-forget on the backend. The pass itself reports its
+  // start and end via PASS_EVENT, which is what drives the spinner — a pass
+  // that runs the review engine takes minutes, far longer than any timeout we
+  // could guess at. Refs stay stable across the listener closures.
   const checkingRef = useRef(false);
-  const checkTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const passRunningRef = useRef(false);
+  // Only covers the gap before the pass starts (e.g. no token, so no pass runs
+  // at all). Cancelled the moment PASS_EVENT says a pass is under way.
+  const startTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  function stopChecking(reason?: "done" | "timeout") {
+  function clearStartTimer() {
+    if (startTimer.current) {
+      clearTimeout(startTimer.current);
+      startTimer.current = null;
+    }
+  }
+
+  function stopChecking(reason?: "done" | "no-pass") {
     const wasChecking = checkingRef.current;
     checkingRef.current = false;
     setChecking(false);
-    if (checkTimer.current) {
-      clearTimeout(checkTimer.current);
-      checkTimer.current = null;
-    }
+    clearStartTimer();
     if (!wasChecking) return;
     if (reason === "done") showToast("Check complete", "success");
-    else if (reason === "timeout") showToast("Check finished — no response", "info");
+    else if (reason === "no-pass") showToast("아직 검사가 시작되지 않았어요", "info");
   }
 
   useEffect(() => {
     api.getConnectionStatus().then(setStatus).catch(() => {});
     const offStatus = onStatusChanged((s) => {
       setStatus(s);
-      if (checkingRef.current) stopChecking("done");
+      // A pass emits its own status snapshot on the way out, so let PASS_EVENT
+      // close the spinner. This branch covers the no-pass case (connect only).
+      if (checkingRef.current && !passRunningRef.current) stopChecking("done");
+    });
+    const offPass = onPassState((p) => {
+      passRunningRef.current = p.running;
+      if (p.running) {
+        // The pass is really under way — no need for the start fallback.
+        clearStartTimer();
+        if (checkingRef.current) setChecking(true);
+      } else if (checkingRef.current) {
+        stopChecking("done");
+      }
     });
     const offLogin = onGhLoginProgress((p) => {
       switch (p.kind) {
@@ -61,24 +81,34 @@ export function ConnectionStatus() {
     });
     return () => {
       offStatus.then((u) => u()).catch(() => {});
+      offPass.then((u) => u()).catch(() => {});
       offLogin.then((u) => u()).catch(() => {});
-      if (checkTimer.current) clearTimeout(checkTimer.current);
+      clearStartTimer();
     };
   }, []);
 
   async function checkNow() {
     checkingRef.current = true;
     setChecking(true);
+    let ack: CheckNowAck;
     try {
-      await api.forceCheckNow();
+      ack = await api.forceCheckNow();
     } catch {
       stopChecking();
       showToast("Check failed", "error");
       return;
     }
-    // Fallback: clear the spinner even if no STATUS_EVENT arrives (e.g. no repos configured).
-    if (checkTimer.current) clearTimeout(checkTimer.current);
-    checkTimer.current = setTimeout(() => stopChecking("timeout"), 10000);
+    if (ack === "queued") {
+      // A pass (usually a review) is already running. The press is not lost —
+      // one more pass follows this one.
+      showToast("검사 중이에요 — 끝나면 한 번 더 돌아요", "info");
+      clearStartTimer();
+      return;
+    }
+    // Fallback for the gap before the pass starts: without a token the poller
+    // only reconnects and no pass runs, so nothing would clear the spinner.
+    clearStartTimer();
+    startTimer.current = setTimeout(() => stopChecking("no-pass"), 10000);
   }
 
   async function reconnect() {
