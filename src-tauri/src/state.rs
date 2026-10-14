@@ -79,6 +79,13 @@ pub struct ActivityEntry {
     pub detail: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct PendingReview {
+    pub input_hash: String,
+    pub outcome: crate::review::ReviewOutcome,
+    pub audit: crate::audit::Record,
+}
+
 pub struct AppState {
     pub config_dir: PathBuf,
     pub config: Mutex<AppConfig>,
@@ -88,10 +95,10 @@ pub struct AppState {
     pub activity: Mutex<VecDeque<ActivityEntry>>,
     pub poll_signal: Notify,
     pub gh_login_busy: Mutex<bool>,
-    /// `owner/repo#n` → head sha whose review failed before the model ran
-    /// (e.g. diff fetch). Skipped until the head moves, so one broken PR does
-    /// not retry and log every poll.
-    pub failed_heads: Mutex<std::collections::HashMap<String, String>>,
+    pub retries: Mutex<crate::retry::RetryState>,
+    /// Completed model work awaiting publication; one current head per PR.
+    /// Kept through transient publication errors to avoid paying for the same run twice.
+    pub pending_reviews: Mutex<std::collections::HashMap<String, PendingReview>>,
     /// `owner/repo#n` → head sha deliberately left without a new review (only
     /// docs/tests changed since a review that held). Lets later polls return
     /// before re-fetching the round; lost on restart, which costs one fetch.
@@ -115,7 +122,8 @@ impl AppState {
             activity: Mutex::new(activity),
             poll_signal: Notify::new(),
             gh_login_busy: Mutex::new(false),
-            failed_heads: Mutex::new(std::collections::HashMap::new()),
+            retries: Mutex::new(crate::retry::RetryState::default()),
+            pending_reviews: Mutex::new(std::collections::HashMap::new()),
             settled_heads: Mutex::new(std::collections::HashMap::new()),
             pass_running: std::sync::atomic::AtomicBool::new(false),
             sweep_running: std::sync::atomic::AtomicBool::new(false),
@@ -129,6 +137,17 @@ impl AppState {
         }
         log.push_front(entry);
         save_activity(&self.config_dir, &log);
+    }
+
+    pub async fn record_review(&self, record: &crate::audit::Record) {
+        if let Err(e) = crate::audit::append(&self.config_dir, record) {
+            tracing::error!(error = %e, "review audit persistence failed");
+            self.push_activity(ActivityEntry {
+                timestamp: Utc::now(), kind: ActivityKind::Error, repo: Some(record.repo.clone()),
+                pr_number: Some(record.pr), pr_title: None, author: None, url: record.review_url.clone(),
+                message: format!("리뷰 감사 기록 저장 실패: {e}"), detail: None,
+            }).await;
+        }
     }
 
     pub async fn clear_activity(&self) {

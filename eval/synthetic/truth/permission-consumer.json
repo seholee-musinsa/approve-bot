@@ -1,0 +1,19 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "defects",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/workflow.yml b/workflow.yml\n--- a/workflow.yml\n+++ b/workflow.yml\n@@ -1,17 +1,17 @@\n name: release\n on: push\n jobs:\n   release:\n     runs-on: ubuntu-latest\n     permissions:\n-      contents: write\n+      contents: read\n     steps:\n       - uses: actions/github-script@v7\n         with:\n           script: |\n             await github.rest.git.createRef({\n               owner: context.repo.owner,\n               repo: context.repo.repo,\n               ref: \"refs/tags/release-1\",\n               sha: context.sha\n             });\n",
+  "defects": [
+    {
+      "id": "d1",
+      "path": "workflow.yml",
+      "line": 7,
+      "severity": "major",
+      "summary": "The unchanged tag creation step still uses the current token and loses contents write permission.",
+      "source": "Synthetic draft impact label"
+    }
+  ],
+  "notes": "The unchanged tag creation step still uses the current token and loses contents write permission."
+}

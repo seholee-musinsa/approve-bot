@@ -1,0 +1,11 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "clean",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/policy.ts b/policy.ts\n--- a/policy.ts\n+++ b/policy.ts\n@@ -1,2 +1,2 @@\n-// Published records are immutable by product policy.\n+// Published records are immutable by product policy, including admins.\n export const canEdit = record => !record.published;\n",
+  "defects": [],
+  "notes": "No defect: blocking edits to published records is the explicit policy.",
+  "split": "holdout"
+}

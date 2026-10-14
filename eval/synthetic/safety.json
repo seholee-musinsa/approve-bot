@@ -1,0 +1,403 @@
+[
+  {
+    "id": "standalone-guard",
+    "split": "regression",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      }
+    },
+    "expected": {
+      "clickable": true,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "legacy-missing-metadata",
+    "split": "regression",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": null
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "permission-needs-job-move",
+    "split": "regression",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "contents: read",
+      "suggestion_safety": {
+        "applicability": "requires_other_changes",
+        "dependencies": [
+          "Move createTag consumer into its own write-enabled job"
+        ],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      },
+      "fix": "Move the tag writer into a different job first"
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "import-still-required",
+    "split": "regression",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "return normalize(value);",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [
+          "Import normalize"
+        ],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "unverified-consumer",
+    "split": "regression",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "code_inspection",
+          "result": "not_run",
+          "evidence": "Consumer unavailable"
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "off-diff",
+    "split": "regression",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 99,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 0,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "standalone-contiguous-range",
+    "split": "regression",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      },
+      "fix_code": "guard();\nrun();",
+      "end_line": 12
+    },
+    "expected": {
+      "clickable": true,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "cross-hunk-range",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      },
+      "fix_code": "guard();\nrun();",
+      "end_line": 15
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "schema-needs-migration",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "required: true",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [
+          "Backfill persisted rows before enabling required field"
+        ],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "unknown-dependencies",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "fabricated-verification-method",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "assumption",
+          "result": "passed",
+          "evidence": "Probably fine"
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "blank-verification-evidence",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "major",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "test",
+          "result": "passed",
+          "evidence": " "
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "blocker-with-dependent-patch",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "blocker",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "requires_other_changes",
+        "dependencies": [
+          "Migrate callers"
+        ],
+        "verification": {
+          "method": "code_inspection",
+          "result": "passed",
+          "evidence": "Inspected local guard and its only consumer"
+        }
+      }
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 1,
+      "blockers": 1
+    }
+  },
+  {
+    "id": "minor-proposal-only",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "minor",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": null
+    },
+    "expected": {
+      "clickable": false,
+      "inline": 0,
+      "blockers": 0
+    }
+  },
+  {
+    "id": "holdout-standalone-test-evidence",
+    "split": "holdout",
+    "diff": "diff --git a/src/example.ts b/src/example.ts\n--- a/src/example.ts\n+++ b/src/example.ts\n@@ -10,3 +10,4 @@\n context\n-old\n+new\n+next\n tail\n",
+    "finding": {
+      "severity": "minor",
+      "confidence": 90,
+      "path": "src/example.ts",
+      "line": 11,
+      "claim": "A reachable path loses its required value",
+      "suggestion": "if (!value.trim()) return;",
+      "suggestion_safety": {
+        "applicability": "standalone",
+        "dependencies": [],
+        "verification": {
+          "method": "test",
+          "result": "passed",
+          "evidence": "Local whitespace guard test passed"
+        }
+      }
+    },
+    "expected": {
+      "clickable": true,
+      "inline": 1,
+      "blockers": 0
+    }
+  }
+]

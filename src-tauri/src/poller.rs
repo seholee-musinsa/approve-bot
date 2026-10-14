@@ -92,7 +92,40 @@ enum DocsOnlyStep {
 /// full Opus review, $2.60, on an empty delta). A failed compare never gets
 /// here — `build_round` returns no round and the PR is reviewed in full.
 fn nothing_to_review(delta_diff: &str) -> bool {
-    crate::diffprep::changed_paths(delta_diff).is_empty() || crate::rereview::only_docs_or_tests(delta_diff)
+    crate::review::sensitive_files(delta_diff).is_empty()
+        && (crate::diffprep::changed_paths(delta_diff).is_empty() || crate::rereview::only_docs_or_tests(delta_diff))
+}
+
+/// Follow-ups can reduce the size-driven model/second-pass budget, while the
+/// full diff and checkout remain available to review and the approval gate.
+/// Safety paths anywhere in the PR and unsettled serious findings set a floor.
+fn review_risk(full_diff: &str, round: Option<&crate::rereview::Round>) -> (crate::routing::Risk, String) {
+    use crate::routing::Risk;
+    let Some(round) = round else { return crate::routing::classify(full_diff) };
+    if round.prev.iter().any(|p| {
+        matches!(p.severity.as_str(), "major" | "blocker")
+            && !matches!(p.last_reply.as_deref(), Some("resolved" | "withdrawn"))
+    }) {
+        return (Risk::High, "이전 major·blocker 재확인 필요".into());
+    }
+    if !crate::review::sensitive_files(full_diff).is_empty()
+        || !crate::review::sensitive_files(&round.delta_diff).is_empty()
+    {
+        return (Risk::High, "전체 PR 또는 증분의 민감 파일".into());
+    }
+    // Remove hunks to distinguish size-driven risk from persistent path risk.
+    // Both rename sides count: moving an auth file must not lower scrutiny.
+    let paths = full_diff.lines().filter_map(|line| line.strip_prefix("diff --git "))
+        .flat_map(|line| line.split(' '))
+        .filter_map(|path| path.strip_prefix("a/").or_else(|| path.strip_prefix("b/")))
+        .map(|path| format!("diff --git a/{path} b/{path}\n"))
+        .collect::<String>();
+    let (safety, why) = crate::routing::classify(&paths);
+    if safety == Risk::High {
+        return (safety, format!("전체 PR 안전 기준: {why}"));
+    }
+    let (risk, why) = crate::routing::classify(&round.delta_diff);
+    (risk, format!("직전 리뷰 이후 증분: {why}"))
 }
 
 fn docs_only_step(action: &ReviewAction, docs_only: bool) -> DocsOnlyStep {
@@ -171,7 +204,7 @@ async fn build_round(
     let comments = client
         .list_review_comments(owner, repo, pr.number)
         .await
-        .unwrap_or_default();
+        .ok()?;
     Some(crate::rereview::Round {
         number: engine.len() + 1,
         prev_sha,
@@ -319,12 +352,14 @@ async fn settle_threads(
         if *resolved {
             continue;
         }
+        if client.ensure_publishable(owner, repo, number, head_sha).await.is_err() { return; }
         match crate::rereview::thread_step(&f.status, &f.note, head_sha, p.last_reply.as_deref()) {
             crate::rereview::ThreadStep::Close(body) => {
                 if let Err(e) = client.reply_to_review_comment(owner, repo, number, p.comment_id, &body).await {
                     warn!(error = %e, "follow-up reply failed");
                     continue;
                 }
+                if client.ensure_publishable(owner, repo, number, head_sha).await.is_err() { return; }
                 if let Err(e) = client.resolve_review_thread(thread_id).await {
                     warn!(error = %e, "resolving a settled thread failed");
                 }
@@ -495,6 +530,8 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
     let mut latest_rate: Option<(Option<u64>, Option<u64>)> = None;
 
     for repo_full in &cfg.repositories {
+        if !state.retries.lock().await.ready(repo_full, Utc::now().timestamp()) { continue; }
+
         let (owner, repo) = match split_repo(repo_full) {
             Ok(parts) => parts,
             Err(e) => {
@@ -521,6 +558,8 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
         let (pulls, rate) = match client.list_open_pulls(owner, repo).await {
             Ok(v) => v,
             Err(e) => {
+                let notify = state.retries.lock().await.failure(repo_full, Utc::now().timestamp(), crate::retry::hint(&e), crate::retry::kind(&e));
+                if !notify { continue; }
                 push_and_emit(
                     app,
                     state,
@@ -540,6 +579,13 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
                 continue;
             }
         };
+        if let Some(attempts) = state.retries.lock().await.success(repo_full) {
+            push_and_emit(app, state, ActivityEntry {
+                timestamp: Utc::now(), kind: ActivityKind::Info, repo: Some(repo_full.clone()),
+                pr_number: None, pr_title: None, author: None, url: None,
+                message: format!("GitHub 연결 복구 (실패 {attempts}회 묶음)"), detail: None,
+            }).await;
+        }
         latest_rate = Some((rate.remaining, rate.limit));
 
         for pr in pulls {
@@ -591,34 +637,60 @@ async fn handle_pr(
         return;
     };
 
+    // Coalesce pushes queued while earlier PRs were reviewed.
+    if !cfg.auto_approve_enabled { return; }
+    let lookup_key = format!("lookup:{repo_full}#{}", pr.number);
+    if !state.retries.lock().await.ready(&lookup_key, Utc::now().timestamp()) { return; }
+    let latest = match client.get_pull(owner, repo, pr.number).await {
+        Ok(latest) => latest,
+        Err(e) => {
+            retry_error(app, state, &lookup_key, repo_full, pr, "fresh PR lookup failed", &e).await;
+            return;
+        }
+    };
+    let pr = &latest;
+    let pending_key = format!("{repo_full}#{}", pr.number);
+    let publication_key = format!("publication:{pending_key}@{}", pr.head.sha);
+    if crate::publication::check(pr, &pr.head.sha).is_err()
+        || !allowed.contains(&pr.user.login.to_lowercase())
+        || pr.user.login.eq_ignore_ascii_case(me) { return; }
+
     // Already approved by me?
     let reviews = match client.list_reviews(owner, repo, pr.number).await {
         Ok(v) => v,
         Err(e) => {
-            push_and_emit(
-                app,
-                state,
-                ActivityEntry {
-                    timestamp: Utc::now(),
-                    kind: ActivityKind::Error,
-                    repo: Some(repo_full.to_string()),
-                    pr_number: Some(pr.number),
-                    pr_title: Some(pr.title.clone()),
-                    author: Some(pr.user.login.clone()),
-                    url: Some(pr.html_url.clone()),
-                    message: format!("list reviews failed: {e:#}"),
-                    detail: None,
-                },
-            )
-            .await;
+            retry_error(app, state, &lookup_key, repo_full, pr, "list reviews failed", &e).await;
             return;
         }
     };
+    state.retries.lock().await.success(&lookup_key);
     let head_sha = pr.head.sha.as_str();
     let my_reviews = reviews
         .iter()
         .filter(|r| r.user.login.eq_ignore_ascii_case(me))
         .collect::<Vec<_>>();
+    // A timed-out POST may already have succeeded. Reconcile its stable run marker
+    // before retrying; never rerun the model merely because its receipt was lost.
+    let pending = state.pending_reviews.lock().await.get(&pending_key).cloned();
+    if let Some(mut pending) = pending {
+        if pending.audit.head_sha != head_sha {
+            state.pending_reviews.lock().await.remove(&pending_key);
+        } else if let Some(posted) = my_reviews.iter().find(|r|
+            r.commit_id.as_deref() == Some(head_sha)
+                && r.body.contains(&format!("<!-- approve-bot:run:{} -->", pending.audit.run_id))) {
+            pending.audit.update(if posted.state.eq_ignore_ascii_case("APPROVED") {"approved"}
+                else if pending.outcome.finished_cleanly {"commented"} else {"failure_notice"});
+            pending.audit.review_id = (posted.id > 0).then_some(posted.id);
+            pending.audit.review_url = (!posted.html_url.is_empty()).then(|| posted.html_url.clone());
+            if let Some(at) = &posted.submitted_at { pending.audit.at = at.clone(); }
+            pending.audit.error = None;
+            state.record_review(&pending.audit).await;
+            state.pending_reviews.lock().await.remove(&pending_key);
+            state.retries.lock().await.success(&publication_key);
+            return;
+        }
+    }
+    if !state.retries.lock().await.ready(&publication_key, Utc::now().timestamp()) { return; }
     // Already approved the CURRENT head → nothing to do.
     let approved_head = my_reviews.iter().any(|r| {
         r.state.eq_ignore_ascii_case("APPROVED") && r.commit_id.as_deref() == Some(head_sha)
@@ -700,23 +772,23 @@ async fn handle_pr(
         let pr_key = format!("{repo_full}#{}", pr.number);
         // This head already failed before reaching the model: wait for a new
         // commit instead of retrying (and logging) every poll.
-        if state.failed_heads.lock().await.get(&pr_key).map(String::as_str) == Some(head_sha) {
-            return;
-        }
+        let retry_key = format!("{pr_key}@{head_sha}");
+        if !state.retries.lock().await.ready(&retry_key, Utc::now().timestamp()) { return; }
         let diff = match client.get_pr_diff(owner, repo, pr.number).await {
             Ok(d) => d,
             Err(e) => {
-                state.failed_heads.lock().await.insert(pr_key, head_sha.to_string());
+                let notify = state.retries.lock().await.failure(&retry_key, Utc::now().timestamp(), crate::retry::hint(&e), crate::retry::kind(&e));
+                if !notify { return; }
                 push_and_emit(
                     app,
                     state,
-                    err_entry(repo_full, pr, format!("get diff failed (새 커밋까지 재시도 안 함): {e:#}")),
+                    err_entry(repo_full, pr, format!("get diff failed (지수 지연 후 재시도): {e:#}")),
                 )
                 .await;
                 return;
             }
         };
-        state.failed_heads.lock().await.remove(&pr_key);
+        state.retries.lock().await.success(&retry_key);
         // Include the real PR description so the reviewer doesn't wrongly flag it
         // as empty. Cap length to keep the prompt bounded.
         let pr_body = pr
@@ -751,6 +823,7 @@ async fn handle_pr(
                 added: &added,
                 triggers: &triggers,
                 until: None,
+                body: pr.body.as_deref().unwrap_or(""),
             },
         )
         .await;
@@ -763,7 +836,7 @@ async fn handle_pr(
         );
         let diff_for_gate = diff.clone();
         let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);
-        let (risk, risk_why) = crate::routing::classify(&diff);
+        let (risk, risk_why) = review_risk(&diff, round.as_ref());
         let (model, tk) = crate::routing::pick(cfg, risk);
         let second = crate::routing::second_pass(cfg, risk);
         let trace = cfg.review_value_trace_enabled;
@@ -774,12 +847,33 @@ async fn handle_pr(
         let repo_s = repo.to_string();
         let number = pr.number;
         let token = client.token().to_string();
+        let reviewed_sha = head_sha.to_string();
+
+        // Never spend a model run on a snapshot already superseded during context collection.
+        if let Err(e) = ensure_review_snapshot(client, owner, repo, pr).await {
+            retry_error(app, state, &publication_key, repo_full, pr, "리뷰 시작 보류", &e).await;
+            return;
+        }
+        let guide_path = if cfg.review_guide_path.trim().is_empty() { state.config_dir.join("review-guide.md") }
+            else { std::path::PathBuf::from(&cfg.review_guide_path) };
+        let guide_source = if std::fs::read_to_string(&guide_path).ok().is_some_and(|s| !s.trim().is_empty()) {
+            guide_path.display().to_string()
+        } else { "bundled".into() };
+        let input_hash = crate::audit::fingerprint(&format!("{guide}\n{meta}\n{round_block}\n{diff}\n{}\n{}\n{model}:{tk}:{deep}:{second}:{trace}", pr.base.ref_name, pr.base.sha));
+        let cached = state.pending_reviews.lock().await.get(&pending_key).cloned()
+            .filter(|p| p.audit.head_sha == head_sha && p.input_hash == input_hash);
+        let (outcome, mut audit) = if let Some(pending) = cached {
+            (pending.outcome, pending.audit)
+        } else {
+        let mut audit = crate::audit::Record::start(repo_full, number, head_sha, &model, risk.label(), &guide, guide_source);
+        state.record_review(&audit).await;
+        let review_started = std::time::Instant::now();
 
         // `claude -p` can take minutes — keep it off the async runtime.
         let outcome = match tokio::task::spawn_blocking(move || {
             if deep {
                 crate::review::review_pr_deep_at(
-                    &guide, &meta, &round_block, &diff, &model, tk, &owner_s, &repo_s, number, &token, None, second,
+                    &guide, &meta, &round_block, &diff, &model, tk, &owner_s, &repo_s, number, &token, Some(&reviewed_sha), second,
                     trace,
                 )
             } else {
@@ -790,11 +884,48 @@ async fn handle_pr(
         {
             Ok(o) => o,
             Err(e) => {
-                push_and_emit(app, state, err_entry(repo_full, pr, format!("review task failed: {e:#}")))
-                    .await;
+                audit.update("task_failed");
+                audit.elapsed_ms = review_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                audit.timing_available = true;
+                audit.error = Some(e.to_string());
+                state.record_review(&audit).await;
+                let error = anyhow::anyhow!("review task failed: {e:#}");
+                retry_error(app, state, &publication_key, repo_full, pr, "리뷰 실행 실패", &error).await;
                 return;
             }
         };
+
+        audit.elapsed_ms = review_started.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        audit.timing_available = true;
+        audit.cost_usd = outcome.cost_usd;
+        audit.finished_cleanly = Some(outcome.finished_cleanly);
+        audit.finding_ids = outcome.findings.iter().map(|f| crate::review::finding_id(&f.path, &f.symbol, &f.claim)).collect();
+        audit.result = Some(serde_json::json!({"body": outcome.body, "verdict": outcome.verdict,
+            "score":outcome.score, "findings":outcome.findings, "omitted_files":outcome.omitted_files,
+            "blocking_issues":outcome.blocking_issues}));
+        audit.update(if outcome.finished_cleanly {"reviewed"} else {"model_failed"});
+        state.record_review(&audit).await;
+        (outcome, audit)
+        };
+        {
+            let mut pending = state.pending_reviews.lock().await;
+            pending.insert(pending_key.clone(), crate::state::PendingReview {input_hash, outcome:outcome.clone(), audit:audit.clone()});
+            if pending.len() > 128 {
+                if let Some(oldest) = pending.iter().min_by_key(|(_,p)| &p.audit.started_at).map(|(k,_)|k.clone()) {
+                    pending.remove(&oldest);
+                }
+            }
+        }
+        if !state.config.lock().await.auto_approve_enabled {
+            audit.update("publication_disabled"); state.record_review(&audit).await;
+            return;
+        }
+        if let Err(e) = ensure_review_snapshot(client, owner, repo, pr).await {
+            audit.update("publication_withheld"); audit.error = Some(format!("{e:#}"));
+            state.record_review(&audit).await;
+            retry_error(app, state, &publication_key, repo_full, pr, "리뷰 게시 보류 (결과는 로컬 보관)", &e).await;
+            return;
+        }
 
         let score_str = format!("{:.1}", outcome.score);
         let cost_str = outcome
@@ -852,8 +983,9 @@ async fn handle_pr(
         } else {
             vec![]
         };
-        // Findings that got no thread are the only ones the body lists.
-        let posted: Vec<&str> = inline.iter().map(|c| c.body.as_str()).chain(file_comments.iter().map(|c| c.body.as_str())).collect();
+        // File threads are posted separately and can fail after the review succeeds;
+        // retain those findings in the body until a thread actually exists.
+        let posted: Vec<&str> = inline.iter().map(|c| c.body.as_str()).collect();
         let body = match &round {
             // From the second review on, post a short summary of what changed
             // and fold the model's full review under it.
@@ -911,7 +1043,8 @@ async fn handle_pr(
         // A failed run gets its own marker so the next commit is re-reviewed.
         let marker = if outcome.finished_cleanly { REVIEW_MARKER } else { FAILED_MARKER };
         let posted_body = format!(
-            "{marker}\n{}",
+            "{marker}\n<!-- approve-bot:run:{} -->\n{}",
+            audit.run_id,
             crate::layout::with_reply_hint(&crate::layout::fold_sections(&body), inline.len() + file_comments.len())
         );
         let inline: &[crate::github::ReviewComment] = &inline;
@@ -921,6 +1054,8 @@ async fn handle_pr(
         } else {
             format!(", 인라인 {}건", inline.len())
         };
+        audit.update("publication_attempted"); audit.error = None;
+        state.record_review(&audit).await;
         if decision == Gate::Approve {
             match client
                 .approve_pull_with_comments(
@@ -933,7 +1068,17 @@ async fn handle_pr(
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(receipt) => {
+                    state.pending_reviews.lock().await.remove(&pending_key);
+                    state.retries.lock().await.success(&publication_key);
+                    audit.update(if decision == Gate::Approve {"approved"} else if outcome.finished_cleanly {"commented"} else {"failure_notice"});
+                    audit.review_id = Some(receipt.id); audit.review_url = Some(receipt.html_url);
+                    audit.inline_omitted = receipt.inline_omitted;
+                    if receipt.inline_omitted { inline_str = ", 인라인 게시 실패 — 본문에 보존".into(); }
+                    if let Some(at) = receipt.submitted_at { audit.at = at; }
+                    state.record_review(&audit).await;
+                    observe_publication(client, owner, repo, &mut audit).await;
+                    state.record_review(&audit).await;
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
                     if let Some(r) = &round {
                         hide_outdated(client, &my_reviews, head_sha).await;
@@ -965,8 +1110,8 @@ async fn handle_pr(
                     }
                 }
                 Err(e) => {
-                    push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e:#}")))
-                        .await;
+                    audit.update("publication_unknown");audit.error=Some(format!("{e:#}"));state.record_review(&audit).await;
+                    retry_error(app, state, &publication_key, repo_full, pr, "approve receipt unavailable", &e).await;
                 }
             }
         } else {
@@ -977,7 +1122,17 @@ async fn handle_pr(
                 .comment_pull(owner, repo, pr.number, head_sha, &posted_body, inline)
                 .await
             {
-                Ok(()) => {
+                Ok(receipt) => {
+                    state.pending_reviews.lock().await.remove(&pending_key);
+                    state.retries.lock().await.success(&publication_key);
+                    audit.update(if decision == Gate::Approve {"approved"} else if outcome.finished_cleanly {"commented"} else {"failure_notice"});
+                    audit.review_id = Some(receipt.id); audit.review_url = Some(receipt.html_url);
+                    audit.inline_omitted = receipt.inline_omitted;
+                    if receipt.inline_omitted { inline_str = ", 인라인 게시 실패 — 본문에 보존".into(); }
+                    if let Some(at) = receipt.submitted_at { audit.at = at; }
+                    state.record_review(&audit).await;
+                    observe_publication(client, owner, repo, &mut audit).await;
+                    state.record_review(&audit).await;
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
                     if let Some(r) = &round {
                         hide_outdated(client, &my_reviews, head_sha).await;
@@ -997,15 +1152,15 @@ async fn handle_pr(
                             pr_title: Some(pr.title.clone()),
                             author: Some(pr.user.login.clone()),
                             url: Some(pr.html_url.clone()),
-                            message: format!("리뷰 코멘트 게시 (approve 보류: {why}{inline_str}{route_str})"),
+                            message: format!("리뷰 코멘트 게시 (approve 보류: {why}{cost_str}{inline_str}{route_str})"),
                             detail: Some(outcome.body.clone()),
                         },
                     )
                     .await;
                 }
                 Err(e) => {
-                    push_and_emit(app, state, err_entry(repo_full, pr, format!("comment failed: {e:#}")))
-                        .await;
+                    audit.update("publication_unknown");audit.error=Some(format!("{e:#}"));state.record_review(&audit).await;
+                    retry_error(app, state, &publication_key, repo_full, pr, "comment receipt unavailable", &e).await;
                 }
             }
         }
@@ -1013,11 +1168,21 @@ async fn handle_pr(
     }
 
     // ── Legacy blind approve (review engine disabled) ──
-    match client
+    let mut audit = approval_audit(repo_full, pr, "approval_only");
+    state.record_review(&audit).await;
+    let started = std::time::Instant::now();
+    let result = client
         .approve_pull(owner, repo, pr.number, &pr.head.sha, Some(&cfg.approval_message))
-        .await
-    {
-        Ok(()) => {
+        .await;
+    finish_approval_audit(&mut audit, &result, started.elapsed().as_millis() as u64);
+    state.record_review(&audit).await;
+    if result.is_ok() {
+        observe_publication(client, owner, repo, &mut audit).await;
+        state.record_review(&audit).await;
+    }
+    match result {
+        Ok(_receipt) => {
+            state.retries.lock().await.success(&publication_key);
             push_and_emit(
                 app,
                 state,
@@ -1041,7 +1206,7 @@ async fn handle_pr(
             }
         }
         Err(e) => {
-            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e:#}"))).await;
+            retry_error(app, state, &publication_key, repo_full, pr, "approve receipt unavailable", &e).await;
         }
     }
 }
@@ -1062,8 +1227,20 @@ async fn approve_only(
 ) {
     // Already reviewed earlier — approve with NO body (a bare approval, no
     // comment on the PR). The prior review already carries the substance.
-    match client.approve_pull(owner, repo, pr.number, &pr.head.sha, None).await {
-        Ok(()) => {
+    let mut audit = approval_audit(repo_full, pr, "reapproval");
+    state.record_review(&audit).await;
+    let started = std::time::Instant::now();
+    let result = client.approve_pull(owner, repo, pr.number, &pr.head.sha, None).await;
+    finish_approval_audit(&mut audit, &result, started.elapsed().as_millis() as u64);
+    state.record_review(&audit).await;
+    if result.is_ok() {
+        observe_publication(client, owner, repo, &mut audit).await;
+        state.record_review(&audit).await;
+    }
+    let retry_key = format!("publication:{repo_full}#{}@{}", pr.number, pr.head.sha);
+    match result {
+        Ok(_receipt) => {
+            state.retries.lock().await.success(&retry_key);
             push_and_emit(
                 app,
                 state,
@@ -1087,9 +1264,58 @@ async fn approve_only(
             }
         }
         Err(e) => {
-            push_and_emit(app, state, err_entry(repo_full, pr, format!("approve failed: {e:#}")))
-                .await;
+            retry_error(app, state, &retry_key, repo_full, pr, "approve receipt unavailable", &e).await;
         }
+    }
+}
+
+fn approval_audit(repo: &str, pr: &PullRequest, source: &str) -> crate::audit::Record {
+    let mut audit = crate::audit::Record::start(repo, pr.number, &pr.head.sha, "none", "not_run", "", "not_used".into());
+    audit.source = source.into();
+    audit.guide_hash.clear();
+    audit.cost_usd = Some(0.0); // No model was invoked.
+    audit.update("publication_attempted");
+    audit
+}
+
+/// GitHub offers no atomic open/head precondition on review creation. Record a
+/// post-write observation so a remaining race is visible, without claiming when
+/// a close/push occurred relative to the server's write.
+async fn observe_publication(client: &GitHubClient, owner: &str, repo: &str, audit: &mut crate::audit::Record) {
+    let observation = match client.get_pull(owner, repo, audit.pr).await {
+        Ok(pr) => serde_json::json!({"checked_at":Utc::now().to_rfc3339(), "state":pr.state,
+            "merged":pr.merged, "merged_at":pr.merged_at, "draft":pr.draft, "head_sha":pr.head.sha,
+            "still_eligible":crate::publication::check(&pr, &audit.head_sha).is_ok()}),
+        Err(e) => serde_json::json!({"checked_at":Utc::now().to_rfc3339(), "lookup_error":format!("{e:#}")}),
+    };
+    audit.post_publication = Some(observation);
+}
+
+async fn ensure_review_snapshot(client: &GitHubClient, owner: &str, repo: &str, expected: &PullRequest) -> anyhow::Result<()> {
+    let latest = client.get_pull(owner, repo, expected.number).await?;
+    crate::publication::check_snapshot(&latest, expected).map_err(|reason| anyhow::anyhow!("publication withheld: {reason}"))
+}
+
+fn finish_approval_audit(audit: &mut crate::audit::Record, result: &anyhow::Result<crate::github::ReviewReceipt>, elapsed_ms: u64) {
+    audit.elapsed_ms = elapsed_ms;
+    audit.timing_available = true;
+    match result {
+        Ok(receipt) => {
+            audit.update(if audit.source == "reapproval" {"reapproval"} else {"approved"});
+            audit.review_id = Some(receipt.id);
+            audit.review_url = Some(receipt.html_url.clone());
+            if let Some(at) = &receipt.submitted_at {audit.at = at.clone();}
+        }
+        Err(e) => {audit.update("publication_unknown"); audit.error = Some(format!("{e:#}"));}
+    }
+}
+
+/// Group repeated errors while preserving server-provided retry delays.
+async fn retry_error(app: &AppHandle, state: &Arc<AppState>, key: &str, repo: &str,
+    pr: &PullRequest, message: &str, error: &anyhow::Error) {
+    let notify = state.retries.lock().await.failure(key, Utc::now().timestamp(), crate::retry::hint(error), crate::retry::kind(error));
+    if notify {
+        push_and_emit(app, state, err_entry(repo, pr, format!("{message} (지수 지연 후 재시도): {error:#}"))).await;
     }
 }
 
@@ -1115,6 +1341,7 @@ async fn push_and_emit(app: &AppHandle, state: &Arc<AppState>, entry: ActivityEn
 
 #[cfg(test)]
 mod tests {
+    use super::{docs_only_step, nothing_to_review, review_risk, DocsOnlyStep};
     use super::{decide_review_action, gate, Gate, Marker, ReviewAction};
 
     const R: Marker = Marker::Reviewed;
@@ -1221,6 +1448,72 @@ mod tests {
     }
 
     #[test]
+    fn sensitive_docs_never_take_the_reapproval_shortcut() {
+        for path in ["docs/deploy.sh", "docs/.env.production", ".github/README.md"] {
+            let delta = format!("diff --git a/{path} b/{path}\n-old\n+new\n");
+            assert_eq!(docs_only_step(&ReviewAction::ApproveOnly, nothing_to_review(&delta)), DocsOnlyStep::Review, "{path}");
+        }
+        let rename = "diff --git a/scripts/deploy.sh b/docs/deploy.md\nrename from scripts/deploy.sh\nrename to docs/deploy.md\n";
+        assert!(!nothing_to_review(rename), "a sensitive source path still requires review after renaming");
+    }
+
+    fn routing_diff(path: &str, additions: usize) -> String {
+        format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n{}", "+new\n".repeat(additions))
+    }
+
+    fn routing_round(delta_diff: String) -> crate::rereview::Round {
+        crate::rereview::Round { number: 2, prev_sha: "previous".into(), prev: vec![], delta_diff }
+    }
+
+    #[test]
+    fn small_followup_to_large_ui_change_uses_delta_model_and_second_pass_budget() {
+        use crate::routing::{pick, second_pass, Risk};
+        let full = routing_diff("src/ui/Panel.tsx", 650);
+        let round = routing_round(routing_diff("src/ui/Panel.tsx", 2));
+        let cfg = crate::config::AppConfig::default();
+        assert_eq!(review_risk(&full, None).0, Risk::High);
+        let (risk, _) = review_risk(&full, Some(&round));
+        assert_eq!(risk, Risk::Normal);
+        assert_eq!(pick(&cfg, risk).0, cfg.review_model);
+        assert!(!second_pass(&cfg, risk));
+    }
+
+    #[test]
+    fn followup_keeps_full_pr_safety_risk_even_when_delta_is_small() {
+        use crate::routing::Risk;
+        let round = routing_round(routing_diff("src/ui/Panel.tsx", 2));
+        for path in ["src/auth/permission.ts", "src/api/service.ts", "docs/deploy.sh"] {
+            assert_eq!(review_risk(&routing_diff(path, 1), Some(&round)).0, Risk::High, "{path}");
+        }
+        let rename = "diff --git a/src/auth/access.ts b/src/ui/access.ts\nrename from src/auth/access.ts\nrename to src/ui/access.ts\n";
+        assert_eq!(review_risk(rename, Some(&round)).0, Risk::High);
+    }
+
+    #[test]
+    fn followup_keeps_unresolved_serious_findings_at_high_risk() {
+        use crate::routing::Risk;
+        let full = routing_diff("src/ui/Panel.tsx", 1);
+        let mut round = routing_round(full.clone());
+        for severity in ["major", "blocker"] {
+            for status in [None, Some("unresolved"), Some("partial"), Some("wont_fix")] {
+                round.prev = vec![crate::rereview::PrevFinding { severity: severity.into(), last_reply: status.map(str::to_string), ..Default::default() }];
+                assert_eq!(review_risk(&full, Some(&round)).0, Risk::High, "{severity} {status:?}");
+            }
+        }
+        round.prev[0].last_reply = Some("resolved".into());
+        assert_eq!(review_risk(&full, Some(&round)).0, Risk::Normal);
+        round.prev[0].last_reply = Some("withdrawn".into());
+        assert_eq!(review_risk(&full, Some(&round)).0, Risk::Normal);
+    }
+
+    #[test]
+    fn followup_new_high_risk_delta_is_not_hidden_by_normal_full_diff() {
+        let full = routing_diff("src/ui/Panel.tsx", 2);
+        let round = routing_round(routing_diff("src/auth/guard.ts", 1));
+        assert_eq!(review_risk(&full, Some(&round)).0, crate::routing::Risk::High);
+    }
+
+    #[test]
     fn docs_only_push_after_a_held_review_is_skipped() {
         use super::{docs_only_step, DocsOnlyStep, ReviewAction};
         // PR #1 round 8: README-only push on a PR held by the .npmrc gate.
@@ -1269,6 +1562,7 @@ mod tests {
         use super::outdated_reviews;
         use crate::github::{GhUser, Review};
         let r = |body: &str, sha: &str, id: &str| Review {
+            id: 0, html_url: String::new(),
             user: GhUser { login: "me".into() },
             state: "COMMENTED".into(),
             commit_id: Some(sha.into()),

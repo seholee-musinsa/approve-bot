@@ -1,0 +1,20 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "defects",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/list.ts b/list.ts\n--- a/list.ts\n+++ b/list.ts\n@@ -1,5 +1,4 @@\n export async function listAll(api) {\n-  let cursor; const all = [];\n-  do { const page = await api.list(cursor); all.push(...page.items); cursor = page.next; } while (cursor);\n-  return all;\n+  const page = await api.list();\n+  return page.items;\n }\n",
+  "defects": [
+    {
+      "id": "d1",
+      "path": "list.ts",
+      "line": 3,
+      "severity": "major",
+      "summary": "A nonempty next cursor is ignored, so callers of listAll lose all items after the first page.",
+      "source": "Synthetic draft impact label"
+    }
+  ],
+  "notes": "A nonempty next cursor is ignored, so callers of listAll lose all items after the first page.",
+  "split": "holdout"
+}

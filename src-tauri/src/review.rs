@@ -68,6 +68,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
  "summary":{"changes":["<이 PR 이 바꾼 것, 짧은 구절 2~4개>"],"judgement":"<판단 한두 구절: 결함이 있는지와 가장 중요한 근거>","checks":["<머지 전에 사람이 확인할 것, 짧은 구절. 없으면 []>"]},
  "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
    "symbol":"<함수·컴포넌트 이름>",
+   "impact":{"consequence":"<사용자·데이터·운영 영향>","reachability":"<도달 가능한 입력·상태>","evidence":"<영향을 확인한 코드 위치>"},
    "title":"<스레드 제목 한 줄: 작성자나 사용자가 겪게 될 일. 35자 안팎>",
    "claim":"<왜 그런지 1~3문장>",
    "repro_case":{"input":"<상황·입력>","expected":"<기대>","actual":"<실제>"} 또는 null,
@@ -75,7 +76,8 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
    "evidence":"<확인 방법: 열어 본 파일:라인, grep, 대조한 코드>",
    "rule":"<근거가 된 팀 가이드·레포 규칙 한 줄, 없으면 빈 문자열>",
    "refs":["<함께 보면 좋은 같은 레포 코드 위치 path:시작-끝, 최대 2개>"],
-   "fix":"<고치는 방법 한두 문장>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>","end_line":<fix_code 가 line~end_line 구간을 통째로 바꿀 때 마지막 줄 번호, 아니면 null>,"fix_code":"<선택: 여러 줄 수정 코드>"}]}
+   "fix":"<고치는 방법 한두 문장>","suggestion":"<선택: 그 한 줄을 통째로 바꿀 코드>","end_line":<fix_code 가 line~end_line 구간을 통째로 바꿀 때 마지막 줄 번호, 아니면 null>,"fix_code":"<선택: 여러 줄 수정 코드>",
+   "suggestion_safety":{"applicability":"standalone|requires_other_changes|unknown","dependencies":["<함께 필요한 import·권한·호출부·스키마·배포 변경; 없음을 확인한 경우만 []>"],"verification":{"method":"code_inspection|test|none","result":"passed|failed|not_run","evidence":"<확인한 경로와 결과; 실제 실행한 테스트만 실행했다고 기록>"}}}]}
 ```
 글쓰기 규칙:
 - title 은 원인이 아니라 겪게 될 일로 쓴다.
@@ -97,10 +99,15 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 - 같은 우려를 findings 와 `# 미확인` 에 함께 쓰지 않는다. 줄을 짚을 수 있으면 findings, 짚을 수 없으면 `# 미확인` 에 쓴다.
 - blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 코드가 본문 목록에 적는다.
-- confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
+- confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다. 영향 크기나 수정 줄 수와 혼동하지 않는다.
+- impact 에 실제 결과, 도달 가능한 조건, 코드 근거를 분리해 적는다. 높은 confidence 만으로 blocker 로 올리지 않는다.
+- 빈 값 허용, 저장 중 값 변경, 조회 중 항목 누락, 부분 성공, 동시성, 권한 문제는 입력부터 소비처까지 추적한다. 실제 사용자 흐름이 깨지면 한 줄 수정이라도 minor 로 낮추지 않는다. 의도된 정책과 명시된 선행 PR 은 반증 없이는 결함으로 단정하지 않는다.
 - suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다.
-- fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 그러면 작성자가 버튼 한 번으로 적용할 수 있는 제안(suggestion)으로 달린다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
-- 고칠 줄이 diff 에 보이면(추가·문맥 줄) suggestion(한 줄) 이나 end_line 범위(여러 줄)를 먼저 쓴다. 작성자가 버튼 한 번으로 적용하는 수정안이 가장 많이 반영된다.
+- fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 범위와 suggestion_safety 를 모두 확인한 경우에만 버튼으로 적용할 수 있다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
+- suggestion_safety.applicability 는 해당 코드만 적용해 완결될 때만 standalone 으로 쓴다. dependencies 는 필요한 모든 추가 변경이다. 하나라도 있거나 미확인이면 requires_other_changes 또는 unknown 이다.
+- 권한을 줄이기 전 같은 job 의 쓰기 호출, 함수 변경 전 import·호출부, 데이터 변경 전 스키마·마이그레이션을 확인한다. 별도 job 으로 옮기라고 설명하면서 권한만 지우는 코드를 standalone 으로 내지 않는다.
+- verification 에 검토 방법과 실제 근거를 기록한다. 도구 없이 diff 밖 소비처를 확인했다고 쓰지 않는다. 테스트 미실행은 test/passed 가 아니다. 코드 검토로 완결성을 확인했다면 code_inspection/passed 를 쓴다.
+- 범위가 맞아도 추가 변경이 필요하거나 검증이 없으면 일반 코드로 남긴다. 코드 엔진은 의미적 안전성을 증명하거나 테스트를 대신 실행하지 않는다. major·blocker 는 적용 버튼 유무로 낮추거나 숨기지 않는다.
 - end_line 이 null 이면 fix_code 는 바뀌는 줄만 diff 형식으로 쓴다(`-` 지울 줄, `+` 넣을 줄, 앞뒤 한두 줄은 공백으로 시작). diff 형식은 고칠 줄이 diff 밖이거나 여러 곳에 흩어졌을 때만 쓴다.
 - minor·nit 는 버튼 한 번으로 적용하는 수정안(suggestion 한 줄, 또는 end_line 이 있는 fix_code)이 있어야 스레드로 달린다(nit 는 리뷰당 최대 3건). 말로만 고치는 법을 적은 minor·nit 는 본문 목록에만 남는다. 더 단순하게 쓸 수 있는 곳, 단언이 빠진 테스트처럼 작성자가 바로 고칠 수 있는 것만 nit 로 낸다.
 - major 는 fix·suggestion·fix_code 중 하나가 있어야 인라인으로 달린다. 고치는 방법을 모르면 question 으로 내린다.
@@ -351,7 +358,7 @@ fn merge_file_comments(first: &mut ReviewOutcome, extra: Vec<FileComment>) {
 fn merge_second_pass(first: &mut ReviewOutcome, second: ReviewOutcome) {
     first.cost_usd = match (first.cost_usd, second.cost_usd) {
         (Some(a), Some(b)) => Some(a + b),
-        (a, b) => a.or(b),
+        _ => None, // A partial subtotal is not a known total for all performed passes.
     };
     if !second.finished_cleanly {
         first.body.push_str("
@@ -532,6 +539,9 @@ pub struct Finding {
     pub severity: String,
     #[serde(default)]
     pub confidence: Option<f64>,
+    /// Consequence and reachability are independent of certainty and patch size.
+    #[serde(default)]
+    pub impact: Option<FindingImpact>,
     #[serde(default, deserialize_with = "null_as_default")]
     pub path: String,
     #[serde(default)]
@@ -548,6 +558,9 @@ pub struct Finding {
     pub fix: String,
     #[serde(default, deserialize_with = "null_as_default")]
     pub suggestion: String,
+    /// Model-reported applicability evidence; absence never authorizes a patch.
+    #[serde(default)]
+    pub suggestion_safety: Option<SuggestionSafety>,
     /// Multi-line corrected code. A plain code block, unless `end_line` names
     /// the contiguous diff range it replaces (then a GitHub `suggestion`).
     #[serde(default, deserialize_with = "null_as_default")]
@@ -569,6 +582,50 @@ pub struct Finding {
     /// A behavior bug's case, shown as a one-row table.
     #[serde(default)]
     pub repro_case: Option<ReproCase>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct FindingImpact {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub consequence: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub reachability: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub evidence: String,
+}
+
+/// Model-reported evidence, not a claim that the engine executed a test.
+/// Required explicit empty dependencies distinguish "none" from "not checked".
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct SuggestionSafety {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub applicability: String,
+    #[serde(default)]
+    pub dependencies: Option<Vec<String>>,
+    #[serde(default)]
+    pub verification: Option<SuggestionVerification>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
+pub struct SuggestionVerification {
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub method: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub result: String,
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub evidence: String,
+}
+
+impl SuggestionSafety {
+    fn standalone_verified(&self) -> bool {
+        self.applicability == "standalone"
+            && self.dependencies.as_ref().is_some_and(Vec::is_empty)
+            && self.verification.as_ref().is_some_and(|v| {
+                matches!(v.method.as_str(), "code_inspection" | "test")
+                    && v.result == "passed"
+                    && !v.evidence.trim().is_empty()
+            })
+    }
 }
 
 /// Situation → expected → actual, for a finding about wrong behavior.
@@ -629,6 +686,22 @@ fn fence(code: &str) -> String {
     "`".repeat((longest + 1).max(3))
 }
 
+/// Model prose may describe a patch, but only the engine may create an apply
+/// button. Handle quoted/list-indented, longer, tilde and offset fences too.
+pub(crate) fn neutralize_suggestion_fences(text: &str) -> String {
+    text.split_inclusive('\n').map(|line| {
+        let opening = line.match_indices("```").chain(line.match_indices("~~~")).find_map(|(start, marker)| {
+            let delimiter = marker.as_bytes()[0] as char;
+            let end = start + line[start..].chars().take_while(|c| *c == delimiter).count();
+            line[end..].trim_start().to_ascii_lowercase().starts_with("suggestion").then_some(end)
+        });
+        match opening {
+            Some(end) => format!("{}{}", &line[..end], if line.ends_with('\n') { "\n" } else { "" }),
+            None => line.to_string(),
+        }
+    }).collect()
+}
+
 /// Longest range a multi-line suggestion may replace.
 const MAX_SUGGESTION_LINES: u64 = 30;
 
@@ -637,6 +710,9 @@ const MAX_SUGGESTION_LINES: u64 = 30;
 /// of one file. A wrong range would corrupt code when applied, so anything
 /// doubtful returns None and the code stays a plain block.
 fn suggestion_range(f: &Finding, allowed: &HashMap<String, HashSet<u64>>) -> Option<(u64, u64)> {
+    if !f.suggestion_safety.as_ref().is_some_and(SuggestionSafety::standalone_verified) {
+        return None;
+    }
     let (start, end) = (f.line?, f.end_line?);
     if f.fix_code.trim().is_empty() || end <= start || end - start + 1 > MAX_SUGGESTION_LINES {
         return None;
@@ -648,10 +724,17 @@ fn suggestion_range(f: &Finding, allowed: &HashMap<String, HashSet<u64>>) -> Opt
 /// A fix the author can apply with one button: a single-line `suggestion`, or
 /// `fix_code` over a verified diff range.
 fn one_click(f: &Finding, allowed: &HashMap<String, HashSet<u64>>) -> bool {
-    !f.suggestion.trim().is_empty() || suggestion_range(f, allowed).is_some()
+    if !f.suggestion_safety.as_ref().is_some_and(SuggestionSafety::standalone_verified) {
+        return false;
+    }
+    if !f.suggestion.trim().is_empty() {
+        f.line.is_some_and(|line| allowed.get(&f.path).is_some_and(|lines| lines.contains(&line)))
+    } else {
+        suggestion_range(f, allowed).is_some()
+    }
 }
 
-fn render_inline(f: &Finding) -> String {
+pub(crate) fn render_inline(f: &Finding) -> String {
     render_inline_with(f, false)
 }
 
@@ -807,12 +890,12 @@ pub(crate) fn parse_inline_head(body: &str) -> InlineHead {
     InlineHead { severity, confidence, title }
 }
 
-/// `as_range`: render `fix_code` as a `suggestion` (the caller verified the range).
+/// `clickable`: the caller verified both applicability evidence and diff anchor.
 ///
 /// Reads top to bottom as: headline (what goes wrong) → why, one sentence per
 /// line → the case → what to do → the code → evidence, folded. Confidence is
 /// for the gate, not the author, so it only lives in the hidden meta line.
-fn render_inline_with(f: &Finding, as_range: bool) -> String {
+fn render_inline_with(f: &Finding, clickable: bool) -> String {
     let (emoji, _) = severity_label(&f.severity);
     let head = format!("{emoji} **{}**", finding_title(f));
     // A blocker is the one thing that should stop the eye.
@@ -833,18 +916,27 @@ fn render_inline_with(f: &Finding, as_range: bool) -> String {
         _ if !f.repro.trim().is_empty() => out.push_str(&format!("\n\n{}", sentence_lines(&f.repro))),
         _ => {}
     }
+    if let Some(impact) = &f.impact {
+        for (label, value) in [("영향", &impact.consequence), ("발생 조건", &impact.reachability), ("영향 근거", &impact.evidence)] {
+            if !value.trim().is_empty() {
+                out.push_str(&format!("\n\n{label}: {}", value.trim()));
+            }
+        }
+    }
     if !f.fix.trim().is_empty() {
         out.push_str(&format!("\n\n{}", sentence_lines(&f.fix)));
     }
     out.push_str(&format!("\n\n{}", action_line(&f.severity)));
+    let trusted_code_start = out.len();
     if !f.suggestion.trim().is_empty() {
         let code = f.suggestion.trim_end();
         let fe = fence(code);
-        out.push_str(&format!("\n\n{fe}suggestion\n{code}\n{fe}"));
+        let lang = if clickable { "suggestion" } else { "" };
+        out.push_str(&format!("\n\n{fe}{lang}\n{code}\n{fe}"));
     } else if !f.fix_code.trim().is_empty() {
         let code = f.fix_code.trim_end();
         let fe = fence(code);
-        let lang = if as_range {
+        let lang = if clickable {
             "suggestion"
         } else if looks_like_diff(code) {
             "diff"
@@ -853,8 +945,23 @@ fn render_inline_with(f: &Finding, as_range: bool) -> String {
         };
         out.push_str(&format!("\n\n{fe}{lang}\n{code}\n{fe}"));
     }
+    let trusted_code_end = out.len();
+    if !clickable && (!f.suggestion.trim().is_empty() || !f.fix_code.trim().is_empty()) {
+        out.push_str("\n\n단독 적용을 확인하지 못한 수정안입니다. 연계 변경과 적용 범위를 함께 검토해 주세요.");
+    }
     let refs: Vec<&String> = f.refs.iter().filter(|r| valid_ref(r)).take(2).collect();
     let mut evidence: Vec<String> = Vec::new();
+    if let Some(safety) = &f.suggestion_safety {
+        evidence.push(format!("모델이 보고한 적용 가능성: {}", safety.applicability));
+        if let Some(dependencies) = &safety.dependencies {
+            if !dependencies.is_empty() {
+                evidence.push(format!("함께 필요한 변경: {}", dependencies.join("; ")));
+            }
+        }
+        if let Some(v) = &safety.verification {
+            evidence.push(format!("모델이 보고한 검증: {} / {} — {}", v.method, v.result, v.evidence));
+        }
+    }
     if !f.rule.trim().is_empty() {
         evidence.push(format!("팀 규칙: {}", f.rule.trim()));
     }
@@ -869,7 +976,8 @@ fn render_inline_with(f: &Finding, as_range: bool) -> String {
     }
     out.push_str(&format!("\n\n{}", meta_line(f)));
     out.push_str(&format!("\n<!-- f:{} -->", finding_id(&f.path, &f.symbol, &f.claim)));
-    out
+    format!("{}{}{}", neutralize_suggestion_fences(&out[..trusted_code_start]),
+        &out[trusted_code_start..trusted_code_end], neutralize_suggestion_fences(&out[trusted_code_end..]))
 }
 
 /// Findings that did not become a thread (no inline line, below the inline
@@ -948,7 +1056,7 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
         if postable && (anchored || range.is_some()) {
             split.inline.push(match range {
                 Some((start, end)) => ReviewComment { path: f.path.clone(), line: end, start_line: Some(start), body: render_inline_with(f, true) },
-                None => ReviewComment { path: f.path.clone(), line: f.line.unwrap_or(0), start_line: None, body: render_inline(f) },
+                None => ReviewComment { path: f.path.clone(), line: f.line.unwrap_or(0), start_line: None, body: render_inline_with(f, one_click(f, &allowed)) },
             });
         } else if matches!(f.severity.as_str(), "blocker" | "major") {
             // Still listed in the body, so a failed file comment loses nothing.
@@ -1029,7 +1137,8 @@ fn filter_inline(raw: Vec<InlineRaw>, diff: &str) -> Vec<ReviewComment> {
             path: c.path,
             line: c.line,
             start_line: None,
-            body: c.comment,
+            // Raw comments have no engine-verified application range.
+            body: neutralize_suggestion_fences(&c.comment),
         })
         .collect()
 }
@@ -1046,7 +1155,7 @@ fn extract_review(result: &str) -> Result<(String, Verdict)> {
         let json = after[..close].trim();
         let verdict: Verdict = serde_json::from_str(json)
             .map_err(|e| anyhow!("판정 JSON 파싱 실패: {e}"))?;
-        let body = t[..open].trim().to_string();
+        let body = neutralize_suggestion_fences(t[..open].trim());
         return Ok((body, verdict));
     }
     // Fallback (older contract): first '{' .. last '}'.
@@ -1058,7 +1167,7 @@ fn extract_review(result: &str) -> Result<(String, Verdict)> {
     }
     let verdict: Verdict = serde_json::from_str(&t[s..=e])
         .map_err(|e| anyhow!("판정 JSON 파싱 실패: {e}"))?;
-    Ok((t.to_string(), verdict))
+    Ok((neutralize_suggestion_fences(t), verdict))
 }
 
 /// Read-only tool set the model may use in deep mode (no Bash/Write/network).
@@ -1413,7 +1522,7 @@ const CONTINUATION_NOTE: &str = "=== 추가 리뷰 ===\n앞선 리뷰가 diff �
 fn merge_continuation(first: &mut ReviewOutcome, extra: ReviewOutcome, round: usize) {
     first.cost_usd = match (first.cost_usd, extra.cost_usd) {
         (Some(a), Some(b)) => Some(a + b),
-        (a, b) => a.or(b),
+        _ => None, // A partial subtotal is not a known total for all performed passes.
     };
     if !extra.finished_cleanly {
         first.body.push_str(&format!(
@@ -1603,6 +1712,18 @@ mod tests {
     }
 
     #[test]
+    fn legacy_inline_comments_cannot_bypass_suggestion_safety() {
+        let comments = filter_inline(vec![InlineRaw {
+            path: "src/x.ts".into(), line: 11,
+            comment: "Proposal\n```suggestion\ncontents: read\n```\n\n````suggestion:-1+2\nnext()\n````".into(),
+        }], SAMPLE_DIFF);
+        assert_eq!(comments.len(), 1);
+        assert!(!comments[0].body.contains("suggestion"));
+        assert!(comments[0].body.contains("contents: read"));
+        assert!(comments[0].body.contains("next()"));
+    }
+
+    #[test]
     fn filter_inline_keeps_valid_drops_bogus() {
         let raw = vec![
             InlineRaw { path: "src/x.ts".into(), line: 11, comment: "실제 줄".into() },
@@ -1627,6 +1748,14 @@ mod tests {
             repro: "빈 배열이면 통과".into(),
             evidence: "src/x.ts:11 확인".into(),
             fix: "length 도 검사".into(),
+            suggestion_safety: Some(SuggestionSafety {
+                applicability: "standalone".into(),
+                dependencies: Some(vec![]),
+                verification: Some(SuggestionVerification {
+                    method: "code_inspection".into(), result: "passed".into(),
+                    evidence: "Checked local guard and consumer".into(),
+                }),
+            }),
             ..Default::default()
         }
     }
@@ -1720,6 +1849,21 @@ mod tests {
             followups: vec![],
             summary: ReviewSummary::default(),
             rechecked: false,
+        }
+    }
+
+    #[test]
+    fn incomplete_pass_cost_never_becomes_a_complete_total() {
+        for (initial_cost, extra_cost) in [(Some(0.5), None), (None, Some(0.7)), (None, None)] {
+            let mut first = outcome(vec![], vec![]);
+            first.cost_usd = initial_cost;
+            let mut extra = outcome(vec![], vec![]);
+            extra.cost_usd = extra_cost;
+            let mut second_pass = first.clone();
+            merge_second_pass(&mut second_pass, extra.clone());
+            assert_eq!(second_pass.cost_usd, None, "second pass costs are incomplete");
+            merge_continuation(&mut first, extra, 1);
+            assert_eq!(first.cost_usd, None, "continuation costs are incomplete");
         }
     }
 
@@ -1821,12 +1965,130 @@ mod tests {
         assert!(first.body.contains("재점검이 정상 완료되지 않아"));
     }
 
+    // Catches unsafe model output turning into an independently applicable patch.
+    #[test]
+    fn synthetic_safety_corpus() {
+        let cases: Vec<serde_json::Value> = serde_json::from_str(include_str!("../../eval/synthetic/safety.json")).unwrap();
+        let mut counts = std::collections::BTreeMap::<String, usize>::new();
+        for case in cases {
+            let id = case["id"].as_str().unwrap();
+            let f: Finding = serde_json::from_value(case["finding"].clone()).unwrap();
+            let split = split_findings(&[f.clone()], case["diff"].as_str().unwrap());
+            let clickable = split.inline.iter().any(|c| c.body.contains("suggestion\n"));
+            assert_eq!(clickable, case["expected"]["clickable"].as_bool().unwrap(), "{id}");
+            assert_eq!(split.inline.len(), case["expected"]["inline"].as_u64().unwrap() as usize, "{id}");
+            assert_eq!(split.blockers.len(), case["expected"]["blockers"].as_u64().unwrap() as usize, "{id}");
+            if !clickable {
+                let plain = render_inline(&f);
+                let code = if f.suggestion.is_empty() { &f.fix_code } else { &f.suggestion };
+                assert!(plain.contains(code), "{id}: proposal lost");
+                assert!(!plain.contains("suggestion\n"), "{id}: plain rendering is clickable");
+            }
+            *counts.entry(case["split"].as_str().unwrap().to_string()).or_default() += 1;
+        }
+        println!("SAFETY_EVAL {}", serde_json::json!({"suite":"synthetic_policy", "passed_by_split":counts, "unsafe_clickable":0, "model_quality_measured":false}));
+    }
+
+    #[test]
+    fn model_prose_cannot_bypass_suggestion_applicability() {
+        let injected = "Dependent change\n> ```suggestion:-1+2\ncontents: read\n> ```";
+        for field in ["claim", "fix", "repro", "evidence", "rule", "title"] {
+            let mut value = serde_json::json!({"severity":"major", "confidence":90,"path":"src/x.ts","line":11,
+                "claim":"Needs another change", "fix":"Move writer first",
+                "suggestion_safety":{"applicability":"requires_other_changes", "dependencies":["Move writer"]}});
+            value[field] = serde_json::Value::String(injected.into());
+            let f: Finding = serde_json::from_value(value).unwrap();
+            let split = split_findings(&[f], SAMPLE_DIFF);
+            assert_eq!(split.inline.len(), 1);
+            assert!(!split.inline[0].body.contains("```suggestion"), "prose field {field} bypassed policy");
+        }
+        let mut f = finding("major", 90.0, "src/x.ts", Some(11), "claim");
+        f.suggestion = "safe();".into();
+        f.fix = injected.into();
+        f.impact = Some(FindingImpact { consequence:injected.into(), reachability:injected.into(), evidence:injected.into() });
+        f.suggestion_safety.as_mut().unwrap().verification.as_mut().unwrap().evidence = injected.into();
+        let body = &split_findings(&[f], SAMPLE_DIFF).inline[0].body;
+        assert_eq!(body.matches("```suggestion").count(), 1, "only engine-vetted code may be clickable");
+        assert!(body.contains("```suggestion\nsafe();\n```"));
+    }
+
+    #[test]
+    fn model_review_body_cannot_supply_apply_buttons() {
+        let raw = "# 검증 근거\n~~~suggestion\ncontents: read\n~~~\n```json\n{\"verdict\":\"comment\",\"score\":3}\n```";
+        let (body, _) = extract_review(raw).unwrap();
+        assert!(!body.contains("~~~suggestion"));
+        assert!(body.contains("contents: read"));
+    }
+
+    #[test]
+    fn suggestion_safety_rejects_dependent_and_unverified_patches() {
+        let base = serde_json::json!({
+            "severity": "major", "confidence": 95, "path": "src/x.ts", "line": 11,
+            "claim": "Tag creation loses its required permission", "fix": "Move the tag writer into another job",
+            "suggestion": "contents: read"
+        });
+        let unsafe_cases = [
+            serde_json::Value::Null,
+            serde_json::json!({"applicability":"requires_other_changes", "dependencies":["Move tag writer"], "verification":{"method":"code_inspection","result":"passed","evidence":"Later writer still requires contents: write"}}),
+            serde_json::json!({"applicability":"standalone", "dependencies":["Add import"], "verification":{"method":"code_inspection","result":"passed","evidence":"Checked caller"}}),
+            serde_json::json!({"applicability":"standalone", "dependencies":[], "verification":{"method":"code_inspection","result":"not_run","evidence":"Not checked"}}),
+            serde_json::json!({"applicability":"standalone", "dependencies":[], "verification":{"method":"code_inspection","result":"passed","evidence":" "}}),
+            serde_json::json!({"applicability":"standalone", "verification":{"method":"code_inspection","result":"passed","evidence":"No dependency list supplied"}}),
+        ];
+        for safety in unsafe_cases {
+            let mut data = base.clone();
+            data["suggestion_safety"] = safety.clone();
+            let f: Finding = serde_json::from_value(data).unwrap();
+            let split = split_findings(&[f], SAMPLE_DIFF);
+            assert_eq!(split.inline.len(), 1, "major remains visible");
+            assert!(!split.inline[0].body.contains("```suggestion"), "unsafe metadata: {safety}");
+            assert!(split.inline[0].body.contains("contents: read"), "proposal remains readable");
+        }
+    }
+
+    #[test]
+    fn standalone_verified_patch_is_clickable_only_on_the_diff() {
+        let f: Finding = serde_json::from_value(serde_json::json!({
+            "severity":"minor", "confidence":90, "path":"src/x.ts", "line":11,
+            "claim":"Empty value passes", "suggestion":"if (!value.trim()) return;",
+            "suggestion_safety":{"applicability":"standalone", "dependencies":[],
+                "verification":{"method":"code_inspection","result":"passed","evidence":"Guard and local consumer inspected"}}
+        })).unwrap();
+        let s = split_findings(&[f.clone()], SAMPLE_DIFF);
+        assert_eq!(s.inline.len(), 1);
+        assert!(s.inline[0].body.contains("```suggestion"));
+        let mut off_diff = f;
+        off_diff.line = Some(99);
+        assert!(!one_click(&off_diff, &commentable_lines(SAMPLE_DIFF)), "an off-diff patch is never applicable");
+    }
+
+    #[test]
+    fn impact_and_suggestion_evidence_remain_distinct_from_confidence() {
+        let f: Finding = serde_json::from_value(serde_json::json!({
+            "severity":"major", "confidence":75, "path":"src/x.ts", "line":11,
+            "claim":"The write loses its permission", "suggestion":"contents: read",
+            "impact":{"consequence":"Tag publication fails", "reachability":"Release path calls createTag", "evidence":"release.ts:40"},
+            "suggestion_safety":{"applicability":"requires_other_changes", "dependencies":["Move tag writer into a separate job"],
+                "verification":{"method":"code_inspection","result":"failed","evidence":"Writer still uses this token"}}
+        })).unwrap();
+        let s = split_findings(&[f], SAMPLE_DIFF);
+        let body = &s.inline[0].body;
+        assert!(body.contains("Tag publication fails"));
+        assert!(body.contains("Release path calls createTag"));
+        assert!(body.contains("release.ts:40"));
+        assert!(body.contains("Move tag writer into a separate job"));
+        assert!(body.contains("Writer still uses this token"));
+        assert!(body.contains("모델이 보고한"), "do not claim engine-executed verification");
+        assert!(body.contains("sev:major c:75"));
+        assert!(s.blockers.is_empty(), "impact text never promotes severity automatically");
+    }
+
     #[test]
     fn suggestion_block_only_when_given() {
         let mut f = finding("minor", 80.0, "src/x.ts", Some(11), "c");
         assert!(!render_inline(&f).contains("```suggestion"));
         f.suggestion = "const y = 2;".into();
-        assert!(render_inline(&f).contains("```suggestion\nconst y = 2;\n```"));
+        assert!(split_findings(&[f], SAMPLE_DIFF).inline[0].body.contains("```suggestion\nconst y = 2;\n```"));
     }
 
     #[test]
@@ -1896,6 +2158,7 @@ mod tests {
         f.evidence = String::new();
         f.rule = String::new();
         f.refs = vec![];
+        f.suggestion_safety = None;
         assert!(!render_inline(&f).contains("<details>"));
     }
 
@@ -1958,7 +2221,7 @@ mod tests {
         assert!(body.contains("```\nif (!a?.length) return;\nrun(a);\n```"));
         assert!(!body.contains("```suggestion"));
         f.suggestion = "const y = 2;".into();
-        let body = render_inline(&f);
+        let body = split_findings(&[f], SAMPLE_DIFF).inline[0].body.clone();
         assert!(body.contains("```suggestion\nconst y = 2;\n```"));
         assert!(!body.contains("run(a);"), "one block only");
     }
@@ -2149,6 +2412,46 @@ mod tests {
         let out = "본문\n```json\n{\"verdict\":\"approve\",\"blocking_issues\":[]}\n```";
         let (_b, v) = extract_review(out).unwrap();
         assert_eq!(v.score, None);
+    }
+
+    /// Explicitly opt-in quality sampling. Inputs contain only synthetic diffs;
+    /// labels and expected findings are never passed to the review model.
+    #[test]
+    #[ignore = "requires Claude credentials and incurs model cost; no GitHub access"]
+    fn synthetic_quality_samples() {
+        let label = std::env::var("EVAL_LABEL").expect("set a fresh EVAL_LABEL");
+        assert!(!label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        let split = std::env::var("SPLIT").unwrap_or_else(|_| "dev".into());
+        assert!(matches!(split.as_str(), "dev" | "holdout" | "all"));
+        let samples: usize = std::env::var("EVAL_SAMPLES").unwrap_or_else(|_| "2".into()).parse().unwrap();
+        assert!((1..=20).contains(&samples));
+        let model = std::env::var("EVAL_MODEL").expect("set EVAL_MODEL for reproducible sampling");
+        let guide_path = std::env::var("EVAL_GUIDE").ok();
+        let guide = guide_path.as_ref().map(|p| std::fs::read_to_string(p).unwrap()).unwrap_or_else(|| DEFAULT_GUIDE.into());
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let output = root.join("eval/out2").join(&label);
+        std::fs::create_dir_all(&output).unwrap();
+        let mut files: Vec<_> = std::fs::read_dir(root.join("eval/synthetic/truth")).unwrap().map(|e| e.unwrap().path()).collect();
+        files.sort();
+        for file in files {
+            if file.extension().and_then(|s| s.to_str()) != Some("json") { continue; }
+            let case: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            if split != "all" && case["split"].as_str().unwrap_or("dev") != split { continue; }
+            let key = file.file_stem().unwrap().to_str().unwrap();
+            for sample in 1..=samples {
+                let path = output.join(format!("{key}.s{sample}.json"));
+                assert!(!path.exists(), "Use a fresh label; refusing to mix samples at {}", path.display());
+                let result = review_pr(&guide, "Repository: synthetic/reliability\nTitle: Synthetic code change\nBody: Review the supplied diff.", case["diff"].as_str().unwrap(), &model, 0);
+                let inline: Vec<_> = result.inline.iter().map(|c| serde_json::json!({"path":c.path,"line":c.line,"comment":c.body})).collect();
+                let data = serde_json::json!({"body":result.body,"verdict":result.verdict,"score":result.score,
+                    "blocking_issues":result.blocking_issues,"findings":result.findings,"inline":inline,
+                    "finished_cleanly":result.finished_cleanly,"explored":result.explored,"cost_usd":result.cost_usd,
+                    "model":model,"guide_path":guide_path,"guide_fingerprint":crate::audit::fingerprint(&guide),
+                    "dataset":"synthetic-v1","mode":"diff_only","split":split});
+                std::fs::write(path, serde_json::to_string_pretty(&data).unwrap()).unwrap();
+                assert!(result.finished_cleanly, "model review failed for {key}; recorded as unfinished");
+            }
+        }
     }
 
     // Live smoke test — spawns the real `claude` CLI (network, ~$0.10, slow).

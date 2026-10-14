@@ -1,0 +1,19 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "defects",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/validation.ts b/validation.ts\n--- a/validation.ts\n+++ b/validation.ts\n@@ -1,4 +1,4 @@\n export function ship(value: string) {\n-  if (!value.trim()) throw new Error(\"empty\");\n+  if (value == null) throw new Error(\"empty\");\n   return { shipped: true, invoice: value.trim() };\n }\n",
+  "defects": [
+    {
+      "id": "d1",
+      "path": "validation.ts",
+      "line": 2,
+      "severity": "major",
+      "summary": "Whitespace-only invoice passes the guard and creates a shipment with an empty invoice.",
+      "source": "Synthetic draft impact label"
+    }
+  ],
+  "notes": "Whitespace-only invoice passes the guard and creates a shipment with an empty invoice."
+}

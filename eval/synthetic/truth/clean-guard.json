@@ -1,0 +1,11 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "clean",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/safe.ts b/safe.ts\n--- a/safe.ts\n+++ b/safe.ts\n@@ -1 +1 @@\n-export const canSave = value => value.length > 0;\n+export const canSave = value => value.trim().length > 0;\n",
+  "defects": [],
+  "notes": "No defect: trim rejects whitespace-only values while retaining nonempty values.",
+  "split": "holdout"
+}
