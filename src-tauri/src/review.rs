@@ -100,7 +100,9 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다.
 - suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다.
 - fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 그러면 작성자가 버튼 한 번으로 적용할 수 있는 제안(suggestion)으로 달린다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
-- end_line 이 null 이면 fix_code 는 바뀌는 줄만 diff 형식으로 쓴다(`-` 지울 줄, `+` 넣을 줄, 앞뒤 한두 줄은 공백으로 시작).
+- 고칠 줄이 diff 에 보이면(추가·문맥 줄) suggestion(한 줄) 이나 end_line 범위(여러 줄)를 먼저 쓴다. 작성자가 버튼 한 번으로 적용하는 수정안이 가장 많이 반영된다.
+- end_line 이 null 이면 fix_code 는 바뀌는 줄만 diff 형식으로 쓴다(`-` 지울 줄, `+` 넣을 줄, 앞뒤 한두 줄은 공백으로 시작). diff 형식은 고칠 줄이 diff 밖이거나 여러 곳에 흩어졌을 때만 쓴다.
+- nit 도 고치는 코드(suggestion·fix_code)가 있고 줄이 있으면 스레드로 달린다(리뷰당 최대 3건). 더 단순하게 쓸 수 있는 곳, 단언이 빠진 테스트처럼 작성자가 바로 고칠 수 있는 것만 nit 로 낸다.
 - major·minor 는 fix·suggestion·fix_code 중 하나가 있어야 인라인으로 달린다. 고치는 방법을 모르면 question 으로 내린다.
 - 재리뷰 블록이 있으면 JSON 에 `"followups":[{"id":"<이전 지적 f:id>","status":"resolved|partial|unresolved|wont_fix|withdrawn","note":"<근거 한 줄>"}]` 를 이전 지적마다 하나씩 넣는다.
 - 이 JSON 은 게이트 판정과 인라인 코멘트 게시에 쓰인다."#;
@@ -887,10 +889,27 @@ struct Split {
     unanchored: Vec<Finding>,
 }
 
+/// Most nits that become threads per review. A nit with a ready fix on a diff
+/// line is the kind other reviewers' threads get acted on (simplification,
+/// test gaps); left in the body it is rarely seen. Capped so threads stay
+/// about real problems.
+const MAX_NIT_THREADS: usize = 3;
+
 fn split_findings(findings: &[Finding], diff: &str) -> Split {
     let allowed = commentable_lines(diff);
     let mut split = Split { inline: vec![], file_level: vec![], blockers: vec![], unanchored: vec![] };
-    for f in findings {
+    // The most confident nits that have a fix and a diff line.
+    let mut nits: Vec<(usize, f64)> = findings
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.severity == "nit" && f.has_fix() && !f.claim.trim().is_empty())
+        .filter(|(_, f)| f.line.is_some_and(|l| allowed.get(&f.path).is_some_and(|set| set.contains(&l))))
+        .map(|(i, f)| (i, f.confidence.unwrap_or(0.0)))
+        .filter(|(_, c)| *c >= INLINE_MIN_CONFIDENCE)
+        .collect();
+    nits.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let nit_ok: HashSet<usize> = nits.into_iter().take(MAX_NIT_THREADS).map(|(i, _)| i).collect();
+    for (idx, f) in findings.iter().enumerate() {
         if f.claim.trim().is_empty() {
             continue;
         }
@@ -898,7 +917,8 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
             let at = if f.path.is_empty() { String::new() } else { format!(" ({})", f.path) };
             split.blockers.push(format!("{}{at}", f.claim.trim()));
         }
-        let postable = matches!(f.severity.as_str(), "blocker" | "major" | "minor" | "question")
+        let postable = (matches!(f.severity.as_str(), "blocker" | "major" | "minor" | "question")
+            || nit_ok.contains(&idx))
             && f.confidence.unwrap_or(0.0) >= INLINE_MIN_CONFIDENCE
             // A blocker is always posted, and a question asks rather than
             // fixes; other findings need a way to fix them. Recent human
@@ -1599,6 +1619,30 @@ mod tests {
     }
 
     #[test]
+    fn up_to_three_fixable_nits_become_threads_most_confident_first() {
+        let nit = |conf: f64, line: u64, claim: &str, fix: bool| {
+            let mut f = finding("nit", conf, "src/x.ts", Some(line), claim);
+            if !fix {
+                f.fix = String::new();
+            }
+            f
+        };
+        let fs = vec![
+            nit(75.0, 10, "넷째", true),
+            nit(95.0, 11, "첫째", true),
+            nit(90.0, 12, "둘째", true),
+            nit(85.0, 13, "셋째", true),
+            nit(99.0, 10, "고칠 코드 없음", false),
+            nit(60.0, 11, "확신 낮음", true),
+        ];
+        let s = split_findings(&fs, SAMPLE_DIFF);
+        let titles: Vec<String> = s.inline.iter().map(|c| c.body.lines().next().unwrap().to_string()).collect();
+        // The three most confident fixable nits, in the order the model gave them.
+        assert_eq!(titles, vec!["🔘 **첫째**", "🔘 **둘째**", "🔘 **셋째**"], "{titles:?}");
+        assert!(s.inline[0].body.contains("참고만 해 주세요."));
+    }
+
+    #[test]
     fn a_question_without_a_line_or_with_low_confidence_stays_in_the_body() {
         let fs = vec![
             finding("question", 95.0, "src/x.ts", None, "줄 없는 질문"),
@@ -1629,11 +1673,12 @@ mod tests {
             finding("nit", 95.0, "src/x.ts", Some(11), "이름"),
         ];
         let s = split_findings(&fs, SAMPLE_DIFF);
-        // The confident, anchored blocker and question go inline; the nit and
+        // The confident, anchored blocker, question and fixable nit go inline;
         // the weak or off-diff majors do not.
-        assert_eq!(s.inline.len(), 2, "blocker + question");
+        assert_eq!(s.inline.len(), 3, "blocker + question + nit");
         assert!(s.inline[1].body.starts_with("❔ **의도인가요**"), "{}", s.inline[1].body);
         assert!(s.inline[1].body.contains("의도한 동작인지 답글로 알려 주세요."));
+        assert!(s.inline[2].body.starts_with("🔘 **이름**"), "{}", s.inline[2].body);
         assert!(s.inline[0].body.starts_with("> [!CAUTION]\n> 🔴 **빈 목록이 통과**"), "{}", s.inline[0].body);
         assert!(s.inline[0].body.contains("\n\n빈 배열이면 통과\n\n"));
         assert!(s.inline[0].body.contains("<!-- meta sev:blocker c:90 -->"));

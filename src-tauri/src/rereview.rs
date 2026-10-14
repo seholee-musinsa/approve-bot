@@ -10,13 +10,17 @@
 use crate::github::InlineThreadComment;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct PrevFinding {
     pub id: String,
     pub severity: String,
     pub path: String,
     pub line: Option<u64>,
     pub claim: String,
+    /// REST id of the thread's root comment (where follow-up replies go).
+    pub comment_id: u64,
+    /// The status of my last follow-up reply in this thread, if any.
+    pub last_reply: Option<String>,
 }
 
 /// One status the model reports for an earlier finding.
@@ -54,15 +58,73 @@ pub fn prev_findings(comments: &[InlineThreadComment], me: &str) -> Vec<PrevFind
         }
         let head = crate::review::parse_inline_head(&c.body);
         let (severity, claim) = (head.severity, head.title);
+        let last_reply = comments
+            .iter()
+            .filter(|r| r.in_reply_to_id == Some(c.id) && r.user.login.eq_ignore_ascii_case(me))
+            .rev()
+            .find_map(|r| reply_status(&r.body));
         out.push(PrevFinding {
             id,
             severity,
             path: c.path.clone(),
             line: if c.subject_type.as_deref() == Some("file") { None } else { c.line.or(c.original_line) },
             claim,
+            comment_id: c.id,
+            last_reply,
         });
     }
     out
+}
+
+/// Hidden marker on a follow-up reply: `<!-- fu:resolved -->`.
+const REPLY_MARK: &str = "<!-- fu:";
+
+fn reply_status(body: &str) -> Option<String> {
+    let start = body.find(REPLY_MARK)? + REPLY_MARK.len();
+    let rest = &body[start..];
+    Some(rest[..rest.find(" -->")?].trim().to_string())
+}
+
+/// What happens to an earlier finding's thread after a follow-up round.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ThreadStep {
+    /// Reply and resolve: the finding is settled.
+    Close(String),
+    /// Reply, leave open: the author still has something to do.
+    Note(String),
+    /// Nothing to say, or it was already said.
+    Leave,
+}
+
+/// The follow-up verdict, said where the finding lives.
+///
+/// The bot judged each earlier finding on every round but only wrote it in
+/// the review body, so the thread itself stayed open and silent. In merged
+/// PRs 44% of the bot's threads ended with no reply and no change on their
+/// line, including ones the bot had already judged resolved (a fix made a few
+/// lines away). Settled findings get a reply and are resolved; open ones get a
+/// reply once per status. A finding the model gave no status is left alone —
+/// silence is not a verdict.
+pub fn thread_step(status: &str, note: &str, head_sha: &str, last_reply: Option<&str>) -> ThreadStep {
+    let sha = &head_sha[..head_sha.len().min(7)];
+    let note = note.trim();
+    let with_note = |lead: String| {
+        let mut b = lead;
+        if !note.is_empty() {
+            b.push_str(&format!("\n\n{note}"));
+        }
+        b.push_str(&format!("\n\n{REPLY_MARK}{status} -->"));
+        b
+    };
+    match status {
+        "resolved" => ThreadStep::Close(with_note(format!("✅ `{sha}` 에서 해소된 것을 확인했습니다."))),
+        "withdrawn" => ThreadStep::Close(with_note("↩️ 다시 확인해 보니 이 지적은 맞지 않았습니다. 철회합니다.".to_string())),
+        "wont_fix" => ThreadStep::Close(with_note("🆗 남겨 주신 이유대로 반영하지 않는 것으로 정리합니다.".to_string())),
+        _ if last_reply == Some(status) => ThreadStep::Leave,
+        "partial" => ThreadStep::Note(with_note(format!("🔸 `{sha}` 기준으로 일부만 해소됐습니다."))),
+        "unresolved" => ThreadStep::Note(with_note(format!("⏳ `{sha}` 에서도 그대로입니다."))),
+        _ => ThreadStep::Leave,
+    }
 }
 
 pub(crate) fn marker_id(body: &str) -> Option<String> {
@@ -123,6 +185,11 @@ pub fn open_blockers(prev: &[PrevFinding], followups: &[Followup]) -> Vec<String
         })
         .map(|p| format!("이전 blocker 미해소: {} ({})", p.claim, p.path))
         .collect()
+}
+
+/// The followup the model wrote for an earlier finding, if any.
+pub fn followup_for<'a>(p: &PrevFinding, followups: &'a [Followup]) -> Option<&'a Followup> {
+    followups.iter().find(|f| f.id.trim().trim_start_matches("f:") == p.id)
 }
 
 /// The status the model gave an earlier finding. No followup counts as
@@ -288,10 +355,10 @@ mod tests {
     #[test]
     fn open_blockers_need_explicit_resolution() {
         let prev = vec![
-            PrevFinding { id: "a".into(), severity: "blocker".into(), path: "x".into(), line: None, claim: "A".into() },
-            PrevFinding { id: "b".into(), severity: "blocker".into(), path: "x".into(), line: None, claim: "B".into() },
-            PrevFinding { id: "c".into(), severity: "blocker".into(), path: "x".into(), line: None, claim: "C".into() },
-            PrevFinding { id: "d".into(), severity: "major".into(), path: "x".into(), line: None, claim: "D".into() },
+            PrevFinding { id: "a".into(), severity: "blocker".into(), path: "x".into(), line: None, claim: "A".into(), ..Default::default() },
+            PrevFinding { id: "b".into(), severity: "blocker".into(), path: "x".into(), line: None, claim: "B".into(), ..Default::default() },
+            PrevFinding { id: "c".into(), severity: "blocker".into(), path: "x".into(), line: None, claim: "C".into(), ..Default::default() },
+            PrevFinding { id: "d".into(), severity: "major".into(), path: "x".into(), line: None, claim: "D".into(), ..Default::default() },
         ];
         let f = |id: &str, s: &str| Followup { id: id.into(), status: s.into(), note: String::new() };
         let fu = vec![f("f:a", "resolved"), f("b", "partial")];
@@ -315,7 +382,7 @@ mod tests {
     }
 
     fn prev(id: &str, sev: &str, path: &str, line: u64, claim: &str) -> PrevFinding {
-        PrevFinding { id: id.into(), severity: sev.into(), path: path.into(), line: Some(line), claim: claim.into() }
+        PrevFinding { id: id.into(), severity: sev.into(), path: path.into(), line: Some(line), claim: claim.into(), ..Default::default() }
     }
 
     fn fu(id: &str, status: &str, note: &str) -> Followup {
@@ -393,5 +460,42 @@ mod tests {
         let p = prev_findings(&[c("me", &body, false)], "me");
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].severity.as_str(), p[0].claim.as_str()), ("major", "권한 없이 저장됩니다"));
+    }
+
+    #[test]
+    fn settled_findings_close_their_thread_with_a_reply() {
+        match thread_step("resolved", "길이 검사를 추가했습니다.", "06e26a6aaaa", None) {
+            ThreadStep::Close(b) => {
+                assert!(b.starts_with("✅ `06e26a6` 에서 해소된 것을 확인했습니다.\n\n길이 검사를 추가했습니다."), "{b}");
+                assert!(b.ends_with("<!-- fu:resolved -->"));
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(thread_step("withdrawn", "", "a", None), ThreadStep::Close(b) if b.contains("철회합니다")));
+        assert!(matches!(thread_step("wont_fix", "", "a", None), ThreadStep::Close(b) if b.contains("반영하지 않는 것으로")));
+    }
+
+    #[test]
+    fn open_findings_get_one_note_per_status_and_silence_is_left_alone() {
+        assert!(matches!(thread_step("unresolved", "그대로", "abc1234", None), ThreadStep::Note(b) if b.contains("⏳ `abc1234` 에서도 그대로입니다.")));
+        // Same status as my last reply in the thread → say nothing again.
+        assert_eq!(thread_step("unresolved", "그대로", "def5678", Some("unresolved")), ThreadStep::Leave);
+        // Status moved → a new note.
+        assert!(matches!(thread_step("partial", "", "def5678", Some("unresolved")), ThreadStep::Note(b) if b.contains("일부만")));
+        // The model gave no status for it.
+        assert_eq!(thread_step("", "", "a", None), ThreadStep::Leave);
+    }
+
+    #[test]
+    fn my_last_reply_status_is_read_from_the_thread() {
+        let root = InlineThreadComment { id: 7, ..c("me", "🔵 **x**\n\n<!-- meta sev:minor c:80 -->\n<!-- f:aaaa1111 -->", false) };
+        let mut r1 = c("me", "⏳ 그대로\n\n<!-- fu:unresolved -->", true);
+        r1.in_reply_to_id = Some(7);
+        let mut r2 = c("author", "곧 고칠게요", true);
+        r2.in_reply_to_id = Some(7);
+        let mut r3 = c("me", "🔸 일부\n\n<!-- fu:partial -->", true);
+        r3.in_reply_to_id = Some(7);
+        let p = prev_findings(&[root, r1, r2, r3], "me");
+        assert_eq!((p[0].comment_id, p[0].last_reply.as_deref()), (7, Some("partial")));
     }
 }

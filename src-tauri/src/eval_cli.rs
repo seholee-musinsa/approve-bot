@@ -231,6 +231,7 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
                         path: f.path.clone(),
                         line: f.line,
                         claim: f.claim.clone(),
+                        ..Default::default()
                     })
                     .collect();
                 let delta_diff = client.get_compare_diff(&owner, &repo, prev_sha, sha).await?;
