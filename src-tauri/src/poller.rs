@@ -291,6 +291,54 @@ fn other_notes(decision: &Gate, sensitive: &[String], omitted: &[String], contin
     gate_notes(sensitive, omitted, continued)
 }
 
+/// Say each earlier finding's follow-up verdict in its own thread, and resolve
+/// the settled ones (see `rereview::thread_step`). Runs after the follow-up
+/// review is posted. Best-effort per thread: a failure leaves that thread as
+/// it was and is logged.
+#[allow(clippy::too_many_arguments)]
+async fn settle_threads(
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    number: u64,
+    round: &crate::rereview::Round,
+    followups: &[crate::rereview::Followup],
+    head_sha: &str,
+) {
+    let threads = match client.review_threads(owner, repo, number).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "could not read review threads; follow-up replies skipped");
+            return;
+        }
+    };
+    for p in &round.prev {
+        let Some(f) = crate::rereview::followup_for(p, followups) else { continue };
+        let Some((thread_id, resolved)) = threads.get(&p.comment_id) else { continue };
+        // Someone already resolved it; a reply now would only reopen the noise.
+        if *resolved {
+            continue;
+        }
+        match crate::rereview::thread_step(&f.status, &f.note, head_sha, p.last_reply.as_deref()) {
+            crate::rereview::ThreadStep::Close(body) => {
+                if let Err(e) = client.reply_to_review_comment(owner, repo, number, p.comment_id, &body).await {
+                    warn!(error = %e, "follow-up reply failed");
+                    continue;
+                }
+                if let Err(e) = client.resolve_review_thread(thread_id).await {
+                    warn!(error = %e, "resolving a settled thread failed");
+                }
+            }
+            crate::rereview::ThreadStep::Note(body) => {
+                if let Err(e) = client.reply_to_review_comment(owner, repo, number, p.comment_id, &body).await {
+                    warn!(error = %e, "follow-up reply failed");
+                }
+            }
+            crate::rereview::ThreadStep::Leave => {}
+        }
+    }
+}
+
 /// Hide the earlier rounds once the new one is up. Best-effort: a failure
 /// leaves them visible, which is how it was before.
 async fn hide_outdated(client: &GitHubClient, my_reviews: &[&crate::github::Review], head_sha: &str) {
@@ -887,8 +935,9 @@ async fn handle_pr(
             {
                 Ok(()) => {
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
-                    if round.is_some() {
+                    if let Some(r) = &round {
                         hide_outdated(client, &my_reviews, head_sha).await;
+                        settle_threads(client, owner, repo, pr.number, r, &outcome.followups, head_sha).await;
                     }
                     if n > 0 {
                         inline_str.push_str(&format!(", 파일 스레드 {n}건"));
@@ -930,8 +979,9 @@ async fn handle_pr(
             {
                 Ok(()) => {
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
-                    if round.is_some() {
+                    if let Some(r) = &round {
                         hide_outdated(client, &my_reviews, head_sha).await;
+                        settle_threads(client, owner, repo, pr.number, r, &outcome.followups, head_sha).await;
                     }
                     if n > 0 {
                         inline_str.push_str(&format!(", 파일 스레드 {n}건"));

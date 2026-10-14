@@ -348,6 +348,86 @@ impl GitHubClient {
         Err(anyhow!("file comment failed: {status} {b}"))
     }
 
+    /// POST a GraphQL query. GitHub reports most failures as 200 with an
+    /// `errors` array, so that counts as a failure too.
+    async fn graphql(&self, query: &str, variables: serde_json::Value) -> Result<serde_json::Value> {
+        let payload = serde_json::json!({ "query": query, "variables": variables });
+        let resp = self
+            .http
+            .post(format!("{API}/graphql"))
+            .headers(self.headers())
+            .json(&payload)
+            .send()
+            .await?;
+        let status = resp.status();
+        let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() || v.get("errors").is_some_and(|e| !e.is_null()) {
+            let e = v.get("errors").map(|e| e.to_string()).unwrap_or_default();
+            return Err(anyhow!("graphql failed: {status} {}", e.chars().take(300).collect::<String>()));
+        }
+        Ok(v)
+    }
+
+    /// Review threads of a PR keyed by their root comment's REST id:
+    /// GraphQL thread id and whether it is already resolved.
+    pub async fn review_threads(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<std::collections::HashMap<u64, (String, bool)>> {
+        const Q: &str = "query($o:String!,$r:String!,$n:Int!,$after:String){ repository(owner:$o,name:$r){ pullRequest(number:$n){ reviewThreads(first:100, after:$after){ pageInfo{ hasNextPage endCursor } nodes{ id isResolved comments(first:1){ nodes{ databaseId } } } } } } }";
+        let mut out = std::collections::HashMap::new();
+        let mut after: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let v = self
+                .graphql(Q, serde_json::json!({ "o": owner, "r": repo, "n": number, "after": after }))
+                .await?;
+            let threads = &v["data"]["repository"]["pullRequest"]["reviewThreads"];
+            for t in threads["nodes"].as_array().into_iter().flatten() {
+                let root = t["comments"]["nodes"][0]["databaseId"].as_u64();
+                let id = t["id"].as_str();
+                if let (Some(root), Some(id)) = (root, id) {
+                    out.insert(root, (id.to_string(), t["isResolved"].as_bool().unwrap_or(false)));
+                }
+            }
+            if threads["pageInfo"]["hasNextPage"].as_bool() != Some(true) {
+                break;
+            }
+            after = threads["pageInfo"]["endCursor"].as_str().map(str::to_string);
+        }
+        Ok(out)
+    }
+
+    /// Reply in an existing review thread (`comment_id` = its root comment).
+    pub async fn reply_to_review_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+        comment_id: u64,
+        body: &str,
+    ) -> Result<()> {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies");
+        let resp = self.http.post(&url).headers(self.headers()).json(&serde_json::json!({ "body": body })).send().await?;
+        let status = resp.status();
+        if status.is_success() {
+            return Ok(());
+        }
+        let b = resp.text().await.unwrap_or_default();
+        Err(anyhow!("thread reply failed: {status} {}", b.chars().take(300).collect::<String>()))
+    }
+
+    /// Mark a review thread resolved.
+    pub async fn resolve_review_thread(&self, thread_id: &str) -> Result<()> {
+        self.graphql(
+            "mutation($id: ID!) { resolveReviewThread(input: {threadId: $id}) { thread { isResolved } } }",
+            serde_json::json!({ "id": thread_id }),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// Hide a review body as "Outdated". GitHub keeps it one click away; the
     /// timeline shows a single collapsed line instead of the whole body.
     /// Hiding an already hidden review is a no-op.
