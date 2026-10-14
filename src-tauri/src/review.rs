@@ -102,8 +102,8 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 - fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 그러면 작성자가 버튼 한 번으로 적용할 수 있는 제안(suggestion)으로 달린다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
 - 고칠 줄이 diff 에 보이면(추가·문맥 줄) suggestion(한 줄) 이나 end_line 범위(여러 줄)를 먼저 쓴다. 작성자가 버튼 한 번으로 적용하는 수정안이 가장 많이 반영된다.
 - end_line 이 null 이면 fix_code 는 바뀌는 줄만 diff 형식으로 쓴다(`-` 지울 줄, `+` 넣을 줄, 앞뒤 한두 줄은 공백으로 시작). diff 형식은 고칠 줄이 diff 밖이거나 여러 곳에 흩어졌을 때만 쓴다.
-- nit 도 고치는 코드(suggestion·fix_code)가 있고 줄이 있으면 스레드로 달린다(리뷰당 최대 3건). 더 단순하게 쓸 수 있는 곳, 단언이 빠진 테스트처럼 작성자가 바로 고칠 수 있는 것만 nit 로 낸다.
-- major·minor 는 fix·suggestion·fix_code 중 하나가 있어야 인라인으로 달린다. 고치는 방법을 모르면 question 으로 내린다.
+- minor·nit 는 버튼 한 번으로 적용하는 수정안(suggestion 한 줄, 또는 end_line 이 있는 fix_code)이 있어야 스레드로 달린다(nit 는 리뷰당 최대 3건). 말로만 고치는 법을 적은 minor·nit 는 본문 목록에만 남는다. 더 단순하게 쓸 수 있는 곳, 단언이 빠진 테스트처럼 작성자가 바로 고칠 수 있는 것만 nit 로 낸다.
+- major 는 fix·suggestion·fix_code 중 하나가 있어야 인라인으로 달린다. 고치는 방법을 모르면 question 으로 내린다.
 - 재리뷰 블록이 있으면 JSON 에 `"followups":[{"id":"<이전 지적 f:id>","status":"resolved|partial|unresolved|wont_fix|withdrawn","note":"<근거 한 줄>"}]` 를 이전 지적마다 하나씩 넣는다.
 - 이 JSON 은 게이트 판정과 인라인 코멘트 게시에 쓰인다."#;
 
@@ -645,6 +645,12 @@ fn suggestion_range(f: &Finding, allowed: &HashMap<String, HashSet<u64>>) -> Opt
     (start..=end).all(|l| set.contains(&l)).then_some((start, end))
 }
 
+/// A fix the author can apply with one button: a single-line `suggestion`, or
+/// `fix_code` over a verified diff range.
+fn one_click(f: &Finding, allowed: &HashMap<String, HashSet<u64>>) -> bool {
+    !f.suggestion.trim().is_empty() || suggestion_range(f, allowed).is_some()
+}
+
 fn render_inline(f: &Finding) -> String {
     render_inline_with(f, false)
 }
@@ -902,7 +908,7 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
     let mut nits: Vec<(usize, f64)> = findings
         .iter()
         .enumerate()
-        .filter(|(_, f)| f.severity == "nit" && f.has_fix() && !f.claim.trim().is_empty())
+        .filter(|(_, f)| f.severity == "nit" && one_click(f, &allowed) && !f.claim.trim().is_empty())
         .filter(|(_, f)| f.line.is_some_and(|l| allowed.get(&f.path).is_some_and(|set| set.contains(&l))))
         .map(|(i, f)| (i, f.confidence.unwrap_or(0.0)))
         .filter(|(_, c)| *c >= INLINE_MIN_CONFIDENCE)
@@ -925,7 +931,14 @@ fn split_findings(findings: &[Finding], diff: &str) -> Split {
             // threads show fixes attached get applied far more often than
             // bare complaints. A question with a line used to be listed only
             // in the body (#6074), where the author cannot answer it.
-            && (matches!(f.severity.as_str(), "blocker" | "question") || f.has_fix());
+            && match f.severity.as_str() {
+                "blocker" | "question" => true,
+                // A major is posted with any fix so it is never hidden.
+                "major" => f.has_fix(),
+                // A minor or nit needs a one-click fix: on merged PRs those were
+                // addressed 12/15 against 9/20 for a fix told in words.
+                _ => one_click(f, &allowed),
+            };
         let anchored = f
             .line
             .is_some_and(|l| allowed.get(&f.path).is_some_and(|set| set.contains(&l)));
@@ -1622,7 +1635,9 @@ mod tests {
     fn up_to_three_fixable_nits_become_threads_most_confident_first() {
         let nit = |conf: f64, line: u64, claim: &str, fix: bool| {
             let mut f = finding("nit", conf, "src/x.ts", Some(line), claim);
-            if !fix {
+            if fix {
+                f.suggestion = "fixed".into();
+            } else {
                 f.fix = String::new();
             }
             f
@@ -1670,10 +1685,10 @@ mod tests {
             finding("major", 50.0, "src/x.ts", Some(11), "확신 낮음"),
             finding("major", 90.0, "src/x.ts", Some(99), "diff 밖 줄"),
             finding("question", 95.0, "src/x.ts", Some(11), "의도인가요"),
-            finding("nit", 95.0, "src/x.ts", Some(11), "이름"),
+            Finding { suggestion: "line11fixed".into(), ..finding("nit", 95.0, "src/x.ts", Some(11), "이름") },
         ];
         let s = split_findings(&fs, SAMPLE_DIFF);
-        // The confident, anchored blocker, question and fixable nit go inline;
+        // The confident, anchored blocker, question and one-click nit go inline;
         // the weak or off-diff majors do not.
         assert_eq!(s.inline.len(), 3, "blocker + question + nit");
         assert!(s.inline[1].body.starts_with("❔ **의도인가요**"), "{}", s.inline[1].body);
@@ -2023,6 +2038,36 @@ mod tests {
         assert!(s.inline[0].body.contains("방법 없는 blocker"));
         let un: Vec<&str> = s.unanchored.iter().map(|f| f.claim.as_str()).collect();
         assert_eq!(un, vec!["방법 없는 major"], "a bare major stays visible in the body");
+    }
+
+    #[test]
+    fn minor_and_nit_with_only_a_prose_fix_stay_in_the_body() {
+        let minor = finding("minor", 90.0, "src/x.ts", Some(11), "말로만 고치는 minor");
+        let nit = finding("nit", 90.0, "src/x.ts", Some(12), "말로만 고치는 nit");
+        let fs = vec![minor, nit];
+        let s = split_findings(&fs, SAMPLE_DIFF);
+        assert!(s.inline.is_empty(), "{:?}", s.inline.iter().map(|c| &c.body).collect::<Vec<_>>());
+        let listed: Vec<&str> = unposted(&fs, &[]).iter().map(|f| f.claim.as_str()).collect();
+        assert_eq!(listed, vec!["말로만 고치는 minor", "말로만 고치는 nit"], "still listed in the review body");
+    }
+
+    #[test]
+    fn minor_with_a_one_click_fix_becomes_a_thread() {
+        let mut line = finding("minor", 90.0, "src/x.ts", Some(11), "한 줄 제안");
+        line.suggestion = "line11fixed".into();
+        let mut range = finding("minor", 90.0, "src/x.ts", Some(11), "범위 제안");
+        range.fix_code = "a\nb".into();
+        range.end_line = Some(12);
+        let s = split_findings(&[line, range], SAMPLE_DIFF);
+        assert_eq!(s.inline.len(), 2);
+        assert!(s.inline.iter().all(|c| c.body.contains("```suggestion")), "both are one-click");
+        assert_eq!(s.inline[1].start_line, Some(11));
+    }
+
+    #[test]
+    fn major_with_only_a_prose_fix_is_still_a_thread() {
+        let s = split_findings(&[finding("major", 90.0, "src/x.ts", Some(11), "말로만 고치는 major")], SAMPLE_DIFF);
+        assert_eq!(s.inline.len(), 1, "major keeps its thread so it is not hidden");
     }
 
     #[test]
