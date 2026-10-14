@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
 use reqwest::{Client, StatusCode};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,12 @@ pub struct PrHead {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct PullRequest {
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub merged: bool,
+    #[serde(default)]
+    pub merged_at: Option<String>,
     pub number: u64,
     pub title: String,
     pub draft: bool,
@@ -61,6 +67,10 @@ pub struct PrBase {
 
 #[derive(Debug, Deserialize)]
 pub struct Review {
+    #[serde(default)]
+    pub id: u64,
+    #[serde(default)]
+    pub html_url: String,
     pub user: GhUser,
     pub state: String,
     /// Commit the review was left on (null for pending).
@@ -126,7 +136,18 @@ pub struct FileComment {
     pub body: String,
 }
 
+#[derive(Debug, Clone, Deserialize, serde::Serialize)]
+pub struct ReviewReceipt {
+    pub id: u64,
+    pub html_url: String,
+    #[serde(default)]
+    pub submitted_at: Option<String>,
+    #[serde(default)]
+    pub inline_omitted: bool,
+}
+
 pub struct GitHubClient {
+    api_base: String,
     http: Client,
     token: String,
 }
@@ -134,6 +155,7 @@ pub struct GitHubClient {
 impl GitHubClient {
     pub fn new(token: String) -> Self {
         Self {
+            api_base: API.into(),
             http: Client::builder()
                 .connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(60))
@@ -176,8 +198,10 @@ impl GitHubClient {
                 .try_clone()
                 .ok_or_else(|| anyhow!("request not cloneable"))?;
             match this.send().await {
-                Ok(r) if is_transient_status(r.status()) && attempt < 2 => {}
-                Ok(r) => return Ok(r),
+                Ok(r) => {
+                    let r = preserve_retry_hint(r)?;
+                    if !is_transient_status(r.status()) || attempt >= 2 { return Ok(r); }
+                }
                 Err(e) if (e.is_connect() || e.is_timeout()) && attempt < 2 => {}
                 Err(e) => return Err(e.into()),
             }
@@ -196,7 +220,7 @@ impl GitHubClient {
     }
 
     pub async fn get_user(&self) -> Result<(GhUser, RateLimit)> {
-        let url = format!("{API}/user");
+        let url = format!("{}/user", self.api_base);
         let resp = self
             .send_get(
                 self.http
@@ -205,6 +229,7 @@ impl GitHubClient {
             )
             .await?;
         let rate = Self::extract_rate(resp.headers());
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -219,9 +244,7 @@ impl GitHubClient {
         owner: &str,
         repo: &str,
     ) -> Result<(Vec<PullRequest>, RateLimit)> {
-        let url = format!(
-            "{API}/repos/{owner}/{repo}/pulls?state=open&per_page=100&sort=created&direction=desc"
-        );
+        let url = format!("{}/repos/{owner}/{repo}/pulls?state=open&per_page=100&sort=created&direction=desc", self.api_base);
         let resp = self
             .send_get(
                 self.http
@@ -230,6 +253,7 @@ impl GitHubClient {
             )
             .await?;
         let rate = Self::extract_rate(resp.headers());
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if status == StatusCode::NOT_FOUND {
             return Err(anyhow!("repository {owner}/{repo} not found (404)"));
@@ -248,9 +272,9 @@ impl GitHubClient {
         repo: &str,
         number: u64,
     ) -> Result<Vec<Review>> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100");
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}/reviews?per_page=100", self.api_base);
         self.get_all_pages(&url).await
-            .map_err(|e| anyhow!("list reviews failed: {e}"))
+            .context("list reviews failed")
     }
 
     pub async fn search_users(&self, query: &str, limit: u8) -> Result<Vec<GhUserHint>> {
@@ -260,7 +284,7 @@ impl GitHubClient {
         }
         // Match user logins that start with the prefix; falls back to fuzzy if no prefix hits.
         let q_param = format!("{q} in:login type:user");
-        let url = format!("{API}/search/users");
+        let url = format!("{}/search/users", self.api_base);
         let resp = self
             .send_get(
                 self.http
@@ -272,6 +296,7 @@ impl GitHubClient {
             ])
             )
             .await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -289,7 +314,7 @@ impl GitHubClient {
         number: u64,
         commit_id: &str,
         body: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<ReviewReceipt> {
         self.submit_review(owner, repo, number, commit_id, "APPROVE", body, &[]).await
     }
 
@@ -303,7 +328,7 @@ impl GitHubClient {
         commit_id: &str,
         body: Option<&str>,
         comments: &[ReviewComment],
-    ) -> Result<()> {
+    ) -> Result<ReviewReceipt> {
         self.submit_review(owner, repo, number, commit_id, "APPROVE", body, comments).await
     }
 
@@ -318,7 +343,7 @@ impl GitHubClient {
         commit_id: &str,
         body: &str,
         comments: &[ReviewComment],
-    ) -> Result<()> {
+    ) -> Result<ReviewReceipt> {
         self.submit_review(owner, repo, number, commit_id, "COMMENT", Some(body), comments).await
     }
 
@@ -332,14 +357,16 @@ impl GitHubClient {
         commit_id: &str,
         c: &FileComment,
     ) -> Result<()> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments");
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}/comments", self.api_base);
         let payload = serde_json::json!({
             "body": c.body,
             "commit_id": commit_id,
             "path": c.path,
             "subject_type": "file",
         });
+        self.ensure_publishable(owner, repo, number, commit_id).await?;
         let resp = self.http.post(&url).headers(self.headers()).json(&payload).send().await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -354,11 +381,12 @@ impl GitHubClient {
         let payload = serde_json::json!({ "query": query, "variables": variables });
         let resp = self
             .http
-            .post(format!("{API}/graphql"))
+            .post(format!("{}/graphql", self.api_base))
             .headers(self.headers())
             .json(&payload)
             .send()
             .await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         let v: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if !status.is_success() || v.get("errors").is_some_and(|e| !e.is_null()) {
@@ -408,8 +436,9 @@ impl GitHubClient {
         comment_id: u64,
         body: &str,
     ) -> Result<()> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies");
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}/comments/{comment_id}/replies", self.api_base);
         let resp = self.http.post(&url).headers(self.headers()).json(&serde_json::json!({ "body": body })).send().await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if status.is_success() {
             return Ok(());
@@ -438,11 +467,12 @@ impl GitHubClient {
         });
         let resp = self
             .http
-            .post(format!("{API}/graphql"))
+            .post(format!("{}/graphql", self.api_base))
             .headers(self.headers())
             .json(&payload)
             .send()
             .await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         let b = resp.text().await.unwrap_or_default();
         // GraphQL reports most failures as 200 with an `errors` array.
@@ -472,8 +502,8 @@ impl GitHubClient {
         event: &str,
         body: Option<&str>,
         comments: &[ReviewComment],
-    ) -> Result<()> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/reviews");
+    ) -> Result<ReviewReceipt> {
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}/reviews", self.api_base);
         let build = |with_comments: bool| -> serde_json::Value {
             let mut payload = review_payload_base(event, commit_id);
             if let Some(b) = body.filter(|s| !s.trim().is_empty()) {
@@ -501,6 +531,7 @@ impl GitHubClient {
             serde_json::Value::Object(payload)
         };
 
+        self.ensure_publishable(owner, repo, number, commit_id).await?;
         let resp = self
             .http
             .post(&url)
@@ -508,23 +539,36 @@ impl GitHubClient {
             .json(&build(true))
             .send()
             .await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if status.is_success() {
-            return Ok(());
+            return Ok(resp.json::<ReviewReceipt>().await?);
         }
         // 422 usually means an inline comment pointed at a line not in the diff.
         // Retry without the inline comments so the review body still posts.
         if status == StatusCode::UNPROCESSABLE_ENTITY && !comments.is_empty() {
+            self.ensure_publishable(owner, repo, number, commit_id).await?;
+            let mut fallback = build(false);
+            let mut fallback_body = body.unwrap_or_default().to_string();
+            fallback_body.push_str("\n\n### 인라인 게시를 대신한 지적\n");
+            for comment in comments {
+                fallback_body.push_str(&format!("\n**{}:{}**\n\n{}\n", comment.path, comment.line,
+                    crate::review::neutralize_suggestion_fences(&comment.body)));
+            }
+            fallback["body"] = serde_json::Value::String(crate::review::neutralize_suggestion_fences(&fallback_body));
             let resp2 = self
                 .http
                 .post(&url)
                 .headers(self.headers())
-                .json(&build(false))
+                .json(&fallback)
                 .send()
                 .await?;
+            let resp2 = preserve_retry_hint(resp2)?;
             let s2 = resp2.status();
             if s2.is_success() {
-                return Ok(());
+                let mut receipt = resp2.json::<ReviewReceipt>().await?;
+                receipt.inline_omitted = true;
+                return Ok(receipt);
             }
             let b = resp2.text().await.unwrap_or_default();
             return Err(anyhow!("{event} failed (no-comments retry): {s2} {b}"));
@@ -536,10 +580,11 @@ impl GitHubClient {
     /// Fetch the unified diff for a PR (Accept: `...v3.diff`). Bounded by the
     /// server; the caller truncates before handing it to the review engine.
     pub async fn get_pr_diff(&self, owner: &str, repo: &str, number: u64) -> Result<String> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}");
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}", self.api_base);
         let mut headers = self.headers();
         headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3.diff"));
         let resp = self.http.get(&url).headers(headers).send().await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         // GitHub refuses the diff media type past 300 files (406). The files
         // API still serves per-file patches (up to 3000 files), so rebuild it.
@@ -560,10 +605,11 @@ impl GitHubClient {
     /// the same shape GitHub shows for a PR. Eval uses it to rebuild the diff a
     /// reviewer saw at an earlier commit.
     pub async fn get_compare_diff(&self, owner: &str, repo: &str, base: &str, head: &str) -> Result<String> {
-        let url = format!("{API}/repos/{owner}/{repo}/compare/{base}...{head}");
+        let url = format!("{}/repos/{owner}/{repo}/compare/{base}...{head}", self.api_base);
         let mut headers = self.headers();
         headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.v3.diff"));
         let resp = self.http.get(&url).headers(headers).send().await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -588,7 +634,7 @@ impl GitHubClient {
         }
         let mut out = String::new();
         for page in 1..=30 {
-            let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}");
+            let url = format!("{}/repos/{owner}/{repo}/pulls/{number}/files?per_page=100&page={page}", self.api_base);
             let files: Vec<F> = self.get_json(&url).await?;
             let n = files.len();
             for f in files {
@@ -632,6 +678,7 @@ impl GitHubClient {
                 return Err(anyhow!("GET {url}: more than {MAX_PAGES} pages"));
             }
             let resp = self.send_get(self.http.get(&u).headers(self.headers())).await?;
+            let resp = preserve_retry_hint(resp)?;
             let status = resp.status();
             if !status.is_success() {
                 let body = resp.text().await.unwrap_or_default();
@@ -651,6 +698,7 @@ impl GitHubClient {
     /// GET a JSON list, following nothing past the first page (`per_page=100`).
     async fn get_json<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let resp = self.http.get(url).headers(self.headers()).send().await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -673,7 +721,7 @@ impl GitHubClient {
         struct Who {
             date: String,
         }
-        let url = format!("{API}/repos/{owner}/{repo}/commits/{sha}");
+        let url = format!("{}/repos/{owner}/{repo}/commits/{sha}", self.api_base);
         let c: C = self.get_json(&url).await?;
         Ok(c.commit.committer.date)
     }
@@ -688,7 +736,7 @@ impl GitHubClient {
         struct Inner {
             message: String,
         }
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/commits?per_page=100");
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}/commits?per_page=100", self.api_base);
         let cs: Vec<C> = self.get_all_pages(&url).await?;
         Ok(cs
             .into_iter()
@@ -698,25 +746,24 @@ impl GitHubClient {
 
     /// Inline review comments (people and bots), oldest first.
     pub async fn list_review_comments(&self, owner: &str, repo: &str, number: u64) -> Result<Vec<InlineThreadComment>> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100");
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}/comments?per_page=100", self.api_base);
         self.get_all_pages(&url).await
     }
 
     /// Most recently updated closed PRs (merged or not), newest first.
     pub async fn list_recent_closed_pulls(&self, owner: &str, repo: &str, limit: usize) -> Result<Vec<PullRequest>> {
         let per_page = limit.clamp(1, 100);
-        let url = format!(
-            "{API}/repos/{owner}/{repo}/pulls?state=closed&per_page={per_page}&sort=updated&direction=desc"
-        );
+        let url = format!("{}/repos/{owner}/{repo}/pulls?state=closed&per_page={per_page}&sort=updated&direction=desc", self.api_base);
         self.get_json(&url).await
     }
 
     /// File content at a git ref, or None when the file does not exist there.
     pub async fn get_file_at(&self, owner: &str, repo: &str, path: &str, git_ref: &str) -> Result<Option<String>> {
-        let url = format!("{API}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
+        let url = format!("{}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}", self.api_base);
         let mut headers = self.headers();
         headers.insert(ACCEPT, HeaderValue::from_static("application/vnd.github.raw"));
         let resp = self.http.get(&url).headers(headers).send().await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
@@ -736,11 +783,12 @@ impl GitHubClient {
             #[serde(rename = "type")]
             kind: String,
         }
-        let url = format!("{API}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}");
-        let resp = self.http.get(&url).headers(self.headers()).send().await?;
+        let url = format!("{}/repos/{owner}/{repo}/contents/{path}?ref={git_ref}", self.api_base);
+        let resp = self.send_get(self.http.get(&url).headers(self.headers())).await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(vec![]);
         }
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -750,9 +798,15 @@ impl GitHubClient {
         Ok(es.into_iter().filter(|e| e.kind == "file").map(|e| e.name).collect())
     }
 
+    pub async fn ensure_publishable(&self, owner: &str, repo: &str, number: u64, sha: &str) -> Result<()> {
+        let latest = self.get_pull(owner, repo, number).await?;
+        crate::publication::check(&latest, sha).map_err(|reason| anyhow!("publication withheld: {reason}"))
+    }
+
     pub async fn get_pull(&self, owner: &str, repo: &str, number: u64) -> Result<PullRequest> {
-        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}");
-        let resp = self.http.get(&url).headers(self.headers()).send().await?;
+        let url = format!("{}/repos/{owner}/{repo}/pulls/{number}", self.api_base);
+        let resp = self.send_get(self.http.get(&url).headers(self.headers())).await?;
+        let resp = preserve_retry_hint(resp)?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
@@ -803,7 +857,34 @@ fn next_link(header: &str) -> Option<String> {
 }
 
 fn is_transient_status(s: StatusCode) -> bool {
-    matches!(s.as_u16(), 502 | 503 | 504)
+    matches!(s.as_u16(), 500 | 502 | 503 | 504)
+}
+
+/// Preserve server cooldowns for both reads and writes. This does not resend
+/// a request: a failed POST may have reached GitHub and must be reconciled.
+fn preserve_retry_hint(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    let headers = response.headers();
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || (status == StatusCode::FORBIDDEN && (headers.contains_key("retry-after")
+            || headers.get("x-ratelimit-remaining").is_some_and(|v| v == "0")))
+        || (status.is_server_error() && headers.contains_key("retry-after"))
+    {
+        return Err(crate::retry::Throttle {
+            seconds: server_retry_after(headers, chrono::Utc::now().timestamp()).unwrap_or(60),
+        }.into());
+    }
+    Ok(response)
+}
+
+fn server_retry_after(headers: &HeaderMap, now: i64) -> Option<u64> {
+    let retry = headers.get("retry-after").and_then(|v|v.to_str().ok()).and_then(|v| {
+        v.parse::<u64>().ok().or_else(||chrono::DateTime::parse_from_rfc2822(v).ok()
+            .map(|t| t.timestamp().saturating_sub(now).max(0) as u64))
+    });
+    let reset = headers.get("x-ratelimit-reset").and_then(|v|v.to_str().ok()).and_then(|v|v.parse::<i64>().ok())
+        .map(|t|t.saturating_sub(now).max(0) as u64);
+    match (retry, reset) { (Some(a),Some(b))=>Some(a.max(b)),(a,b)=>a.or(b) }
 }
 
 fn retry_delay(attempt: u32) -> Duration {
@@ -813,6 +894,161 @@ fn retry_delay(attempt: u32) -> Duration {
 #[cfg(test)]
 mod resilience_tests {
     use super::*;
+
+    // Real HTTP requests against a local scripted server; no GitHub writes.
+    struct ScriptedServer {
+        stop: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<Vec<String>>,
+    }
+    impl ScriptedServer {
+        async fn finish(self) -> Vec<String> {
+            let _ = self.stop.send(());
+            self.task.await.unwrap()
+        }
+    }
+
+    async fn scripted_server(responses: Vec<(u16, &'static str, String)>) -> (GitHubClient, ScriptedServer) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, mut stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut requests = vec![];
+            let mut responses = responses.into_iter();
+            loop {
+                let (mut socket, _) = tokio::select! {
+                    _ = &mut stopped => break,
+                    connection = listener.accept() => connection.unwrap(),
+                };
+                // Continue accepting after the script ends, so an unexpected
+                // POST is observed rather than hidden by a closed listener.
+                let (status, headers, body) = responses.next().unwrap_or((500, "", "unexpected request".into()));
+                let mut data = Vec::new();
+                loop {
+                    let mut chunk = [0; 4096];
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    if n == 0 { break; }
+                    data.extend_from_slice(&chunk[..n]);
+                    if let Some(end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let header = String::from_utf8_lossy(&data[..end]);
+                        let len = header.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:").and_then(|v| v.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if data.len() >= end + 4 + len { break; }
+                    }
+                }
+                requests.push(String::from_utf8(data).unwrap());
+                let response = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{headers}\r\n{body}", body.len());
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+            requests
+        });
+        let mut client = GitHubClient::new("synthetic-token".into());
+        client.api_base = format!("http://{address}");
+        (client, ScriptedServer { stop, task })
+    }
+
+    fn open_pr(sha: &str, state: &str) -> String {
+        serde_json::json!({"number":1,"title":"synthetic","draft":false,"state":state,
+            "html_url":"https://example.test/pull/1","user":{"login":"author"},"head":{"sha":sha}}).to_string()
+    }
+
+    #[test]
+    fn retry_headers_use_seconds_http_date_and_later_reset() {
+        let now = 1_445_412_480; // Wed, 21 Oct 2015 07:28:00 GMT
+        for (retry, reset, expected) in [
+            (Some("120"), None, Some(120)),
+            (Some("Wed, 21 Oct 2015 07:30:00 GMT"), None, Some(120)),
+            (Some("Wed, 21 Oct 2015 07:27:00 GMT"), None, Some(0)),
+            (None, Some("1445412780"), Some(300)),
+            (Some("120"), Some("1445412780"), Some(300)),
+            (Some("invalid"), Some("1445412780"), Some(300)),
+            (Some("invalid"), Some("invalid"), None),
+        ] {
+            let mut headers = HeaderMap::new();
+            if let Some(v) = retry { headers.insert("retry-after", HeaderValue::from_str(v).unwrap()); }
+            if let Some(v) = reset { headers.insert("x-ratelimit-reset", HeaderValue::from_str(v).unwrap()); }
+            assert_eq!(server_retry_after(&headers, now), expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn list_reviews_preserves_the_server_cooldown_through_context() {
+        let (client, requests) = scripted_server(vec![(429, "Retry-After: 123\r\n", "{}".into())]).await;
+        let error = client.list_reviews("acme", "demo", 1).await.unwrap_err();
+        assert_eq!(crate::retry::hint(&error), Some(123));
+        assert!(error.to_string().contains("list reviews"));
+        assert_eq!(requests.finish().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn review_post_rate_limits_are_preserved_without_resending() {
+        for status in [429, 403, 503] {
+            let (client, requests) = scripted_server(vec![
+                (200, "", open_pr("head", "open")),
+                (status, "Retry-After: 75\r\n", "{}".into()),
+            ]).await;
+            let error = client.comment_pull("acme", "demo", 1, "head", "review", &[]).await.unwrap_err();
+            assert_eq!(crate::retry::hint(&error), Some(75), "status {status}");
+            let requests = requests.finish().await;
+            assert_eq!(requests.len(), 2);
+            assert!(requests[1].starts_with("POST "));
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_inline_findings_survive_in_the_fallback_body() {
+        let comments = [ReviewComment { path:"a.ts".into(), line:7, start_line:None,
+            body:"Major: value is lost\n```suggestion\nkeep(value)\n```".into() }];
+        let (client, server) = scripted_server(vec![
+            (200, "", open_pr("head", "open")), (422, "", "{}".into()),
+            (200, "", open_pr("head", "open")),
+            (200, "", r#"{"id":9,"html_url":"https://example.test/review/9"}"#.into()),
+        ]).await;
+        let receipt = client.comment_pull("acme", "demo", 1, "head", "review intro", &comments).await.unwrap();
+        assert!(receipt.inline_omitted);
+        let requests = server.finish().await;
+        let payload: serde_json::Value = serde_json::from_str(requests[3].split_once("\r\n\r\n").unwrap().1).unwrap();
+        let body = payload["body"].as_str().unwrap();
+        assert!(body.contains("Major: value is lost"));
+        assert!(body.contains("a.ts:7"));
+        assert!(body.contains("keep(value)"));
+        assert!(!body.contains("```suggestion"));
+        assert!(payload.get("comments").is_none());
+    }
+
+    #[tokio::test]
+    async fn review_fallback_preserves_throttle_and_rechecks_before_posting() {
+        let comments = [ReviewComment { path:"a.ts".into(), line:1, start_line:None, body:"issue".into() }];
+        let (client, server) = scripted_server(vec![
+            (200, "", open_pr("head", "open")), (422, "", "{}".into()),
+            (200, "", open_pr("head", "open")), (429, "Retry-After: 81\r\n", "{}".into()),
+        ]).await;
+        let error = client.comment_pull("acme", "demo", 1, "head", "review", &comments).await.unwrap_err();
+        assert_eq!(crate::retry::hint(&error), Some(81));
+        let requests = server.finish().await;
+        assert_eq!(requests.len(), 4);
+        assert!(requests[2].starts_with("GET "));
+        let payload: serde_json::Value = serde_json::from_str(requests[3].split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert_eq!(payload["commit_id"], "head");
+        assert!(payload["body"].as_str().unwrap().starts_with("review"));
+        assert!(payload.get("comments").is_none());
+    }
+
+    #[tokio::test]
+    async fn changed_head_prevents_first_post_and_closed_pr_prevents_fallback_post() {
+        let (client, requests) = scripted_server(vec![(200, "", open_pr("new", "open"))]).await;
+        assert!(client.comment_pull("acme", "demo", 1, "old", "review", &[]).await.is_err());
+        assert_eq!(requests.finish().await.len(), 1);
+
+        let comments = [ReviewComment { path:"a.ts".into(), line:1, start_line:None, body:"issue".into() }];
+        let (client, requests) = scripted_server(vec![
+            (200, "", open_pr("head", "open")), (422, "", "{}".into()),
+            (200, "", open_pr("head", "closed")),
+        ]).await;
+        assert!(client.comment_pull("acme", "demo", 1, "head", "review", &comments).await.is_err());
+        let requests = requests.finish().await;
+        assert_eq!(requests.iter().filter(|r| r.starts_with("POST ")).count(), 1);
+        assert!(requests[2].starts_with("GET "));
+    }
 
     #[test]
     fn transient_statuses() {
@@ -879,4 +1115,3 @@ mod paging_tests {
         assert!(!review_payload_base("COMMENT", "").contains_key("commit_id"));
     }
 }
-

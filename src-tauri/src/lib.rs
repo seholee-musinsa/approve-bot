@@ -1,4 +1,6 @@
 mod auth;
+mod audit;
+mod audit_import;
 mod commands;
 mod config;
 mod confluence;
@@ -10,9 +12,11 @@ mod gh_login;
 mod github;
 mod layout;
 mod poller;
+mod publication;
 mod repocache;
 mod rereview;
 mod routing;
+mod retry;
 mod trace;
 mod review;
 mod state;

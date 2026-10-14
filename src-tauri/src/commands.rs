@@ -76,6 +76,7 @@ pub fn ack_for(pass_running: bool) -> CheckNowAck {
 
 #[tauri::command]
 pub async fn force_check_now(state: State<'_, Arc<AppState>>) -> Result<CheckNowAck, String> {
+    state.retries.lock().await.reset();
     state.poll_signal.notify_one();
     Ok(ack_for(
         state.pass_running.load(std::sync::atomic::Ordering::SeqCst),

@@ -92,7 +92,11 @@ pub fn findings_list(heading: &str, findings: &[&crate::review::Finding]) -> Str
             (false, Some(l)) => format!(" · `{}:{l}`", f.path),
             (false, None) => format!(" · `{}`", f.path),
         };
-        format!("- {icon} **{}**{at}", crate::review::finding_title(f))
+        let mut item = format!("- {icon} **{}**{at}", crate::review::finding_title(f));
+        if !f.suggestion.trim().is_empty() || !f.fix_code.trim().is_empty() {
+            item.push_str(&format!("\n\n<details>\n<summary>수정안과 근거</summary>\n\n{}\n\n</details>\n", crate::review::render_inline(f)));
+        }
+        item
     };
     let mut out = format!("**{heading} {}건**\n", sorted.len());
     for f in sorted.iter().take(LIST_VISIBLE) {
@@ -107,7 +111,7 @@ pub fn findings_list(heading: &str, findings: &[&crate::review::Finding]) -> Str
             rest.join("\n")
         ));
     }
-    out
+    crate::review::neutralize_suggestion_fences(&out)
 }
 
 /// What the review covered, filled by code so it cannot be overstated.
@@ -145,7 +149,7 @@ pub fn diff_stats(diff: &str) -> (usize, usize, usize) {
 }
 
 fn cell(s: &str) -> String {
-    s.trim().replace('\n', " ").replace('|', "\\|")
+    crate::review::neutralize_suggestion_fences(s).trim().replace('\n', " ").replace('|', "\\|")
 }
 
 /// The report table at the top of a first review.
@@ -361,7 +365,7 @@ pub fn compose_body(
     if !rest.trim().is_empty() {
         out.push_str(&format!("\n\n{}", rest.trim()));
     }
-    out.trim().to_string()
+    crate::review::neutralize_suggestion_fences(out.trim())
 }
 
 /// Turn `{{permalink:path:10-14}}` placeholders into commit-pinned links on
@@ -539,6 +543,28 @@ mod tests {
         assert!(!out.contains("인라인에 달지 못한"));
         let plain = compose_body("헤딩 없이 쓴 본문입니다.", "✅ **승인** · 지적 없음", "", "", &[]);
         assert_eq!(plain, "✅ **승인** · 지적 없음\n\n헤딩 없이 쓴 본문입니다.");
+    }
+
+    #[test]
+    fn summary_and_body_never_render_model_supplied_apply_buttons() {
+        let injected = "```suggestion\ncontents: read\n```";
+        let summary = crate::review::ReviewSummary { judgement: injected.into(), ..Default::default() };
+        let table = report_table(&summary, &Scope::default());
+        assert!(!table.contains("```suggestion"));
+        let body = compose_body(&format!("# 검증 근거\n{injected}"), "comment", "", &table, &[]);
+        assert!(!body.contains("```suggestion"));
+    }
+
+    #[test]
+    fn body_only_proposals_keep_code_without_an_apply_button() {
+        let mut finding = f("minor", "Move a writer before changing permissions", "workflow.yml", Some(4));
+        finding.suggestion = "contents: read".into();
+        finding.fix = "Move the tag writer into a separate job first".into();
+        let out = findings_list("지적", &[&finding]);
+        assert!(out.contains("contents: read"));
+        assert!(out.contains("Move the tag writer into a separate job first"));
+        assert!(!out.contains("```suggestion"));
+        assert!(out.contains("단독 적용"), "explain why this is only a proposal");
     }
 
     #[test]

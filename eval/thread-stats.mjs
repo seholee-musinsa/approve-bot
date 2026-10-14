@@ -1,88 +1,83 @@
 #!/usr/bin/env node
-// 리뷰 스레드 반영률 집계. 리뷰어별·지적 형식별로 "작성자가 수정했다고 답한 비율"을 낸다.
-// 사용: node eval/thread-stats.mjs --repo owner/name [--limit 80] [--min-len 80]
-// 결과는 stdout 에만 찍는다. 사내 PR 내용이 섞이므로 파일로 저장해 커밋하지 않는다(public repo).
-//
-// 판정: 첫 코멘트 작성자 외의 답글이 `수정·반영·적용…` 등으로 시작하면 fixed,
-// `반영하지 않…·그대로 두…·철회` 등이 있으면 rejected. 답글 없이 고친 건 못 잡으므로 반영률은 하한이다.
+// Read-only collection; classification belongs exclusively to Rust feedback.rs.
+// node eval/thread-stats.mjs --repo owner/name [--limit 80] [--min-len 80] [--format json]
+// Offline: --input fixture.json. APPROVE_BOT_BIN can select an already built binary.
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-const args = Object.fromEntries(
-  process.argv.slice(2).reduce((acc, a, i, all) => {
-    if (a.startsWith('--')) acc.push([a.slice(2), all[i + 1]]);
-    return acc;
-  }, []),
-);
-const repo = args.repo;
-if (!repo || !repo.includes('/')) {
-  console.error('usage: node eval/thread-stats.mjs --repo owner/name [--limit 80] [--min-len 80]');
-  process.exit(1);
+const args = {};
+for (let i = 2; i < process.argv.length; i += 2) {
+  const flag = process.argv[i];
+  if (!['--repo', '--limit', '--min-len', '--format', '--input'].includes(flag) || process.argv[i + 1] == null) {
+    throw new Error(`Unknown flag or missing value: ${flag}`);
+  }
+  args[flag.slice(2)] = process.argv[i + 1];
 }
-const [owner, name] = repo.split('/');
+const repo = args.repo ?? '';
+if ((!repo || !/^[^/]+\/[^/]+$/.test(repo)) && !args.input) {
+  throw new Error('usage: node eval/thread-stats.mjs --repo owner/name [--limit 80] [--min-len 80] [--format json] [--input file]');
+}
 const limit = Number(args.limit ?? 80);
 const minLen = Number(args['min-len'] ?? 80);
-
-const FIXED = /^\s*(\*\*)?(수정|반영|적용|고쳤|지웠|걷어|추가했|바꿨|Fixed|Done)/;
-const REJECTED = /반영하지 않|반영은 하지|그대로 두|유지합니다|의도한|의도된|철회/;
-const SEVERITY = /🔴|🟡|P1|P2|blocker|major/;
-
-const gh = (a) => execFileSync('gh', a, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-
-const prs = JSON.parse(
-  gh(['pr', 'list', '--repo', repo, '--state', 'merged', '--limit', String(limit), '--json', 'number']),
-).map((p) => p.number);
-
-const QUERY = `query($o:String!,$n:String!,$pr:Int!){repository(owner:$o,name:$n){pullRequest(number:$pr){
-  reviewThreads(first:100){nodes{comments(first:8){nodes{author{login} body}}}}}}}`;
-
-const threads = [];
-for (const pr of prs) {
-  try {
-    const out = JSON.parse(
-      gh(['api', 'graphql', '-f', `query=${QUERY}`, '-f', `o=${owner}`, '-f', `n=${name}`, '-F', `pr=${pr}`]),
-    );
-    for (const t of out.data.repository.pullRequest.reviewThreads.nodes) {
-      const [first, ...replies] = t.comments.nodes;
-      if (!first || (first.body ?? '').length < minLen) continue;
-      const user = first.author?.login ?? 'ghost';
-      threads.push({
-        user,
-        code: first.body.includes('```'),
-        sev: SEVERITY.test(first.body),
-        fixed: replies.some((r) => r.author?.login !== user && FIXED.test(r.body ?? '')),
-        rejected: replies.some((r) => REJECTED.test(r.body ?? '')),
-      });
+if (!Number.isInteger(limit) || limit <= 0 || !Number.isInteger(minLen) || minLen < 0) throw new Error('Invalid limit or min-len');
+if (!['text', 'json'].includes(args.format ?? 'text')) throw new Error('--format must be text or json');
+const gh = (a) => JSON.parse(execFileSync('gh', a, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }));
+const errors = [];
+let input;
+let requestedPulls;
+if (args.input) {
+  input = JSON.parse(readFileSync(args.input, 'utf8'));
+  requestedPulls = input.pulls.length;
+} else {
+  const prs = gh(['pr', 'list', '--repo', repo, '--state', 'merged', '--limit', String(limit), '--json', 'number,author']);
+  input = { pulls: [] };
+  requestedPulls = prs.length;
+  for (const pr of prs) {
+    try {
+      // REST pagination fetches all replies; truncated GraphQL threads could
+      // otherwise hide later rejections or fixes.
+      const comments = gh(['api', '--paginate', '--slurp', `repos/${repo}/pulls/${pr.number}/comments?per_page=100`]).flat();
+      input.pulls.push({ number: pr.number, author: pr.author.login, comments });
+    } catch (e) {
+      const message = `PR ${pr.number} skipped: ${String(e.message).split('\n')[0]}`;
+      errors.push(message);
+      console.error(message);
     }
-  } catch (e) {
-    console.error(`PR ${pr} 건너뜀: ${String(e.message).split('\n')[0]}`);
   }
 }
-
-const group = (key) => {
-  const m = new Map();
-  for (const t of threads) {
+for (const pr of input.pulls) {
+  pr.comments = pr.comments.filter(c => c.in_reply_to_id != null || (c.body ?? '').length >= minLen);
+}
+const flags = ['feedback', '--input', '-', '--all-reviewers', '--format', 'json'];
+if (repo) flags.push('--repo', repo);
+const binary = process.env.APPROVE_BOT_BIN;
+const command = binary ?? 'cargo';
+const commandArgs = binary ? flags : ['run', '--quiet', '--manifest-path', fileURLToPath(new URL('../src-tauri/Cargo.toml', import.meta.url)), '--', ...flags];
+const report = JSON.parse(execFileSync(command, commandArgs, { input: JSON.stringify(input), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'inherit'] }));
+report.requested_pulls = requestedPulls;
+report.incomplete ||= errors.length > 0;
+report.errors.push(...errors);
+const group = key => {
+  const groups = new Map();
+  for (const t of report.findings.filter(t => t.severity !== 'question')) {
     const k = key(t);
-    const g = m.get(k) ?? { n: 0, fixed: 0, rejected: 0 };
-    g.n += 1;
-    g.fixed += t.fixed ? 1 : 0;
-    g.rejected += t.rejected ? 1 : 0;
-    m.set(k, g);
+    const g = groups.get(k) ?? { group: k, threads: 0, fixed: 0, partial: 0, deferred: 0, rejected: 0 };
+    g.threads += 1;
+    if (Object.hasOwn(g, t.outcome)) g[t.outcome] += 1;
+    groups.set(k, g);
   }
-  return [...m.entries()]
-    .sort((a, b) => b[1].n - a[1].n)
-    .map(([k, g]) => ({
-      group: k,
-      threads: g.n,
-      fixed: g.fixed,
-      'fixed%': Math.floor((g.fixed * 100) / g.n),
-      'rejected%': Math.floor((g.rejected * 100) / g.n),
-    }));
+  return [...groups.values()].sort((a, b) => b.threads - a.threads).map(g => ({ ...g, 'fixed%': Math.floor(g.fixed * 100 / g.threads), 'rejected%': Math.floor(g.rejected * 100 / g.threads) }));
 };
-
-console.log(`\n${repo} 최근 머지 ${prs.length} PR, 스레드 ${threads.length}개 (본문 ${minLen}자 이상)`);
-console.log('\n리뷰어별');
-console.table(group((t) => t.user));
-console.log('수정 코드 블록');
-console.table(group((t) => (t.code ? '있음' : '없음')));
-console.log('심각도 표시');
-console.table(group((t) => (t.sev ? '있음' : '없음')));
+report.groups = {
+  reviewers: group(t => t.reviewer),
+  code: group(t => t.has_code ? '있음' : '없음'),
+  severity: group(t => t.severity),
+};
+if (args.format === 'json') console.log(JSON.stringify(report, null, 2));
+else {
+  console.log(`\n${repo} PR ${report.pulls}건, 스레드 ${report.findings.length}개 (본문 ${minLen}자 이상)`);
+  console.log(`작성자 보고 기준; question ${report.summary.questions.n}건은 resolution 분모에서 제외. 코드 검증 아님.`);
+  for (const [name, groups] of Object.entries(report.groups)) { console.log(name); console.table(groups); }
+  if (report.incomplete) console.log('일부 PR 수집 실패: 집계 불완전');
+}

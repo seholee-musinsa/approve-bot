@@ -12,6 +12,7 @@
 //   Scores each label (cached per review in eval/scores2/<label>/), then prints
 //   and appends a side-by-side table to eval/results.md.
 import { execFileSync } from 'node:child_process';
+import { DIMS, metrics } from './quality-metrics.mjs';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 
 const LABELS = process.argv.slice(2);
@@ -28,14 +29,17 @@ const CLAUDE = process.env.CLAUDE_PATH || `${process.env.HOME}/.local/bin/claude
 // SPLIT=dev (cases without a split) | holdout | holdout2 | ... | all (default). The held-out
 // batch was collected after the guide was tuned, so it is the honest check.
 const SPLIT = process.env.SPLIT || 'all';
-const cases = readdirSync(P('eval', 'truth'))
+const TRUTH_DIR = process.env.TRUTH_DIR || P('eval', 'truth');
+const cases = readdirSync(TRUTH_DIR)
   .filter((f) => f.endsWith('.json'))
-  .map((f) => ({ key: f.replace('.json', ''), ...JSON.parse(readFileSync(P('eval', 'truth', f), 'utf8')) }))
-  .filter((c) => SPLIT === 'all' || (SPLIT === 'dev' ? !c.split : c.split === SPLIT))
+  .map((f) => ({ key: f.replace('.json', ''), ...JSON.parse(readFileSync(`${TRUTH_DIR}/${f}`, 'utf8')) }))
+  .filter((c) => SPLIT === 'all' || (SPLIT === 'dev' ? !c.split || c.split === 'dev' : c.split === SPLIT))
   .sort((a, b) => a.key.localeCompare(b.key));
 
 // ---- inputs -----------------------------------------------------------------
 function caseDiff(c) {
+  // Synthetic cases are entirely local and never trigger a GitHub lookup.
+  if (typeof c.diff === 'string') return c.diff.slice(0, MAX_DIFF);
   const f = P('eval', 'cache', `${c.key}.diff`);
   if (!existsSync(f)) {
     mkdirSync(P('eval', 'cache'), { recursive: true });
@@ -54,13 +58,13 @@ function caseDiff(c) {
 }
 
 function reviewText(r) {
-  const inline = (r.inline || []).map((c) => `- ${c.path}:${c.line} — ${c.comment}`).join('\n');
-  return `${r.body || ''}\n\n[인라인 코멘트]\n${inline || '(없음)'}\n\n[blocking_issues]\n${(r.blocking_issues || []).join('\n') || '(없음)'}`;
+  const inline = (r.inline || []).map((c) => `- ${c.path}:${c.line} — ${c.comment || c.body || ''}`).join('\n');
+  return `${r.body || ''}\n\n[인라인 코멘트]\n${inline || '(없음)'}\n\n[blocking_issues]\n${(r.blocking_issues || []).join('\n') || '(없음)'}\n\n[구조화 지적]\n${JSON.stringify(r.findings || [])}`;
 }
 
 // ---- judge ------------------------------------------------------------------
-const INSTRUCTIONS = `너는 코드리뷰 채점관이다. PR diff, 그 PR 에 대해 이미 확정된 결함 목록(정답), 채점할 리뷰(본문+인라인+blocking)를 받는다.
-정답 목록은 사람 리뷰어가 지적하고 작성자가 실제로 고친 것만 모은 것이다. 목록에 없는 문제도 실제로 있을 수 있다.
+const INSTRUCTIONS = `너는 코드리뷰 채점관이다. PR diff, 출처가 명시된 기준 결함 목록, 채점할 리뷰(본문+인라인+blocking)를 받는다.
+정답 출처는 각 사례의 provenance 를 따른다. 합성 사례는 작성된 기대 결과이며 실제 작성자의 반영 증거가 아니다. 목록에 없는 문제도 실제로 있을 수 있다.
 
 해야 할 일:
 1. defects: 정답 결함마다 리뷰가 찾았는지 판정한다.
@@ -81,16 +85,20 @@ const INSTRUCTIONS = `너는 코드리뷰 채점관이다. PR diff, 그 PR 에 �
    - actionability: 파일·라인·수정 방법이 구체적인가
    - tone_structure: 자연스러운 한국어, 읽기 쉬운 구조
 
+4. 각 known defect 를 찾았으면 severity_result 를 aligned|understated|overstated|unverifiable 로 적는다. 영향과 도달 가능성으로 평가하며 확신도·수정 줄 수만으로 판정하지 않는다. 놓쳤으면 unverifiable 이다.
+5. suggestions: 실제 적용 버튼이 있는 코드 블록마다 단독 적용 안전성을 safe|unsafe|unverifiable 로 판정한다. 다른 import·권한·소비처·마이그레이션 변경이 필요한데 빠졌으면 unsafe 다. 일반 코드 제안에는 적용 버튼이 없으므로 이 목록에 넣지 않는다. 구조화 findings 의 suggestion 필드만으로 버튼이 있다고 보지 말고, 실제 인라인의 suggestion 펜스를 확인한다.
+
 출력은 아래 JSON 하나만. 설명 문장 금지.
-{"defects":[{"id":"d1","result":"found|partial|missed","why":"짧게"}],
+{"defects":[{"id":"d1","result":"found|partial|missed","severity_result":"aligned|understated|overstated|unverifiable","why":"짧게"}],
  "claims":[{"summary":"짧게","verdict":"correct|incorrect|unverifiable","severity":"blocking|non_blocking","matches":"d1|null"}],
+ "suggestions":[{"verdict":"safe|unsafe|unverifiable","why":"짧게"}],
  "quality":{"fp_discipline":n,"confidence_separation":n,"signal_density":n,"actionability":n,"tone_structure":n}}`;
 
 function judge(c, review) {
   const truth = c.defects.length
     ? c.defects.map((d) => `- ${d.id} [${d.severity}] ${d.path}${d.line ? `:${d.line}` : ''} — ${d.summary}`).join('\n')
     : '(없음 — 알려진 결함이 없는 PR)';
-  const prompt = `${INSTRUCTIONS}\n\n=== PR ===\n${c.repo}#${c.pr} @ ${c.sha}\n\n=== 정답 결함 ===\n${truth}\n\n=== 채점할 리뷰 ===\n${reviewText(review)}\n\n=== diff ===\n${caseDiff(c)}`;
+  const prompt = `${INSTRUCTIONS}\n\n=== PR ===\n${c.repo}#${c.pr} @ ${c.sha}\n\n=== 정답 출처 ===\n${c.provenance || "Local truth; inspect source/evidence fields"}\n\n=== 정답 결함 ===\n${truth}\n\n=== 채점할 리뷰 ===\n${reviewText(review)}\n\n=== diff ===\n${caseDiff(c)}`;
   const raw = execFileSync(
     CLAUDE,
     ['-p', '--output-format', 'json', '--model', JUDGE_MODEL, '--allowedTools', '', '--setting-sources', 'user'],
@@ -133,37 +141,6 @@ function scoreLabel(label) {
 }
 
 // ---- metrics ------------------------------------------------------------------
-const avg = (a) => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : NaN);
-const DIMS = ['fp_discipline', 'confidence_separation', 'signal_density', 'actionability', 'tone_structure'];
-
-function metrics(rows) {
-  const withDefects = rows.filter((r) => r.c.defects.length);
-  const recallOf = (r) =>
-    avg(r.j.defects.map((d) => (d.result === 'found' ? 1 : d.result === 'partial' ? 0.5 : 0)));
-  const strictRecallOf = (r) => avg(r.j.defects.map((d) => (d.result === 'found' ? 1 : 0)));
-  const claims = rows.flatMap((r) => r.j.claims || []);
-  const incorrect = claims.filter((c) => c.verdict === 'incorrect');
-  const clean = rows.filter((r) => !r.c.defects.length);
-  return {
-    reviews: rows.length,
-    recall: avg(withDefects.map(recallOf)),
-    recall_strict: avg(withDefects.map(strictRecallOf)),
-    claims_per_review: claims.length / (rows.length || 1),
-    precision: claims.length ? claims.filter((c) => c.verdict === 'correct').length / claims.length : NaN,
-    incorrect_per_review: incorrect.length / (rows.length || 1),
-    incorrect_blocking_per_review: incorrect.filter((c) => c.severity === 'blocking').length / (rows.length || 1),
-    clean_false_block_rate: clean.length
-      ? clean.filter((r) => (r.review.blocking_issues || []).length > 0).length / clean.length
-      : NaN,
-    quality: avg(rows.flatMap((r) => DIMS.map((d) => r.j.quality?.[d]).filter((x) => typeof x === 'number'))),
-    ...Object.fromEntries(DIMS.map((d) => [d, avg(rows.map((r) => r.j.quality?.[d]).filter((x) => typeof x === 'number'))])),
-    inline_per_review: avg(rows.map((r) => (r.review.inline || []).length)),
-    explored_rate: avg(rows.map((r) => (r.review.explored ? 1 : 0))),
-    unfinished: rows.filter((r) => !r.review.finished_cleanly).length,
-    cost_per_review: avg(rows.map((r) => r.review.cost_usd).filter((x) => typeof x === 'number')),
-  };
-}
-
 // ---- report -------------------------------------------------------------------
 const results = Object.fromEntries(LABELS.map((l) => [l, scoreLabel(l)]));
 const M = Object.fromEntries(LABELS.map((l) => [l, metrics(results[l])]));
@@ -178,6 +155,11 @@ const ROWS = [
   ['틀린 주장 / 리뷰', 'incorrect_per_review'],
   ['틀린 blocking / 리뷰', 'incorrect_blocking_per_review'],
   ['clean PR 오차단율', 'clean_false_block_rate', true],
+  ['심각도 평가 수', 'severity_assessments'],
+  ['심각도 일치율', 'severity_alignment', true],
+  ['적용 제안 평가 수', 'suggestion_assessments'],
+  ['위험한 적용 제안 비율', 'unsafe_suggestion_rate', true],
+  ['적용 안전성 미확인 비율', 'unverifiable_suggestion_rate', true],
   ['품질 총점 (0~5)', 'quality'],
   ...DIMS.map((d) => [`  ${d}`, d]),
   ['인라인 / 리뷰', 'inline_per_review'],

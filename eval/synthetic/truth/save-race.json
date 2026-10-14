@@ -1,0 +1,19 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "defects",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/editor.ts b/editor.ts\n--- a/editor.ts\n+++ b/editor.ts\n@@ -1,5 +1,4 @@\n export async function save(form, api) {\n-  const submitted = form.value;\n-  await api.write(submitted);\n-  form.savedValue = submitted;\n+  await api.write(form.value);\n+  form.savedValue = form.value;\n }\n",
+  "defects": [
+    {
+      "id": "d1",
+      "path": "editor.ts",
+      "line": 3,
+      "severity": "major",
+      "summary": "Editing form.value while write is pending marks the new unsaved value as saved.",
+      "source": "Synthetic draft impact label"
+    }
+  ],
+  "notes": "Editing form.value while write is pending marks the new unsaved value as saved."
+}

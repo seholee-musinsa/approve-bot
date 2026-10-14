@@ -1,0 +1,20 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "defects",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/guard.ts b/guard.ts\n--- a/guard.ts\n+++ b/guard.ts\n@@ -1,5 +1,5 @@\n export function accept(code) {\n+  if (!code) return false;\n   const normalized = code.replaceAll(\"-\", \"\").trim();\n-  if (!normalized) return false;\n   return true;\n }\n",
+  "defects": [
+    {
+      "id": "d1",
+      "path": "guard.ts",
+      "line": 2,
+      "severity": "major",
+      "summary": "Input consisting of spaces and hyphens passes validation although normalization produces an empty code.",
+      "source": "Synthetic draft impact label"
+    }
+  ],
+  "notes": "Input consisting of spaces and hyphens passes validation although normalization produces an empty code.",
+  "split": "holdout"
+}

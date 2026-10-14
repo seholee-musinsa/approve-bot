@@ -1,0 +1,19 @@
+{
+  "repo": "synthetic/reliability",
+  "pr": 0,
+  "sha": "synthetic-v1",
+  "kind": "defects",
+  "provenance": "Synthetic draft labels; require human validation before model-quality claims. No production evidence.",
+  "diff": "diff --git a/bulk.ts b/bulk.ts\n--- a/bulk.ts\n+++ b/bulk.ts\n@@ -1,4 +1,4 @@\n export async function bulk(items, send) {\n-  const results = await Promise.allSettled(items.map(send));\n-  return { ok: results.every(r => r.status === \"fulfilled\") };\n+  await Promise.allSettled(items.map(send));\n+  return { ok: true };\n }\n",
+  "defects": [
+    {
+      "id": "d1",
+      "path": "bulk.ts",
+      "line": 3,
+      "severity": "major",
+      "summary": "A rejected item is silently reported as successful by the bulk operation.",
+      "source": "Synthetic draft impact label"
+    }
+  ],
+  "notes": "A rejected item is silently reported as successful by the bulk operation."
+}
