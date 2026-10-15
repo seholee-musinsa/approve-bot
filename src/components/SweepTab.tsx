@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { summarizeSweepRun } from "../lib/sweepSummary";
 import { api } from "../lib/tauri";
 import { JiraPanels } from "./JiraPanels";
 import { ResultsPanel } from "./ResultsPanel";
@@ -332,7 +333,7 @@ function RunLog() {
         runs.map((r) => (
           <details key={r.at} className="review-detail">
             <summary>
-              {r.ok ? "✅" : "⚠"} {new Date(r.at * 1000).toLocaleString("ko-KR")} · {r.seconds}초 · {summarize(r.text)}
+              {r.ok ? "✅" : "⚠"} {new Date(r.at * 1000).toLocaleString("ko-KR")} · {r.seconds}초 · {summarizeSweepRun(r.text, r.ok)}
             </summary>
             <pre className="review-body">{r.text}</pre>
           </details>
@@ -340,15 +341,4 @@ function RunLog() {
       )}
     </div>
   );
-}
-
-/** 실행 출력에서 만든 티켓·대기 건수를 한 줄로 요약한다. */
-function summarize(text: string): string {
-  const lines = text.split("\n");
-  const created = lines.filter((l) => l.startsWith("생성: ")).length;
-  const waiting = lines.filter((l) => l.startsWith("대기: ")).length;
-  const failed = lines.some((l) => l.startsWith("⚠️ 생성"));
-  const parts = [`티켓 ${created}건 생성`, `대기 ${waiting}건`];
-  if (failed) parts.push("⚠ 생성 실패");
-  return parts.join(" · ");
 }

@@ -117,7 +117,13 @@ fn log_path(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 pub fn load_log(dir: &std::path::Path) -> Vec<RunEntry> {
-    std::fs::read_to_string(log_path(dir)).ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default()
+    let mut rows: Vec<RunEntry> = std::fs::read_to_string(log_path(dir)).ok().and_then(|r| serde_json::from_str(&r).ok()).unwrap_or_default();
+    for row in &mut rows { row.ok &= !output_failed(&row.text); }
+    rows
+}
+
+fn output_failed(text: &str) -> bool {
+    text.lines().any(|line| ["읽기에 실패했다:", "실패를 장부에 기록했다", "⚠️ 생성하지 못했다", "⚠️ 생성 실패", "⚠️ Jira 를 읽지 못해"].iter().any(|p| line.starts_with(p)))
 }
 
 pub fn append_log(dir: &std::path::Path, e: RunEntry) -> std::io::Result<()> {
@@ -206,7 +212,7 @@ pub async fn run_once(state: &Arc<AppState>, s: &SweepSettings) -> bool {
         }
     }
     // 티켓을 만들려다 실패한 실행은 정상으로 보이지 않게 한다.
-    if text.contains("⚠️ 생성하지 못했다") || text.contains("⚠️ 생성 실패") {
+    if output_failed(&text) {
         ok = false;
     }
     let _ = append_log(
@@ -443,6 +449,23 @@ mod tests {
         let off = status(&dir, &SweepSettings::default(), false, dt(2026, 10, 2, 3, 0));
         assert!(off.next_run.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn historical_model_failures_are_not_successful_zero_ticket_runs() {
+        let dir = std::env::temp_dir().join(format!("sweep-log-errors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rows = vec![
+            RunEntry { at: 1, ok: true, seconds: 1200, text: "읽기에 실패했다: \n실패를 장부에 기록했다(저장)".into() },
+            RunEntry { at: 2, ok: true, seconds: 30, text: "읽기에 실패했다: 모델 출력에서 JSON 을 찾지 못함: unrelated answer".into() },
+            RunEntry { at: 3, ok: true, seconds: 30, text: "발견 0건 → 티켓 후보 0건 · 오늘 만들 티켓 0건".into() },
+        ];
+        std::fs::write(log_path(&dir), serde_json::to_vec(&rows).unwrap()).unwrap();
+        let loaded = load_log(&dir);
+        assert!(!loaded[0].ok); assert!(!loaded[1].ok); assert!(loaded[2].ok);
+        // Reading history changes its interpretation, not the original evidence.
+        assert_eq!(serde_json::from_slice::<Vec<RunEntry>>(&std::fs::read(log_path(&dir)).unwrap()).unwrap(), rows);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

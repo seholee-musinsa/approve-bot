@@ -997,6 +997,17 @@ fn changed_between(root: &Path, from: &str, to: &str) -> std::collections::HashS
         .unwrap_or_default()
 }
 
+fn failed_slice_result(ledger: &mut crate::sweep_state::Ledger, slice: &str, why: &str,
+    dir: &Path, save: bool, mut out: String) -> anyhow::Result<String> {
+    ledger.mark_failed(slice, why);
+    out.push_str(&format!("읽기에 실패했다: {why}\n"));
+    if save {
+        crate::sweep_state::save(dir, ledger)?;
+        out.push_str("실패를 장부에 기록했다(저장)\n");
+    }
+    Err(anyhow::anyhow!(out.trim_end().to_string()))
+}
+
 /// One day of the sweep: pick the next slice from the ledger, read it, decide
 /// what to create and what to carry over. Writes the ledger only with `--save`.
 fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
@@ -1032,15 +1043,8 @@ fn run_day(c: &DayCtx, slices: &[Slice]) -> anyhow::Result<String> {
     let (model, thinking) = model_settings(c.model.clone(), c.thinking);
     let outcome = read_slice(slice, &prompt, c.checkout, &model, thinking, c.max_files);
     out.push_str(&format!("오늘의 점검 구간 {} · 파일 {}개 · {}줄 · 모델 {model}\n", slice.name, slice.files.len(), slice.lines));
-    if outcome.run.is_error || outcome.parse_error.is_some() {
-        let why = outcome.parse_error.clone().unwrap_or_else(|| outcome.run.text.chars().take(200).collect());
-        ledger.mark_failed(&slice.name, &why);
-        out.push_str(&format!("읽기에 실패했다: {why}\n"));
-        if c.save {
-            st::save(&dir, &ledger)?;
-            out.push_str("실패를 장부에 기록했다(저장)\n");
-        }
-        return Ok(out);
+    if let Some(why) = outcome.failure_reason() {
+        return failed_slice_result(&mut ledger, &slice.name, &why, &dir, c.save, out);
     }
     // Findings left over from earlier days come first; they compete with today's by risk.
     let mut incoming = outcome.kept.clone();
@@ -1197,6 +1201,20 @@ mod tests {
 
     fn stat(path: &str, lines: usize, churn: u32) -> FileStat {
         FileStat { path: path.into(), lines, markers: Markers::default(), violations: vec![], churn }
+    }
+
+    #[test]
+    fn failed_slice_is_persisted_but_propagates_an_error_to_the_scheduler() {
+        let dir = std::env::temp_dir().join(format!("sweep-failure-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ledger = crate::sweep_state::Ledger::default();
+        ledger.start_cycle(&[("sample".into(), 1)], "sha", 1);
+        let result = failed_slice_result(&mut ledger, "sample", "20분 안에 끝나지 않아 중단", &dir, true, "오늘의 점검 구간 sample\n".into());
+        assert!(result.is_err(), "a failed model run must not be a successful zero-ticket run");
+        assert!(format!("{:#}", result.unwrap_err()).contains("20분"));
+        let saved = crate::sweep_state::load(&dir);
+        assert!(serde_json::to_string(&saved).unwrap().contains("20분"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -700,6 +700,7 @@ pub fn parse_stream(stdout: &str, cwd: &Path) -> RunResult {
         path.strip_prefix(&canon).or_else(|_| path.strip_prefix(cwd)).map(|r| r.to_string_lossy().into_owned()).unwrap_or_else(|_| p.to_string())
     };
     let mut r = RunResult::default();
+    let mut saw_result = false;
     for line in stdout.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
         match v["type"].as_str() {
@@ -717,21 +718,37 @@ pub fn parse_stream(stdout: &str, cwd: &Path) -> RunResult {
                 }
             }
             Some("result") => {
+                saw_result = true;
                 r.text = v["result"].as_str().unwrap_or("").to_string();
                 r.cost_usd = v["total_cost_usd"].as_f64();
                 r.duration_ms = v["duration_ms"].as_u64().unwrap_or(0);
                 r.turns = v["num_turns"].as_u64().unwrap_or(0);
                 r.is_error = v["is_error"].as_bool().unwrap_or(false);
+                if r.is_error {
+                    let errors = v["errors"].as_array().map(|items| items.iter().filter_map(|e| e.as_str()).collect::<Vec<_>>().join("; ")).unwrap_or_default();
+                    r.error = Some(if !errors.trim().is_empty() { errors }
+                        else if !r.text.trim().is_empty() { r.text.clone() }
+                        else { format!("모델 실행 실패: {}", v["subtype"].as_str().unwrap_or("원인 미제공")) });
+                }
             }
             _ => {}
         }
+    }
+    if !saw_result {
+        r.is_error = true;
+        r.error = Some("결과 이벤트가 없음".into());
+    }
+    let unexpected: Vec<_> = r.tool_calls.keys().filter(|name| !["Read", "Grep", "Glob"].contains(&name.as_str())).cloned().collect();
+    if !unexpected.is_empty() {
+        r.is_error = true;
+        r.error = Some(format!("코드점검 범위 밖 도구 호출: {}", unexpected.join(", ")));
     }
     r
 }
 
 /// Run the model on a prompt in `cwd` with read-only tools. Same sandbox as the
 /// PR review: no shell, no writes, no web, secrets removed from the environment.
-pub fn run_model(prompt: &str, model: &str, thinking: u32, cwd: &Path) -> RunResult {
+fn model_command(model: &str, thinking: u32, cwd: &Path) -> Command {
     let mut cmd = Command::new(crate::review::claude_bin());
     cmd.args([
         "-p",
@@ -740,6 +757,9 @@ pub fn run_model(prompt: &str, model: &str, thinking: u32, cwd: &Path) -> RunRes
         "--verbose",
         "--setting-sources",
         "user",
+        "--disable-slash-commands",
+        "--tools",
+        crate::review::READ_ONLY_TOOLS,
         "--allowedTools",
         crate::review::READ_ONLY_TOOLS,
         "--disallowedTools",
@@ -752,8 +772,8 @@ pub fn run_model(prompt: &str, model: &str, thinking: u32, cwd: &Path) -> RunRes
     ]);
     cmd.current_dir(cwd);
     cmd.env_clear();
-    for (k, v) in std::env::vars() {
-        if !crate::review::is_secret_env(&k) {
+    for (k, v) in std::env::vars_os() {
+        if k.to_str().is_some_and(|name| !crate::review::is_secret_env(name)) {
             cmd.env(k, v);
         }
     }
@@ -762,12 +782,19 @@ pub fn run_model(prompt: &str, model: &str, thinking: u32, cwd: &Path) -> RunRes
     }
     // `claude -p` breaks on the corporate CA when this is set.
     cmd.env_remove("NODE_OPTIONS");
+    cmd
+}
+
+pub fn run_model(prompt: &str, model: &str, thinking: u32, cwd: &Path) -> RunResult {
+    let cmd = model_command(model, thinking, cwd);
     match crate::review::run_with_timeout(cmd, prompt, crate::review::CLAUDE_TIMEOUT) {
         Ok(out) => {
             let mut r = parse_stream(&String::from_utf8_lossy(&out.stdout), cwd);
-            if r.text.is_empty() && !r.is_error {
+            if !out.status.success() || r.error.as_deref() == Some("결과 이벤트가 없음") {
                 r.is_error = true;
-                r.error = Some(format!("결과 이벤트가 없음: {}", String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()));
+                let stderr = String::from_utf8_lossy(&out.stderr).chars().take(300).collect::<String>();
+                r.error = Some(format!("{} (종료 상태 {}){}", r.error.as_deref().unwrap_or("claude 실행 실패"), out.status,
+                    if stderr.trim().is_empty() { String::new() } else { format!(": {stderr}") }));
             }
             r
         }
@@ -784,6 +811,16 @@ pub struct SliceOutcome {
     pub drafts: Vec<TicketDraft>,
     pub parse_error: Option<String>,
     pub coverage: Option<Coverage>,
+}
+
+impl SliceOutcome {
+    pub fn failure_reason(&self) -> Option<String> {
+        if let Some(error) = &self.parse_error { return Some(error.clone()); }
+        if !self.run.is_error { return None; }
+        Some(self.run.error.as_deref().filter(|s| !s.trim().is_empty())
+            .or_else(|| (!self.run.text.trim().is_empty()).then_some(self.run.text.as_str()))
+            .unwrap_or("모델 실행 실패 (원인 미제공)").chars().take(1000).collect())
+    }
 }
 
 /// Turn a model run into verified findings and ticket drafts.
@@ -1214,6 +1251,33 @@ mod tests {
         assert!(!body.contains("be718036aa"), "the commit is shortened");
     }
 
+    #[test]
+    fn automated_sweep_exposes_only_read_tools_and_no_skills() {
+        let cmd = model_command("synthetic-model", 0, Path::new("."));
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.iter().any(|a| a == "--disable-slash-commands"));
+        let at = args.iter().position(|a| a == "--tools").expect("restrict available tools, not only auto-approval");
+        assert_eq!(args[at + 1], "Read,Grep,Glob");
+        assert!(args.windows(2).any(|a| a == ["--setting-sources", "user"]), "retain user auth and telemetry");
+    }
+
+    #[test]
+    fn failed_result_keeps_cli_diagnostic_when_result_text_is_empty() {
+        let r = parse_stream(r#"{"type":"result","subtype":"error_max_turns","is_error":true,"errors":["maximum turns reached"],"result":""}"#, Path::new("."));
+        assert!(r.is_error);
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("maximum turns reached")));
+    }
+
+    #[test]
+    fn out_of_scope_skill_use_invalidates_even_a_valid_empty_result() {
+        let r = parse_stream(concat!(
+            "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"tool_use\",\"name\":\"Skill\",\"input\":{\"skill\":\"synthetic-pet\"}}]}}\n",
+            "{\"type\":\"result\",\"is_error\":false,\"result\":\"{\\\"findings\\\":[]}\"}"
+        ), Path::new("."));
+        assert!(r.is_error);
+        assert!(r.error.as_deref().is_some_and(|e| e.contains("Skill")));
+    }
+
     // ---- the model run ----
 
     #[test]
@@ -1245,6 +1309,7 @@ mod tests {
         let input = SliceInput { name: "s".into(), commit: "abc".into(), files: vec![], candidates: vec![] };
         let text = report(&input, &o);
         assert!(text.contains("실패: 시간 초과"), "{text}");
+        assert_eq!(o.failure_reason().as_deref(), Some("시간 초과"));
         assert!(o.drafts.is_empty());
     }
 
