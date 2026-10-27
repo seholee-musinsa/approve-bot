@@ -108,6 +108,9 @@ pub struct AppState {
     /// docs/tests changed since a review that held). Lets later polls return
     /// before re-fetching the round; lost on restart, which costs one fetch.
     pub settled_heads: Mutex<std::collections::HashMap<String, String>>,
+    /// `owner/repo#n` → the PR `updated_at` whose threads were last checked
+    /// for author replies. Unchanged PRs cost no extra GitHub calls.
+    pub reply_checks: Mutex<std::collections::HashMap<String, String>>,
     /// True while a PR poll pass (including its reviews) is running. The sweep
     /// scheduler waits for it to be false so the two never compete.
     pub pass_running: std::sync::atomic::AtomicBool,
@@ -130,6 +133,7 @@ impl AppState {
             retries: Mutex::new(crate::retry::RetryState::default()),
             pending_reviews: Mutex::new(std::collections::HashMap::new()),
             settled_heads: Mutex::new(std::collections::HashMap::new()),
+            reply_checks: Mutex::new(std::collections::HashMap::new()),
             pass_running: std::sync::atomic::AtomicBool::new(false),
             sweep_running: std::sync::atomic::AtomicBool::new(false),
         })

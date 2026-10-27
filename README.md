@@ -116,6 +116,12 @@ cargo run --manifest-path src-tauri/Cargo.toml -- review-metrics \
   --from 2026-10-15 --to 2026-10-27 --timezone +09:00 --format md
 ```
 
+작성자가 push 없이 답글만 남긴 스레드도 정리한다. PR의 `updated_at`이 바뀐 경우에만 스레드를 읽고,
+내 마지막 답글 뒤에 온 작성자 답글 하나에 한 번만 답한다. question은 어떤 답이든 닫고, nit·minor는
+반영 보고·반대 이유·보류면 닫는다. major·blocker는 반영 보고가 와도 push 뒤 재리뷰가 코드로 확인할
+때까지 열어 두고, 반대·보류 이유에는 메모 한 번만 남긴다. 정리 결과는 감사 기록 `threads_settled`와
+활동 로그에 남는다. 답글 기반 정리는 코드 검증이 아니며 `feedback` 집계에서 봇 판단으로 구분된다.
+
 답글 통계는 작성자 보고, 참여자 보고, 봇의 후속 판단, 검증된 커밋 증거를 분리한다.
 이 수집기는 커밋을 직접 검증하지 않으므로 commit_verified는 비어 있다. 부분 반영·보류·반대는
 반영 완료와 분리하고, 질문은 별도 분모로 집계한다.

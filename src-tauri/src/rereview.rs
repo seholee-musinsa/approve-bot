@@ -85,6 +85,58 @@ fn reply_status(body: &str) -> Option<String> {
     Some(rest[..rest.find(" -->")?].trim().to_string())
 }
 
+/// The author's latest reply in a thread that came after my last reply (or
+/// with no reply of mine at all). None when the author has not spoken since
+/// I did, so a settlement never answers the same reply twice. Order is
+/// `created_at` then id, as `feedback` sorts replies.
+pub fn author_reply_after_mine<'a>(
+    comments: &'a [InlineThreadComment],
+    root_id: u64,
+    me: &str,
+    author: &str,
+) -> Option<&'a InlineThreadComment> {
+    let key = |c: &InlineThreadComment| {
+        (
+            c.created_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|t| t.timestamp_millis())
+                .unwrap_or(i64::MAX),
+            c.id,
+        )
+    };
+    let replies = comments.iter().filter(|c| c.in_reply_to_id == Some(root_id));
+    let mine = replies.clone().filter(|c| c.user.login.eq_ignore_ascii_case(me)).map(key).max();
+    replies
+        .filter(|c| c.user.login.eq_ignore_ascii_case(author))
+        .filter(|c| mine.is_none_or(|m| key(c) > m))
+        .max_by_key(|c| key(c))
+}
+
+/// What to do with a thread the author replied to without pushing. The
+/// reply is a report, not proof, so only threads where the report is enough
+/// are closed: a question is answered by any reply; a nit or minor by a fix
+/// report, a reason not to, or a deferral. A major or blocker waits for the
+/// push that lets the follow-up round check the code.
+pub fn reply_step(severity: &str, outcome: crate::feedback::Outcome, last_reply: Option<&str>) -> ThreadStep {
+    use crate::feedback::Outcome as O;
+    let mark = |lead: &str, status: &str| format!("{lead}\n\n{REPLY_MARK}{status} -->");
+    match (severity, outcome) {
+        (_, O::NoReply) => ThreadStep::Leave,
+        ("question", _) => ThreadStep::Close(mark("🙏 답변 감사합니다. 확인했습니다.", "answered")),
+        ("nit" | "minor", O::Fixed) => ThreadStep::Close(mark(
+            "✅ 반영해 주셨다고 하셔서 정리합니다. 다음 리뷰에서 코드로 확인합니다.",
+            "resolved_by_reply",
+        )),
+        ("nit" | "minor", O::Rejected) => ThreadStep::Close(mark("🆗 남겨 주신 이유대로 반영하지 않는 것으로 정리합니다.", "wont_fix")),
+        ("nit" | "minor", O::Deferred) => ThreadStep::Close(mark("🕐 보류로 정리합니다.", "deferred")),
+        ("major" | "blocker", O::Rejected | O::Deferred) if last_reply != Some("noted") => {
+            ThreadStep::Note(mark("이유 확인했습니다. 다음 push 때 코드로 다시 봅니다.", "noted"))
+        }
+        _ => ThreadStep::Leave,
+    }
+}
+
 /// What happens to an earlier finding's thread after a follow-up round.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ThreadStep {
@@ -473,6 +525,65 @@ mod tests {
         let p = prev_findings(&[c("me", &body, false)], "me");
         assert_eq!(p.len(), 1);
         assert_eq!((p[0].severity.as_str(), p[0].claim.as_str()), ("major", "권한 없이 저장됩니다"));
+    }
+
+    #[test]
+    fn reply_step_closes_questions_and_low_severities_but_not_majors() {
+        use crate::feedback::Outcome as O;
+        let close = |s: &str, o: O| matches!(reply_step(s, o, None), ThreadStep::Close(_));
+        let leave = |s: &str, o: O| reply_step(s, o, None) == ThreadStep::Leave;
+        // A question is settled by any answer.
+        for o in [O::Fixed, O::Partial, O::Deferred, O::Rejected, O::Replied] {
+            assert!(close("question", o), "{o:?}");
+        }
+        assert!(leave("question", O::NoReply));
+        // nit/minor: fix report, reason not to, or deferral close; chatter does not.
+        for s in ["nit", "minor"] {
+            assert!(close(s, O::Fixed) && close(s, O::Rejected) && close(s, O::Deferred), "{s}");
+            assert!(leave(s, O::Partial) && leave(s, O::Replied), "{s}");
+        }
+        match reply_step("minor", O::Fixed, None) {
+            ThreadStep::Close(b) => {
+                assert!(b.starts_with("✅ 반영해 주셨다고 하셔서 정리합니다."), "{b}");
+                assert!(b.ends_with("<!-- fu:resolved_by_reply -->"), "{b}");
+            }
+            other => panic!("{other:?}"),
+        }
+        // major/blocker: a fix report waits for the push; a reason gets one note.
+        for s in ["major", "blocker"] {
+            assert!(leave(s, O::Fixed) && leave(s, O::Partial) && leave(s, O::Replied), "{s}");
+            match reply_step(s, O::Rejected, None) {
+                ThreadStep::Note(b) => assert!(b.ends_with("<!-- fu:noted -->"), "{b}"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(reply_step(s, O::Rejected, Some("noted")), ThreadStep::Leave, "said once");
+        }
+    }
+
+    #[test]
+    fn author_reply_after_my_last_reply_is_the_only_trigger() {
+        let at = |id: u64, login: &str, t: &str| InlineThreadComment {
+            id, user: crate::github::GhUser { login: login.into() }, path: "a.ts".into(), line: Some(1), original_line: None,
+            body: format!("reply {id}"), in_reply_to_id: Some(100), created_at: Some(format!("2026-10-27T{t}:00Z")), subject_type: None,
+        };
+        let root = InlineThreadComment { id: 100, in_reply_to_id: None, ..at(100, "me", "09:00") };
+        // Author answered after my thread root, I never replied → trigger.
+        let c = vec![root.clone(), at(101, "author", "10:00")];
+        assert_eq!(author_reply_after_mine(&c, 100, "me", "author").map(|r| r.id), Some(101));
+        // I replied after → nothing new.
+        let c = vec![root.clone(), at(101, "author", "10:00"), at(102, "me", "10:05")];
+        assert!(author_reply_after_mine(&c, 100, "me", "author").is_none());
+        // Author came back after my reply → the latest author reply.
+        let c = vec![root.clone(), at(101, "author", "10:00"), at(102, "me", "10:05"), at(103, "author", "10:10"), at(104, "author", "10:12")];
+        assert_eq!(author_reply_after_mine(&c, 100, "me", "author").map(|r| r.id), Some(104));
+        // Someone else's reply is not the author's.
+        let c = vec![root.clone(), at(101, "colleague", "10:00")];
+        assert!(author_reply_after_mine(&c, 100, "me", "author").is_none());
+        // Another thread's replies do not count.
+        let mut other = at(201, "author", "11:00");
+        other.in_reply_to_id = Some(200);
+        let c = vec![root, other];
+        assert!(author_reply_after_mine(&c, 100, "me", "author").is_none());
     }
 
     #[test]

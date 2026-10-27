@@ -223,6 +223,8 @@ pub fn report(dir: &Path, date: &str, timezone: &str) -> Result<Report> {
         }
         if r.status == "reapproval" || r.status == "legacy_reapproval" {
             out.reapprovals += 1;
+        } else if r.source == "settlement" {
+            // Thread replies settled from the author's answer: not a review run.
         } else if r.finished_cleanly == Some(false)
             || matches!(
                 r.status.as_str(),
@@ -1008,6 +1010,22 @@ mod tests {
         assert!(md.contains("| 전체 | 3 | 2 | 1 (50%) | 1 | 1 | 2 (auth 1, usage_limit 1) | 3 | 1 (33%) | 1 | 1 |"), "{md}");
         let json = serde_json::to_value(&m).unwrap();
         assert!(json["total"].get("body_chars").is_none(), "scratch vectors are not serialized");
+        std::fs::remove_dir_all(p).unwrap();
+    }
+    #[test]
+    fn settlement_records_are_not_incomplete_runs() {
+        let p = dir();
+        let mut s = row("settle-1", "2026-10-20T01:00:00Z");
+        s.repo = "example/repo".into();
+        s.pr = 1;
+        s.source = "settlement".into();
+        s.status = "threads_settled".into();
+        append(&p, &s).unwrap();
+        let r = report(&p, "2026-10-20", "UTC").unwrap();
+        assert_eq!(r.records.len(), 1);
+        assert_eq!(r.incomplete_runs, 0);
+        assert_eq!(r.normal_reviews, 0);
+        assert_eq!(r.statuses["threads_settled"], 1);
         std::fs::remove_dir_all(p).unwrap();
     }
     #[test]
