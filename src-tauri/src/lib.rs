@@ -58,15 +58,44 @@ pub fn run() {
                 .expect("could not resolve app config dir");
             std::fs::create_dir_all(&config_dir).ok();
 
-            let cfg = match config::load(&config_dir) {
+            let mut cfg = match config::load(&config_dir) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(error = %e, "failed to load config; using defaults");
                     config::AppConfig::default()
                 }
             };
+            // Older builds read `review-guide.md` from the config dir ahead of the
+            // bundle; the copy silently went stale. Move it aside or make it explicit.
+            let migration = review::guide_migrate(&config_dir, &mut cfg);
+            if matches!(migration, Some(review::GuideMigration::PromotedToExplicit(_))) {
+                if let Err(e) = config::save(&config_dir, &cfg) {
+                    warn!(error = %e, "could not save the promoted review guide path");
+                }
+            }
             let state = state::AppState::new(config_dir, cfg);
             app.manage(Arc::clone(&state));
+            if let Some(m) = migration {
+                let (message, detail) = match m {
+                    review::GuideMigration::RenamedStale(target) => (
+                        "옛 리뷰 가이드 복사본을 치우고 번들 가이드를 사용합니다".to_string(),
+                        Some(format!("{}", target.display())),
+                    ),
+                    review::GuideMigration::PromotedToExplicit(path) => (
+                        "직접 고친 리뷰 가이드를 설정의 명시 경로로 옮겼습니다. 버전 마커가 없어 stale 로 표시됩니다".to_string(),
+                        Some(format!("{}", path.display())),
+                    ),
+                };
+                let state = Arc::clone(&state);
+                tauri::async_runtime::spawn(async move {
+                    state.push_activity(state::ActivityEntry {
+                        timestamp: chrono::Utc::now(),
+                        kind: state::ActivityKind::Info,
+                        repo: None, pr_number: None, pr_title: None, author: None, url: None,
+                        message, detail,
+                    }).await;
+                });
+            }
 
             sweep_sched::spawn(Arc::clone(&state));
             poller::spawn(app.handle().clone(), state);

@@ -39,6 +39,8 @@ const REVIEW_MARKER: &str = "<!-- approve-bot:review -->";
 /// `REVIEW_MARKER` it never counts as "reviewed" — the next commit gets a real
 /// review instead of a bare approve.
 const FAILED_MARKER: &str = "<!-- approve-bot:review-failed -->";
+/// Warn once per process, not once per PR, when the explicit guide is stale.
+static STALE_GUIDE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Which engine marker (if any) a prior review of mine carries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -835,7 +837,12 @@ async fn handle_pr(
             pr.number, pr.user.login, pr.title
         );
         let diff_for_gate = diff.clone();
-        let guide = crate::review::load_guide(&state.config_dir, &cfg.review_guide_path, me);
+        let resolved = crate::review::resolve_guide(&cfg.review_guide_path, me);
+        if resolved.source.is_stale() && !STALE_GUIDE_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            warn!(guide = %resolved.source.label(), "review guide lacks the current version marker; its 본문 양식 may predate the output format");
+        }
+        let guide_source = resolved.source.label();
+        let guide = resolved.text;
         let (risk, risk_why) = review_risk(&diff, round.as_ref());
         let (model, tk) = crate::routing::pick(cfg, risk);
         let second = crate::routing::second_pass(cfg, risk);
@@ -854,11 +861,6 @@ async fn handle_pr(
             retry_error(app, state, &publication_key, repo_full, pr, "리뷰 시작 보류", &e).await;
             return;
         }
-        let guide_path = if cfg.review_guide_path.trim().is_empty() { state.config_dir.join("review-guide.md") }
-            else { std::path::PathBuf::from(&cfg.review_guide_path) };
-        let guide_source = if std::fs::read_to_string(&guide_path).ok().is_some_and(|s| !s.trim().is_empty()) {
-            guide_path.display().to_string()
-        } else { "bundled".into() };
         let input_hash = crate::audit::fingerprint(&format!("{guide}\n{meta}\n{round_block}\n{diff}\n{}\n{}\n{model}:{tk}:{deep}:{second}:{trace}", pr.base.ref_name, pr.base.sha));
         let cached = state.pending_reviews.lock().await.get(&pending_key).cloned()
             .filter(|p| p.audit.head_sha == head_sha && p.input_hash == input_hash);

@@ -7,8 +7,8 @@
 //!   approve-bot review-once --pr <url> [--guide <path>] [--sha <commit>]
 //!                           [--diff-only] [--model <id>] [--thinking <n>]
 //!
-//! `--guide` overrides the team guide (empty/omitted = the config-dir guide,
-//! same as the running bot). Deep mode by default, like the running bot;
+//! `--guide` overrides the team guide (empty/omitted = the bundled guide,
+//! same as the running bot without `review_guide_path`). Deep mode by default, like the running bot;
 //! `--diff-only` turns it off. `--sha` reviews that commit instead of the PR's
 //! current head (diff = `<base>...<sha>`), so a case can be pinned to the
 //! commit a human reviewed before the fixes landed.
@@ -257,9 +257,8 @@ fn run(flags: &[String]) -> anyhow::Result<String> {
     })?;
 
     // Resolve the guide exactly like the poller: `--guide` path wins, else the
-    // config-dir copy, else the bundled default. `{{GITHUB_LOGIN}}` substituted.
-    let config_dir = config_dir()?;
-    let guide = review::load_guide(&config_dir, &args.guide, &login);
+    // bundled default. `{{GITHUB_LOGIN}}` substituted.
+    let guide = review::resolve_guide(&args.guide, &login).text;
 
     // Build the PR meta block identically to poller.rs (capped body).
     let meta = format!("{}\n\n{context}", build_meta(&owner, &repo, &pr));

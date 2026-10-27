@@ -24,8 +24,9 @@ pub struct AppConfig {
     /// Model passed to `claude -p`.
     #[serde(default = "default_review_model")]
     pub review_model: String,
-    /// Override path to the review guide md. Empty = app config dir's
-    /// `review-guide.md`, else the bundled default.
+    /// Override path to the review guide md. Empty = the bundled default.
+    /// (Older builds read the config dir's `review-guide.md` implicitly; the
+    /// first start after that moves it aside or makes it this explicit path.)
     #[serde(default)]
     pub review_guide_path: String,
     /// Minimum score (0-5) to auto-approve; below this posts a COMMENT review.
