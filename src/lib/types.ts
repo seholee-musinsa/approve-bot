@@ -73,6 +73,8 @@ export interface ConnectionStatus {
   rate_limit_total: number | null;
   last_error: string | null;
   checked_at: string;
+  /** Set while the review engine waits for the model's usage window to reset. */
+  engine_paused_until?: string | null;
 }
 
 /// What "Check now" did with the press. "queued" means a pass is already
