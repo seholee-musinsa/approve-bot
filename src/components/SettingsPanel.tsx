@@ -68,6 +68,19 @@ export function SettingsPanel({ value, onChange }: Props) {
           <div className="muted" style={{ marginLeft: 26 }}>
             줄별 지적을 스레드로 게시. repo 가 "대화 해결 필수"면 머지 병목이 될 수 있어 끌 수 있음
           </div>
+          <label className="toggle" style={{ marginTop: 8 }}>
+            <input
+              type="checkbox"
+              checked={value.hold_on_confident_major ?? true}
+              onChange={(e) =>
+                patch({ hold_on_confident_major: e.target.checked })
+              }
+            />
+            확인한 major 가 있으면 사람 확인으로 보류
+          </label>
+          <div className="muted" style={{ marginLeft: 26 }}>
+            확신 80 이상 major(또는 재리뷰에서 아직 열린 major)가 있으면 점수가 넘어도 자동 승인하지 않음
+          </div>
         </div>
       ) : (
         <div className="muted" style={{ marginLeft: 24 }}>

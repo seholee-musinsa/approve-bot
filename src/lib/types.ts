@@ -17,6 +17,7 @@ export interface AppConfig {
   /** true = attach inline line comments (resolvable threads). Turn off if a repo
    *  requires conversation resolution to merge. */
   inline_comments_enabled: boolean;
+  hold_on_confident_major: boolean;
   /** Regular repo sweep. Always sent back whole so saving never resets it. */
   sweep: SweepSettings;
   report: ReportSettings;

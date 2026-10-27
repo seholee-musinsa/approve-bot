@@ -69,6 +69,11 @@ pub struct AppConfig {
     /// touches). Off: it showed no recall gain in the eval.
     #[serde(default)]
     pub review_value_trace_enabled: bool,
+    /// A confirmed major (confidence ≥ 80), or an earlier major still open on
+    /// a follow-up, holds auto-approval for a human. Off: the score alone
+    /// decides (a major costs 0.5, so one major still approves at 4.5).
+    #[serde(default = "default_true")]
+    pub hold_on_confident_major: bool,
 
     /// Regular repo sweep (all defaulted, off until switched on).
     #[serde(default)]
@@ -232,6 +237,7 @@ impl Default for AppConfig {
             review_thinking_low: default_thinking_low(),
             review_second_pass_enabled: true,
             review_value_trace_enabled: false,
+            hold_on_confident_major: true,
             sweep: SweepSettings::default(),
             report: ReportSettings::default(),
         }

@@ -38,6 +38,7 @@ pnpm tauri dev
   - 작성자가 본인이 아니고
   - 게시 직전에도 open 상태이며 draft 가 아니고 검토한 SHA와 같고
   - 본인이 아직 APPROVED 리뷰를 안 남겼고
+  - 확신 80 이상 major 지적(또는 재리뷰에서 아직 열린 major)이 없고 (`hold_on_confident_major`, 기본 켬)
 - approve 결과는 활동 로그 + macOS 알림으로 표시.
 
 ## 설정 위치
