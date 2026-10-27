@@ -7,9 +7,10 @@ export function ConnectionStatus() {
   const [status, setStatus] = useState<Status | null>(null);
   // Live position of the running pass: repository n/N, PR, stage.
   const [pass, setPass] = useState<PassState | null>(null);
-  // "Check now" scope: "" = every repository, else one `owner/repo`.
-  const [scope, setScope] = useState("");
+  // Repositories for the "Check now ▾" menu; picking one checks it right away.
   const [repos, setRepos] = useState<string[]>([]);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const menuRef = useRef<HTMLDivElement | null>(null);
   const loadRepos = () => api.getConfig().then((c) => setRepos(c.repositories)).catch(() => {});
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(false);
@@ -53,6 +54,10 @@ export function ConnectionStatus() {
     api.getConnectionStatus().then(setStatus).catch(() => {});
     api.getPassState().then(setPass).catch(() => {});
     loadRepos();
+    const closeMenu = (e: MouseEvent) => {
+      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", closeMenu);
     const offStatus = onStatusChanged((s) => {
       setStatus(s);
       // A pass emits its own status snapshot on the way out, so let PASS_EVENT
@@ -102,15 +107,17 @@ export function ConnectionStatus() {
       offPass.then((u) => u()).catch(() => {});
       offLogin.then((u) => u()).catch(() => {});
       clearStartTimer();
+      document.removeEventListener("mousedown", closeMenu);
     };
   }, []);
 
-  async function checkNow() {
+  async function checkNow(scope?: string) {
+    setMenuOpen(false);
     checkingRef.current = true;
     setChecking(true);
     let ack: CheckNowAck;
     try {
-      ack = await api.forceCheckNow(scope || undefined);
+      ack = await api.forceCheckNow(scope);
     } catch {
       stopChecking();
       showToast("Check failed", "error");
@@ -207,23 +214,34 @@ export function ConnectionStatus() {
             Sign in with GitHub
           </button>
         )}
-        <select
-          value={scope}
-          onChange={(e) => setScope(e.target.value)}
-          onFocus={loadRepos}
-          disabled={checking || busy || pass?.running}
-          title="Check now 대상"
-        >
-          <option value="">전체</option>
-          {repos.map((r) => (
-            <option key={r} value={r}>
-              {r}
-            </option>
-          ))}
-        </select>
-        <button onClick={checkNow} disabled={checking || busy || pass?.running}>
-          {checking ? "Checking…" : pass?.running ? "검사 중…" : "Check now"}
-        </button>
+        <div className="split" ref={menuRef}>
+          <button onClick={() => checkNow()} disabled={checking || busy || pass?.running}>
+            {checking ? "Checking…" : pass?.running ? "검사 중…" : "Check now"}
+          </button>
+          <button
+            className="split-caret"
+            aria-label="저장소 하나만 검사"
+            title="저장소 하나만 검사"
+            disabled={checking || busy || pass?.running}
+            onClick={() => {
+              loadRepos();
+              setMenuOpen((o) => !o);
+            }}
+          >
+            ▾
+          </button>
+          {menuOpen && !pass?.running && (
+            <div className="menu">
+              <div className="menu-title">이 저장소만 지금 검사</div>
+              {repos.length === 0 && <div className="muted" style={{ padding: "4px 10px" }}>설정된 저장소 없음</div>}
+              {repos.map((r) => (
+                <button key={r} className="menu-item" title={r} onClick={() => checkNow(r)}>
+                  {r.includes("/") ? r.slice(r.indexOf("/") + 1) : r}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {pass?.running && (
