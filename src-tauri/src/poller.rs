@@ -15,9 +15,33 @@ pub const PASS_EVENT: &str = "approve-bot://pass-state";
 /// Published when a poll pass starts and when it ends. A pass that runs the
 /// review engine takes minutes, so the UI needs the real start/end instead of
 /// guessing with a timeout.
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct PassState {
     pub running: bool,
+    /// 1-based index of the repository being worked on, and how many there are.
+    pub repo_index: usize,
+    pub repo_total: usize,
+    pub repo: Option<String>,
+    /// 1-based index of the PR inside that repository, and how many it has.
+    pub pr_index: usize,
+    pub pr_total: usize,
+    pub pr_number: Option<u64>,
+    pub pr_title: Option<String>,
+    /// What is happening right now: `PR 목록 조회`, `확인`, `리뷰 중`, `게시`.
+    pub stage: Option<String>,
+    /// 0..=1 share of the pass that is done, for the progress bar.
+    pub fraction: f64,
+}
+
+/// Share of the pass done: finished repositories count whole, the current one
+/// by its PRs. A repository whose PR count is not known yet counts as 0.
+fn progress_fraction(repo_index: usize, repo_total: usize, pr_index: usize, pr_total: usize) -> f64 {
+    if repo_total == 0 || repo_index == 0 {
+        return 0.0;
+    }
+    let done_repos = (repo_index - 1) as f64;
+    let within = if pr_total == 0 { 0.0 } else { (pr_index.saturating_sub(1) as f64 / pr_total as f64).min(1.0) };
+    ((done_repos + within) / repo_total as f64).clamp(0.0, 1.0)
 }
 
 /// Flip the shared `pass_running` flag and tell the UI about it. The flag was
@@ -26,7 +50,25 @@ fn set_pass_running(app: &AppHandle, state: &Arc<AppState>, running: bool) {
     state
         .pass_running
         .store(running, std::sync::atomic::Ordering::SeqCst);
-    let _ = app.emit(PASS_EVENT, &PassState { running });
+    let snapshot = {
+        let mut p = state.pass_progress.lock().unwrap_or_else(|e| e.into_inner());
+        *p = PassState { running, ..PassState::default() };
+        p.clone()
+    };
+    let _ = app.emit(PASS_EVENT, &snapshot);
+}
+
+/// Update the live pass progress and tell the UI. Called on every repository
+/// and PR step so "Check now" shows where the pass is instead of a spinner.
+fn progress(app: &AppHandle, state: &Arc<AppState>, update: impl FnOnce(&mut PassState)) {
+    let snapshot = {
+        let mut p = state.pass_progress.lock().unwrap_or_else(|e| e.into_inner());
+        update(&mut p);
+        p.running = true;
+        p.fraction = progress_fraction(p.repo_index, p.repo_total, p.pr_index, p.pr_total);
+        p.clone()
+    };
+    let _ = app.emit(PASS_EVENT, &snapshot);
 }
 
 /// Hidden marker prepended to engine-posted review bodies so later polls can
@@ -738,7 +780,18 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
 
     let mut latest_rate: Option<(Option<u64>, Option<u64>)> = None;
 
-    for repo_full in &cfg.repositories {
+    let repo_total = cfg.repositories.len();
+    for (repo_i, repo_full) in cfg.repositories.iter().enumerate() {
+        progress(app, state, |p| {
+            p.repo_index = repo_i + 1;
+            p.repo_total = repo_total;
+            p.repo = Some(repo_full.clone());
+            p.pr_index = 0;
+            p.pr_total = 0;
+            p.pr_number = None;
+            p.pr_title = None;
+            p.stage = Some("PR 목록 조회".into());
+        });
         if !state.retries.lock().await.ready(repo_full, Utc::now().timestamp()) { continue; }
 
         let (owner, repo) = match split_repo(repo_full) {
@@ -797,8 +850,16 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
         }
         latest_rate = Some((rate.remaining, rate.limit));
 
-        for pr in pulls {
-            handle_pr(app, state, &client, &cfg, &allowed, &me, repo_full, &pr).await;
+        let pr_total = pulls.len();
+        for (pr_i, pr) in pulls.iter().enumerate() {
+            progress(app, state, |p| {
+                p.pr_index = pr_i + 1;
+                p.pr_total = pr_total;
+                p.pr_number = Some(pr.number);
+                p.pr_title = Some(pr.title.clone());
+                p.stage = Some("확인".into());
+            });
+            handle_pr(app, state, &client, &cfg, &allowed, &me, repo_full, pr).await;
         }
     }
 
@@ -1091,6 +1152,7 @@ async fn handle_pr(
         } else {
         let mut audit = crate::audit::Record::start(repo_full, number, head_sha, &model, risk.label(), &guide, guide_source);
         state.record_review(&audit).await;
+        progress(app, state, |p| p.stage = Some(format!("리뷰 중 · {}", model.trim_start_matches("claude-"))));
         let review_started = std::time::Instant::now();
 
         // `claude -p` can take minutes — keep it off the async runtime.
@@ -1338,6 +1400,7 @@ async fn handle_pr(
         } else {
             format!(", 인라인 {}건", inline.len())
         };
+        progress(app, state, |p| p.stage = Some("게시".into()));
         audit.note_posted(&posted_body);
         audit.update("publication_attempted"); audit.error = None;
         state.record_review(&audit).await;
@@ -1714,6 +1777,20 @@ mod tests {
         // …and with an earlier finished review it becomes a follow-up round.
         let reviews = [("COMMENTED", Some(OLD), R), ("COMMENTED", Some(HEAD), F)];
         assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::FollowUp);
+    }
+
+    #[test]
+    fn progress_fraction_counts_finished_repos_whole_and_the_current_one_by_prs() {
+        use super::progress_fraction as f;
+        assert_eq!(f(0, 0, 0, 0), 0.0);
+        assert_eq!(f(1, 4, 0, 0), 0.0, "first repo, PR count unknown");
+        assert_eq!(f(2, 4, 0, 0), 0.25, "one repo done");
+        assert_eq!(f(2, 4, 3, 4), 0.25 + 0.5 / 4.0, "third of four PRs in the second repo: two done");
+        assert_eq!(f(4, 4, 4, 4), 0.75 + 0.75 / 4.0);
+        assert!(f(9, 4, 9, 1) <= 1.0, "never past the end");
+        let json = serde_json::to_value(super::PassState { running: true, repo_index: 1, repo_total: 2, ..Default::default() }).unwrap();
+        assert_eq!(json["repo_total"], 2);
+        assert_eq!(json["fraction"], 0.0);
     }
 
     #[test]

@@ -103,6 +103,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_connection_status,
+            commands::get_pass_state,
             commands::reconnect,
             commands::get_config,
             commands::update_config,

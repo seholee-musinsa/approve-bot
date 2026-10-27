@@ -11,6 +11,11 @@ pub async fn get_connection_status(state: State<'_, Arc<AppState>>) -> Result<Co
 }
 
 #[tauri::command]
+pub async fn get_pass_state(state: tauri::State<'_, Arc<AppState>>) -> Result<crate::poller::PassState, String> {
+    Ok(state.pass_progress.lock().unwrap_or_else(|e| e.into_inner()).clone())
+}
+
+#[tauri::command]
 pub async fn reconnect(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,

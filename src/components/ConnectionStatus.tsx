@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { api, onGhLoginProgress, onPassState, onStatusChanged } from "../lib/tauri";
 import { showToast } from "../lib/toast";
-import type { CheckNowAck, ConnectionStatus as Status } from "../lib/types";
+import type { CheckNowAck, ConnectionStatus as Status, PassState } from "../lib/types";
 
 export function ConnectionStatus() {
   const [status, setStatus] = useState<Status | null>(null);
+  // Live position of the running pass: repository n/N, PR, stage.
+  const [pass, setPass] = useState<PassState | null>(null);
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
@@ -41,6 +43,7 @@ export function ConnectionStatus() {
 
   useEffect(() => {
     api.getConnectionStatus().then(setStatus).catch(() => {});
+    api.getPassState().then(setPass).catch(() => {});
     const offStatus = onStatusChanged((s) => {
       setStatus(s);
       // A pass emits its own status snapshot on the way out, so let PASS_EVENT
@@ -48,6 +51,7 @@ export function ConnectionStatus() {
       if (checkingRef.current && !passRunningRef.current) stopChecking("done");
     });
     const offPass = onPassState((p) => {
+      setPass(p);
       passRunningRef.current = p.running;
       if (p.running) {
         // The pass is really under way — no need for the start fallback.
@@ -191,6 +195,26 @@ export function ConnectionStatus() {
           {checking ? "Checking…" : "Check now"}
         </button>
       </div>
+
+      {pass?.running && (
+        <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+          <div className="progress">
+            <div className="progress-bar" style={{ width: `${Math.round((pass.fraction ?? 0) * 100)}%` }} />
+          </div>
+          <div className="muted" style={{ fontSize: 12 }}>
+            {pass.repo_total > 0 ? `저장소 ${pass.repo_index}/${pass.repo_total}` : "검사 준비 중"}
+            {pass.repo && ` · ${pass.repo}`}
+            {pass.pr_number != null &&
+              ` · PR #${pass.pr_number}${pass.pr_total ? ` (${pass.pr_index}/${pass.pr_total})` : ""}`}
+            {pass.stage && ` · ${pass.stage}`}
+          </div>
+          {pass.pr_title && (
+            <div className="muted" style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {pass.pr_title}
+            </div>
+          )}
+        </div>
+      )}
 
       {pausedUntil && (
         <div className="row muted" style={{ gap: 8 }}>
