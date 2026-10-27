@@ -278,9 +278,14 @@ enum Gate {
     HoldSensitive(Vec<String>),
     HoldOmitted(Vec<String>),
     HoldContinued,
+    /// A confirmed major is on the page; a human decides, not the score.
+    HoldMajor(usize),
     HoldVerdict,
     HoldScore,
 }
+
+/// Confidence from which a major finding holds auto-approval.
+const CONFIDENT_MAJOR: f64 = 80.0;
 
 impl Gate {
     fn reason(&self, blocking: usize, score: &str, min: f64) -> String {
@@ -291,6 +296,7 @@ impl Gate {
             Gate::HoldSensitive(files) => format!("민감 파일 {}건", files.len()),
             Gate::HoldOmitted(files) => format!("미검토 파일 {}건", files.len()),
             Gate::HoldContinued => "대형 PR(이어서 리뷰)".to_string(),
+            Gate::HoldMajor(n) => format!("확인한 major {n}건"),
             Gate::HoldVerdict => "판정이 approve 아님".to_string(),
             Gate::HoldScore => format!("점수 {score}/5 < {min:.1}"),
         }
@@ -310,6 +316,7 @@ fn outcome_line(decision: &Gate, counts: &str, blocking: usize, score: &str, min
             format!("👤 **사람 승인 필요** — 민감 파일 변경({}) · {counts}", short_files(files))
         }
         Gate::HoldBlocking => format!("> [!CAUTION]\n> **머지 전에 고쳐야 할 지적이 있습니다** · {counts}"),
+        Gate::HoldMajor(n) => format!("👤 **사람 확인 필요** — 확인한 major {n}건 · {counts}"),
         other => format!("⏸ **승인 보류** — {} · {counts}", other.reason(blocking, score, min)),
     }
 }
@@ -437,6 +444,36 @@ async fn settle_replies(
         pr_number: Some(pr.number), pr_title: Some(pr.title.clone()), author: Some(pr.user.login.clone()),
         url: Some(pr.html_url.clone()), message, detail: None,
     }).await;
+}
+
+/// Majors that hold auto-approval: new findings at or above `CONFIDENT_MAJOR`
+/// confidence, plus earlier majors the follow-up round did not settle
+/// (resolved, withdrawn, or a reason not to fix). Earlier findings carry no
+/// confidence, but they were posted at ≥ 70 and judged again this round.
+fn count_confident_majors(
+    findings: &[crate::review::Finding],
+    round: Option<&crate::rereview::Round>,
+    followups: &[crate::rereview::Followup],
+) -> usize {
+    let prev_ids: Vec<&str> = round.map(|r| r.prev.iter().map(|p| p.id.as_str()).collect()).unwrap_or_default();
+    let new = findings
+        .iter()
+        .filter(|f| f.severity == "major" && f.confidence.unwrap_or(0.0) >= CONFIDENT_MAJOR)
+        .filter(|f| !prev_ids.contains(&crate::review::finding_id(&f.path, &f.symbol, &f.claim).as_str()))
+        .count();
+    let open_prev = round
+        .map(|r| {
+            r.prev
+                .iter()
+                .filter(|p| p.severity == "major")
+                .filter(|p| {
+                    !crate::rereview::followup_for(p, followups)
+                        .is_some_and(|f| matches!(f.status.as_str(), "resolved" | "withdrawn" | "wont_fix"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    new + open_prev
 }
 
 /// Hold reasons other than the one the first line already states.
@@ -572,6 +609,7 @@ fn gate(
     sensitive: &[String],
     omitted: &[String],
     continued: bool,
+    confident_majors: usize,
     min_score: f64,
 ) -> Gate {
     if !finished_cleanly {
@@ -587,6 +625,11 @@ fn gate(
         // Review quality drops on big PRs (recall ~8% above 150KB in eval), so
         // even a fully read one is left to a human.
         Gate::HoldContinued
+    } else if confident_majors > 0 {
+        // The score would still pass (a major costs 0.5), but a confirmed
+        // defect is for a human to weigh, not to wave through at 4.5. 20
+        // such approvals went out between 10/15 and 10/27.
+        Gate::HoldMajor(confident_majors)
     } else if verdict != "approve" {
         Gate::HoldVerdict
     } else if score < min_score {
@@ -1171,6 +1214,11 @@ async fn handle_pr(
         // Code-side policy the model can't talk its way past: sensitive files
         // always go to a human (the #4022-style ".env-only PR got 5/5" case).
         let sensitive = crate::review::sensitive_files(&diff_for_gate);
+        let confident_majors = if cfg.hold_on_confident_major {
+            count_confident_majors(&outcome.findings, round.as_ref(), &outcome.followups)
+        } else {
+            0
+        };
         let decision = gate(
             outcome.finished_cleanly,
             &outcome.verdict,
@@ -1179,6 +1227,7 @@ async fn handle_pr(
             &sensitive,
             &outcome.omitted_files,
             outcome.continued,
+            confident_majors,
             cfg.min_approve_score,
         );
         // The first line states the outcome from the gate; every other hold
@@ -1583,7 +1632,7 @@ async fn push_and_emit(app: &AppHandle, state: &Arc<AppState>, entry: ActivityEn
 #[cfg(test)]
 mod tests {
     use super::{docs_only_step, nothing_to_review, review_risk, DocsOnlyStep};
-    use super::{decide_review_action, gate, Gate, Marker, ReviewAction};
+    use super::{decide_review_action, gate, outcome_line, Gate, Marker, ReviewAction};
 
     const R: Marker = Marker::Reviewed;
     const N: Marker = Marker::None;
@@ -1670,6 +1719,41 @@ mod tests {
     }
 
     #[test]
+    fn gate_holds_a_confident_major_when_the_policy_is_on_and_approves_when_off() {
+        assert_eq!(gate(true, "approve", 4.5, 0, &[], &[], false, 1, 4.0), Gate::HoldMajor(1));
+        assert_eq!(gate(true, "approve", 4.5, 0, &[], &[], false, 0, 4.0), Gate::Approve, "policy off passes a count of 0");
+        // Earlier holds still come first; a blocker is not demoted to a major hold.
+        assert_eq!(gate(true, "approve", 4.5, 1, &[], &[], false, 2, 4.0), Gate::HoldBlocking);
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &[], true, 2, 4.0), Gate::HoldContinued);
+        assert_eq!(Gate::HoldMajor(2).reason(0, "4.0", 4.0), "확인한 major 2건");
+        assert_eq!(outcome_line(&Gate::HoldMajor(1), "major 1 · minor 2", 0, "4.5", 4.0), "👤 **사람 확인 필요** — 확인한 major 1건 · major 1 · minor 2");
+    }
+
+    #[test]
+    fn confident_majors_count_new_findings_and_unsettled_earlier_ones() {
+        let mk = |sev: &str, conf: f64, claim: &str| crate::review::Finding {
+            severity: sev.into(), confidence: Some(conf), path: "a.ts".into(), symbol: "f".into(), claim: claim.into(), ..Default::default()
+        };
+        let findings = vec![mk("major", 85.0, "a"), mk("major", 70.0, "b"), mk("minor", 95.0, "c"), mk("blocker", 90.0, "d")];
+        assert_eq!(super::count_confident_majors(&findings, None, &[]), 1, "only the confident major");
+        // On a follow-up, a re-posted earlier finding is not new; an open earlier major counts.
+        let prev = |id: &str, sev: &str| crate::rereview::PrevFinding {
+            id: id.into(), severity: sev.into(), path: "a.ts".into(), line: Some(1), claim: "x".into(), comment_id: 1, last_reply: None,
+        };
+        let reposted = crate::review::finding_id("a.ts", "f", "a");
+        let round = crate::rereview::Round {
+            number: 2, prev_sha: "p".into(), delta_diff: String::new(),
+            prev: vec![prev(&reposted, "major"), prev("open1", "major"), prev("fixed1", "major"), prev("minor1", "minor")],
+        };
+        let fu = |id: &str, status: &str| crate::rereview::Followup { id: id.into(), status: status.into(), note: String::new() };
+        let followups = vec![fu(&reposted, "resolved"), fu("fixed1", "wont_fix")];
+        // reposted: resolved → 0; open1: no followup → 1; fixed1: wont_fix → 0; minor1 ignored; new confident major "a" is reposted → not new.
+        assert_eq!(super::count_confident_majors(&findings, Some(&round), &followups), 1);
+        let followups = vec![fu("open1", "partial")];
+        assert_eq!(super::count_confident_majors(&findings, Some(&round), &followups), 3, "partial and silent earlier majors stay open; 'a' is new again");
+    }
+
+    #[test]
     fn outdated_reviews_include_a_failed_notice_on_head() {
         let mk = |body: &str, sha: &str, node: &str| crate::github::Review {
             id: 0, html_url: String::new(), user: crate::github::GhUser { login: "me".into() }, state: "COMMENTED".into(),
@@ -1712,19 +1796,19 @@ mod tests {
 
     #[test]
     fn gate_rejects_approve_with_blocking_issues() {
-        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], false, 4.0), Gate::HoldBlocking);
+        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], false, 0, 4.0), Gate::HoldBlocking);
     }
 
     #[test]
     fn gate_holds_sensitive_files() {
         let files = vec![".env.production".to_string()];
-        assert_eq!(gate(true, "approve", 5.0, 0, &files, &[], false, 4.0), Gate::HoldSensitive(files));
+        assert_eq!(gate(true, "approve", 5.0, 0, &files, &[], false, 0, 4.0), Gate::HoldSensitive(files));
     }
 
     #[test]
     fn gate_holds_when_files_were_not_reviewed() {
         let omitted = vec!["src/big.ts".to_string()];
-        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, false, 4.0), Gate::HoldOmitted(omitted));
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, false, 0, 4.0), Gate::HoldOmitted(omitted));
     }
 
     #[test]
@@ -1879,18 +1963,18 @@ mod tests {
 
     #[test]
     fn continued_review_is_held_even_when_everything_else_passes() {
-        assert_eq!(gate(true, "approve", 5.0, 0, &[], &[], true, 4.0), Gate::HoldContinued);
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &[], true, 0, 4.0), Gate::HoldContinued);
         // Higher-priority holds still win, so the reason shown is the first one hit.
         let omitted = vec!["src/big.ts".to_string()];
-        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, true, 4.0), Gate::HoldOmitted(omitted));
-        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], true, 4.0), Gate::HoldBlocking);
+        assert_eq!(gate(true, "approve", 5.0, 0, &[], &omitted, true, 0, 4.0), Gate::HoldOmitted(omitted));
+        assert_eq!(gate(true, "approve", 5.0, 1, &[], &[], true, 0, 4.0), Gate::HoldBlocking);
     }
 
     #[test]
     fn gate_approves_only_when_all_hold() {
-        assert_eq!(gate(true, "approve", 4.0, 0, &[], &[], false, 4.0), Gate::Approve);
-        assert_eq!(gate(false, "approve", 5.0, 0, &[], &[], false, 4.0), Gate::HoldUnfinished);
-        assert_eq!(gate(true, "comment", 5.0, 0, &[], &[], false, 4.0), Gate::HoldVerdict);
-        assert_eq!(gate(true, "approve", 3.5, 0, &[], &[], false, 4.0), Gate::HoldScore);
+        assert_eq!(gate(true, "approve", 4.0, 0, &[], &[], false, 0, 4.0), Gate::Approve);
+        assert_eq!(gate(false, "approve", 5.0, 0, &[], &[], false, 0, 4.0), Gate::HoldUnfinished);
+        assert_eq!(gate(true, "comment", 5.0, 0, &[], &[], false, 0, 4.0), Gate::HoldVerdict);
+        assert_eq!(gate(true, "approve", 3.5, 0, &[], &[], false, 0, 4.0), Gate::HoldScore);
     }
 }

@@ -102,6 +102,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 코드가 본문 목록에 적는다.
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다. 영향 크기나 수정 줄 수와 혼동하지 않는다.
 - impact 에 실제 결과, 도달 가능한 조건, 코드 근거를 분리해 적는다. 높은 confidence 만으로 blocker 로 올리지 않는다.
+- major 는 특정 입력·상태에서 동작이나 데이터가 틀리는, 코드로 확인한 결함이다. 시안과의 시각 차이(px·색·간격·정렬)는 기능이 깨지지 않으면 minor 또는 nit 다. 예) "팝오버 항목이 시안보다 2px 좁아집니다" 는 minor, "저장 요청이 두 번 나가 중복 생성됩니다" 는 major.
 - 빈 값 허용, 저장 중 값 변경, 조회 중 항목 누락, 부분 성공, 동시성, 권한 문제는 입력부터 소비처까지 추적한다. 실제 사용자 흐름이 깨지면 한 줄 수정이라도 minor 로 낮추지 않는다. 의도된 정책과 명시된 선행 PR 은 반증 없이는 결함으로 단정하지 않는다.
 - suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다.
 - fix_code 가 diff 에 이어서 보이는 **line 부터 end_line 까지를 통째로 대체**하는 코드이면 end_line 에 마지막 줄 번호를 적는다. 범위와 suggestion_safety 를 모두 확인한 경우에만 버튼으로 적용할 수 있다. 구간을 확신할 수 없으면 end_line 을 쓰지 않는다(잘못된 구간은 적용하면 코드를 망가뜨린다).
@@ -1881,6 +1882,7 @@ mod tests {
         assert!(p.contains("작성자가 답할 수 있는 확인 요청은 `# 미확인` 이나 summary.checks 가 아니라 severity \"question\" finding 으로 낸다"));
         assert!(p.contains("지적이 하나도 없는 PR 이면 2~4개"));
         assert!(p.contains("사람이 머지 전에 직접 해 볼 일"));
+        assert!(p.contains("시각 차이(px·색·간격·정렬)는 기능이 깨지지 않으면 minor 또는 nit"), "cosmetic deviations are not major");
     }
 
     #[test]
