@@ -199,7 +199,25 @@ pub fn report_table(summary: &crate::review::ReviewSummary, scope: &Scope) -> St
 
 /// Sections the posted body drops: the findings are listed by code (only the
 /// ones without a thread), so the model's own list would repeat the threads.
-const DROPPED: &[&str] = &["발견", "질문", "줄을 짚지 못한 지적"];
+/// `이전 지적 처리` is the re-review tally the code already prints from the
+/// `followups` JSON; a second `총평` (a later pass writing a whole review)
+/// would repeat the overview.
+const DROPPED: &[&str] = &["발견", "질문", "줄을 짚지 못한 지적", "이전 지적 처리", "총평"];
+
+/// The part of a heading that names the section: `검증 근거` for
+/// `# 검증 근거 — 2차` and `# 검증 근거: …`. Same-named sections from a
+/// continuation or second pass merge into one.
+fn section_key(title: &str) -> String {
+    title
+        .split(" — ")
+        .next()
+        .unwrap_or(title)
+        .split(':')
+        .next()
+        .unwrap_or(title)
+        .trim()
+        .to_string()
+}
 
 /// A sentence that states the score or the verdict ("4.0/5점, Approve 합니다").
 /// The first line already states the outcome from the gate, and a held review
@@ -301,12 +319,28 @@ pub fn compose_body(
     report: &str,
     unposted: &[&crate::review::Finding],
 ) -> String {
+    compose_body_with(model_body, verdict_line, notes, report, unposted, true)
+}
+
+/// `compose_body` with a choice of folding. A re-review folds the whole first
+/// review under one `전체 리뷰 보기`, so inside it the audit sections stay flat
+/// (`###`) — a `<details>` inside a `<details>` reads as a broken page.
+pub fn compose_body_with(
+    model_body: &str,
+    verdict_line: &str,
+    notes: &str,
+    report: &str,
+    unposted: &[&crate::review::Finding],
+    fold: bool,
+) -> String {
     let mut overview: Vec<String> = Vec::new();
-    let mut rest = String::new();
+    // Sections in first-seen order; a repeated title (the continuation pass's
+    // own `# 검증 근거`) appends to the first instead of opening a second fold.
+    let mut sections: Vec<(String, Vec<String>)> = Vec::new();
     let mut title: Option<String> = None; // None = before the first heading
     let mut seen_overview = false;
     let mut in_fence = false;
-    let flush = |title: &Option<String>, lines: &mut Vec<String>, overview: &mut Vec<String>, rest: &mut String, seen: &mut bool| {
+    let flush = |title: &Option<String>, lines: &mut Vec<String>, overview: &mut Vec<String>, sections: &mut Vec<(String, Vec<String>)>, seen: &mut bool| {
         let body: Vec<String> = std::mem::take(lines);
         match title.as_deref() {
             None => overview.extend(body),
@@ -316,18 +350,16 @@ pub fn compose_body(
             }
             Some(t) if DROPPED.iter().any(|d| t.starts_with(d)) => {}
             Some(t) => {
-                let text = body.join("\n");
-                if text.trim().is_empty() {
+                if body.join("\n").trim().is_empty() {
                     return;
                 }
-                // Each folded section is folded on its own: a `###` section after
-                // it would otherwise be swallowed into the `<details>`.
-                if FOLDED.iter().any(|f| t.starts_with(f)) {
-                    rest.push_str(&fold_sections(&format!("# {t}\n\n{}", text.trim())));
+                let key = section_key(t);
+                if let Some((_, existing)) = sections.iter_mut().find(|(k, _)| *k == key) {
+                    existing.push(String::new());
+                    existing.extend(body);
                 } else {
-                    rest.push_str(&format!("### {t}\n\n{}", text.trim()));
+                    sections.push((key, body));
                 }
-                rest.push_str("\n\n");
             }
         }
     };
@@ -337,13 +369,26 @@ pub fn compose_body(
             in_fence = !in_fence;
         }
         if !in_fence && line.starts_with("# ") {
-            flush(&title, &mut lines, &mut overview, &mut rest, &mut seen_overview);
+            flush(&title, &mut lines, &mut overview, &mut sections, &mut seen_overview);
             title = Some(line[2..].trim().to_string());
             continue;
         }
         lines.push(line.to_string());
     }
-    flush(&title, &mut lines, &mut overview, &mut rest, &mut seen_overview);
+    flush(&title, &mut lines, &mut overview, &mut sections, &mut seen_overview);
+
+    let mut rest = String::new();
+    for (t, body) in &sections {
+        let text = collapse_blank(body.join("\n").trim());
+        // Each folded section is folded on its own: a `###` section after
+        // it would otherwise be swallowed into the `<details>`.
+        if fold && FOLDED.iter().any(|f| t.starts_with(f)) {
+            rest.push_str(&fold_sections(&format!("# {t}\n\n{text}")));
+        } else {
+            rest.push_str(&format!("### {t}\n\n{text}"));
+        }
+        rest.push_str("\n\n");
+    }
 
     let mut out = verdict_line.trim().to_string();
     if !notes.trim().is_empty() {
@@ -532,6 +577,42 @@ mod tests {
         assert!(out.contains("<summary>검증 근거 2건 · ⚠️ 1</summary>"), "{out}");
         assert!(out.contains("<summary>산입하지 않은 것 1건</summary>"), "{out}");
         assert!(!out.lines().any(|l| l.starts_with("# ")), "no H1 left: {out}");
+    }
+
+    #[test]
+    fn same_titled_sections_merge_into_one_fold_with_combined_counts() {
+        // A continuation pass appends its own `# 검증 근거`; readers saw two folds.
+        let body = "# 검증 근거\n\n- ✅ 첫째\n- ⚠️ 둘째\n\n# 미확인\n\n- 못 봄\n\n# 추가 리뷰 (1) — 앞선 리뷰가 보지 못한 파일\n\n# 검증 근거\n\n- ✅ 셋째\n\n# 미확인\n\n- 더 못 봄\n";
+        let out = compose_body(body, "✅ **승인** · 지적 없음", "", "", &[]);
+        assert_eq!(out.matches("<details>").count(), 1, "{out}");
+        assert!(out.contains("<summary>검증 근거 3건 · ⚠️ 1</summary>"), "{out}");
+        assert!(out.contains("- ✅ 첫째\n- ⚠️ 둘째\n\n- ✅ 셋째"), "{out}");
+        assert_eq!(out.matches("### 미확인").count(), 1, "{out}");
+        assert!(out.contains("- 못 봄\n\n- 더 못 봄"), "{out}");
+        assert!(!out.contains("추가 리뷰"), "an empty heading-only section is dropped: {out}");
+        // A failed continuation keeps its note as its own small section.
+        let failed = "# 검증 근거\n\n- ✅ 첫째\n\n# 추가 리뷰 (2)\n\n(남은 파일 리뷰가 정상 완료되지 않아 해당 파일은 보지 못했습니다.)\n";
+        let out = compose_body(failed, "⏸ **승인 보류**", "", "", &[]);
+        assert!(out.contains("### 추가 리뷰 (2)\n\n(남은 파일 리뷰가"), "{out}");
+    }
+
+    #[test]
+    fn model_written_followup_tally_and_second_overview_are_dropped() {
+        let body = "# 총평\n\n첫 총평\n\n# 이전 지적 처리 — 해소 0 · 부분 0 · 미해소 0 · 철회 0\n\n- ~~고침~~\n\n# 검증 근거\n\n- ✅ 확인\n\n# 총평\n\n두 번째 리뷰어가 또 쓴 총평\n";
+        let out = compose_body(body, "✅ **승인**", "", "", &[]);
+        assert!(out.contains("첫 총평"), "{out}");
+        assert!(!out.contains("이전 지적 처리") && !out.contains("~~고침~~"), "{out}");
+        assert!(!out.contains("두 번째 리뷰어"), "{out}");
+        assert_eq!(section_key("검증 근거 — 2차"), "검증 근거");
+        assert_eq!(section_key("이전 지적 처리: 해소 1"), "이전 지적 처리");
+    }
+
+    #[test]
+    fn flat_composition_uses_small_headings_instead_of_folds() {
+        let body = "# 검증 근거\n\n- ✅ 확인\n\n# 산입하지 않은 것\n\n- 남의 것\n";
+        let out = compose_body_with(body, "", "", "", &[], false);
+        assert!(!out.contains("<details>"), "{out}");
+        assert!(out.starts_with("### 검증 근거\n\n- ✅ 확인\n\n### 산입하지 않은 것"), "{out}");
     }
 
     #[test]
