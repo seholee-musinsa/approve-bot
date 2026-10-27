@@ -20,6 +20,9 @@ export function ConnectionStatus() {
   // could guess at. Refs stay stable across the listener closures.
   const checkingRef = useRef(false);
   const passRunningRef = useRef(false);
+  // "Check now" pressed while a pass was running: the press runs as the NEXT
+  // pass, so the current pass's end must not close the spinner.
+  const queuedRef = useRef(false);
   // Only covers the gap before the pass starts (e.g. no token, so no pass runs
   // at all). Cancelled the moment PASS_EVENT says a pass is under way.
   const startTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -34,6 +37,7 @@ export function ConnectionStatus() {
   function stopChecking(reason?: "done" | "no-pass") {
     const wasChecking = checkingRef.current;
     checkingRef.current = false;
+    queuedRef.current = false;
     setChecking(false);
     clearStartTimer();
     if (!wasChecking) return;
@@ -58,7 +62,12 @@ export function ConnectionStatus() {
         clearStartTimer();
         if (checkingRef.current) setChecking(true);
       } else if (checkingRef.current) {
-        stopChecking("done");
+        if (queuedRef.current) {
+          // That was the pass that was already running; ours comes next.
+          queuedRef.current = false;
+        } else {
+          stopChecking("done");
+        }
       }
     });
     const offLogin = onGhLoginProgress((p) => {
@@ -104,7 +113,9 @@ export function ConnectionStatus() {
     }
     if (ack === "queued") {
       // A pass (usually a review) is already running. The press is not lost —
-      // one more pass follows this one.
+      // one more pass follows this one, and the spinner stays until that
+      // second pass ends.
+      queuedRef.current = true;
       showToast("검사 중이에요 — 끝나면 한 번 더 돌아요", "info");
       clearStartTimer();
       return;
@@ -192,7 +203,7 @@ export function ConnectionStatus() {
           </button>
         )}
         <button onClick={checkNow} disabled={checking || busy}>
-          {checking ? "Checking…" : "Check now"}
+          {checking ? "Checking…" : pass?.running ? "자동 검사 중 · 한 번 더" : "Check now"}
         </button>
       </div>
 
