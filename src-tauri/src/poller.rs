@@ -902,7 +902,9 @@ async fn handle_pr(
         audit.finding_ids = outcome.findings.iter().map(|f| crate::review::finding_id(&f.path, &f.symbol, &f.claim)).collect();
         audit.result = Some(serde_json::json!({"body": outcome.body, "verdict": outcome.verdict,
             "score":outcome.score, "findings":outcome.findings, "omitted_files":outcome.omitted_files,
-            "blocking_issues":outcome.blocking_issues}));
+            "blocking_issues":outcome.blocking_issues, "summary": outcome.summary,
+            "followups": outcome.followups, "rechecked": outcome.rechecked,
+            "continued": outcome.continued, "explored": outcome.explored}));
         audit.update(if outcome.finished_cleanly {"reviewed"} else {"model_failed"});
         state.record_review(&audit).await;
         (outcome, audit)
@@ -1054,6 +1056,7 @@ async fn handle_pr(
         } else {
             format!(", 인라인 {}건", inline.len())
         };
+        audit.note_posted(&posted_body);
         audit.update("publication_attempted"); audit.error = None;
         state.record_review(&audit).await;
         if decision == Gate::Approve {
