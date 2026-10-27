@@ -34,13 +34,20 @@ pub struct PassState {
 }
 
 /// Share of the pass done: finished repositories count whole, the current one
-/// by its PRs. A repository whose PR count is not known yet counts as 0.
-fn progress_fraction(repo_index: usize, repo_total: usize, pr_index: usize, pr_total: usize) -> f64 {
+/// by its PRs, and the PR being reviewed or posted counts half — a review
+/// runs for minutes, and a bar that sits still looks broken. A repository
+/// whose PR count is not known yet counts as 0.
+fn progress_fraction(repo_index: usize, repo_total: usize, pr_index: usize, pr_total: usize, in_flight: bool) -> f64 {
     if repo_total == 0 || repo_index == 0 {
         return 0.0;
     }
     let done_repos = (repo_index - 1) as f64;
-    let within = if pr_total == 0 { 0.0 } else { (pr_index.saturating_sub(1) as f64 / pr_total as f64).min(1.0) };
+    let within = if pr_total == 0 {
+        0.0
+    } else {
+        let done_prs = pr_index.saturating_sub(1) as f64 + if in_flight && pr_index > 0 { 0.5 } else { 0.0 };
+        (done_prs / pr_total as f64).min(1.0)
+    };
     ((done_repos + within) / repo_total as f64).clamp(0.0, 1.0)
 }
 
@@ -65,7 +72,8 @@ fn progress(app: &AppHandle, state: &Arc<AppState>, update: impl FnOnce(&mut Pas
         let mut p = state.pass_progress.lock().unwrap_or_else(|e| e.into_inner());
         update(&mut p);
         p.running = true;
-        p.fraction = progress_fraction(p.repo_index, p.repo_total, p.pr_index, p.pr_total);
+        let in_flight = p.stage.as_deref().is_some_and(|s| s.starts_with("리뷰 중") || s == "게시");
+        p.fraction = progress_fraction(p.repo_index, p.repo_total, p.pr_index, p.pr_total, in_flight);
         p.clone()
     };
     let _ = app.emit(PASS_EVENT, &snapshot);
@@ -1782,12 +1790,14 @@ mod tests {
     #[test]
     fn progress_fraction_counts_finished_repos_whole_and_the_current_one_by_prs() {
         use super::progress_fraction as f;
-        assert_eq!(f(0, 0, 0, 0), 0.0);
-        assert_eq!(f(1, 4, 0, 0), 0.0, "first repo, PR count unknown");
-        assert_eq!(f(2, 4, 0, 0), 0.25, "one repo done");
-        assert_eq!(f(2, 4, 3, 4), 0.25 + 0.5 / 4.0, "third of four PRs in the second repo: two done");
-        assert_eq!(f(4, 4, 4, 4), 0.75 + 0.75 / 4.0);
-        assert!(f(9, 4, 9, 1) <= 1.0, "never past the end");
+        assert_eq!(f(0, 0, 0, 0, false), 0.0);
+        assert_eq!(f(1, 4, 0, 0, false), 0.0, "first repo, PR count unknown");
+        assert_eq!(f(2, 4, 0, 0, false), 0.25, "one repo done");
+        assert_eq!(f(2, 4, 3, 4, false), 0.25 + 0.5 / 4.0, "third of four PRs in the second repo: two done");
+        assert_eq!(f(2, 4, 3, 4, true), 0.25 + 0.625 / 4.0, "the PR under review counts half");
+        assert_eq!(f(4, 4, 4, 4, false), 0.75 + 0.75 / 4.0);
+        assert!(f(9, 4, 9, 1, true) <= 1.0, "never past the end");
+        assert_eq!(f(1, 1, 1, 1, true), 0.5, "one repo, one PR, mid-review");
         let json = serde_json::to_value(super::PassState { running: true, repo_index: 1, repo_total: 2, ..Default::default() }).unwrap();
         assert_eq!(json["repo_total"], 2);
         assert_eq!(json["fraction"], 0.0);
