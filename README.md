@@ -78,8 +78,10 @@ head, base, diff, 가이드, 문맥 또는 실행 설정이 달라지면 재사�
 감사 기록은 설정 폴더의 `review-audit.jsonl`에 추가 저장하며 UI의 최근 200건 제한과 별개다.
 review/finding ID, SHA, 실행·게시 상태, 모델, 빌드 입력 fingerprint, 가이드 경로·hash,
 비용·실행 시간의 기록 여부를 포함한다. 부분적으로만 알려진 다중 패스 비용은 총액으로
-표시하지 않는다. 기존 사용자 가이드를 덮어쓰지 않으며, 감사 기록의 `guide_source`와
-`guide_hash`로 실제 사용본을 확인할 수 있다.
+표시하지 않는다. 리뷰 가이드는 `review_guide_path`가 비어 있으면 번들 가이드를 쓴다. 예전 빌드가
+설정 폴더에 남긴 `review-guide.md`는 첫 실행 때 `review-guide.md.stale-날짜`로 옮기고, 직접 고친
+파일이면 `review_guide_path`로 올린다. 번들 가이드 첫 줄의 버전 마커가 없는 가이드는 감사 기록의
+`guide_source`에 `(stale)`로 표시된다. `guide_hash`로 실제 사용본을 확인할 수 있다.
 
 ```bash
 # 먼저 npm ci && npm run build

@@ -18,7 +18,7 @@ use std::path::Path;
 use std::process::Command;
 
 /// Bundled default review guide. Editable at runtime by dropping a
-/// `review-guide.md` into the app config dir (see `load_guide`).
+/// `review-guide.md` into the app config dir (see `resolve_guide`).
 const DEFAULT_GUIDE: &str = include_str!("../review-guide.md");
 
 /// Security + output-contract rules the user cannot override (prompt-injection
@@ -258,20 +258,109 @@ pub fn claude_bin() -> String {
     "claude".to_string()
 }
 
-/// Load the team review guide: a user-editable copy in `base_dir/review-guide.md`
-/// wins, else the bundled default. `{{GITHUB_LOGIN}}` is substituted so the
-/// guide can reference the reviewer's handle without hardcoding it.
-pub fn load_guide(base_dir: &Path, guide_override: &str, login: &str) -> String {
-    let path = if guide_override.trim().is_empty() {
-        base_dir.join("review-guide.md")
+/// Version marker the bundled guide carries on its first line. An explicit
+/// guide without the current marker is used as is but flagged stale, so the
+/// audit record shows that the prompt text may predate the output format.
+pub const GUIDE_VERSION: &str = "3";
+const GUIDE_MARKER_PREFIX: &str = "<!-- approve-bot-guide:";
+
+/// Fingerprints (`audit::fingerprint` of the raw file) of guide copies that
+/// older builds wrote into the config dir. 505 reviews between 10/15 and
+/// 10/27 ran on the first one while the bundle had moved on; the copy still
+/// asked for `# 총평 … /5점` and `# 발견` that the engine strips afterwards.
+pub const KNOWN_OLD_GUIDE_HASHES: &[&str] = &["fnv1a64:21c72f4d61487c69"];
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GuideSource {
+    Bundled,
+    Explicit { path: std::path::PathBuf, stale: bool },
+}
+
+impl GuideSource {
+    /// What the audit record stores: `bundled`, the path, or the path marked stale.
+    pub fn label(&self) -> String {
+        match self {
+            GuideSource::Bundled => "bundled".into(),
+            GuideSource::Explicit { path, stale: false } => path.display().to_string(),
+            GuideSource::Explicit { path, stale: true } => format!("{} (stale)", path.display()),
+        }
+    }
+    pub fn is_stale(&self) -> bool {
+        matches!(self, GuideSource::Explicit { stale: true, .. })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Guide {
+    pub text: String,
+    pub source: GuideSource,
+}
+
+fn has_current_marker(text: &str) -> bool {
+    text.lines()
+        .take(3)
+        .any(|l| l.trim() == format!("{GUIDE_MARKER_PREFIX} {GUIDE_VERSION} -->"))
+}
+
+/// The team review guide: the bundled default unless `review_guide_path`
+/// names a file. The config-dir copy an older build left behind is no longer
+/// read implicitly; `guide_migrate` moves it aside or makes it explicit once.
+/// `{{GITHUB_LOGIN}}` is substituted so the guide can reference the
+/// reviewer's handle without hardcoding it.
+pub fn resolve_guide(guide_override: &str, login: &str) -> Guide {
+    let explicit = guide_override.trim();
+    let (text, source) = if explicit.is_empty() {
+        (DEFAULT_GUIDE.to_string(), GuideSource::Bundled)
     } else {
-        Path::new(guide_override).to_path_buf()
+        let path = std::path::PathBuf::from(explicit);
+        match std::fs::read_to_string(&path).ok().filter(|t| !t.trim().is_empty()) {
+            Some(t) => {
+                let stale = !has_current_marker(&t);
+                (t, GuideSource::Explicit { path, stale })
+            }
+            None => (DEFAULT_GUIDE.to_string(), GuideSource::Bundled),
+        }
     };
-    let text = std::fs::read_to_string(&path)
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_GUIDE.to_string());
-    text.replace("{{GITHUB_LOGIN}}", login)
+    Guide { text: text.replace("{{GITHUB_LOGIN}}", login), source }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum GuideMigration {
+    /// A copy of an old bundle was moved to `review-guide.md.stale-YYYYMMDD`.
+    RenamedStale(std::path::PathBuf),
+    /// A user-edited copy became `review_guide_path`; the caller saves the config.
+    PromotedToExplicit(std::path::PathBuf),
+}
+
+/// One-time cleanup of the implicit config-dir guide. With no explicit path
+/// set and a `review-guide.md` present: a known old bundle copy (or one equal
+/// to the current bundle) is renamed so the bundle is used; anything else is
+/// treated as the user's edit and becomes the explicit path, so the choice
+/// is visible in the settings instead of silent.
+pub fn guide_migrate(config_dir: &Path, cfg: &mut crate::config::AppConfig) -> Option<GuideMigration> {
+    if !cfg.review_guide_path.trim().is_empty() {
+        return None;
+    }
+    let path = config_dir.join("review-guide.md");
+    let text = std::fs::read_to_string(&path).ok()?;
+    let hash = crate::audit::fingerprint(&text);
+    let old_copy = KNOWN_OLD_GUIDE_HASHES.contains(&hash.as_str())
+        || hash == crate::audit::fingerprint(DEFAULT_GUIDE)
+        || text.trim().is_empty();
+    if old_copy {
+        let stamp = chrono::Utc::now().format("%Y%m%d");
+        let mut target = config_dir.join(format!("review-guide.md.stale-{stamp}"));
+        let mut n = 1;
+        while target.exists() {
+            target = config_dir.join(format!("review-guide.md.stale-{stamp}-{n}"));
+            n += 1;
+        }
+        std::fs::rename(&path, &target).ok()?;
+        Some(GuideMigration::RenamedStale(target))
+    } else {
+        cfg.review_guide_path = path.display().to_string();
+        Some(GuideMigration::PromotedToExplicit(path))
+    }
 }
 
 /// The exact prompt a review would send, without running the model. For
@@ -1654,6 +1743,74 @@ mod tests {
         assert!(!is_sensitive_path("src/keyboard.tsx"));
         assert!(is_sensitive_path("Dockerfile.dev"));
         assert!(is_sensitive_path("infra/main.tf"));
+    }
+
+    #[test]
+    fn bundled_guide_is_used_unless_a_path_is_set() {
+        let dir = std::env::temp_dir().join(format!("guide-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // An old implicit copy in the config dir is ignored now.
+        std::fs::write(dir.join("review-guide.md"), "# 총평\n{점수}/5점").unwrap();
+        let g = resolve_guide("", "me");
+        assert_eq!(g.source, GuideSource::Bundled);
+        assert!(g.text.starts_with(&format!("{GUIDE_MARKER_PREFIX} {GUIDE_VERSION} -->")), "bundle carries the marker first");
+        assert!(!g.text.contains("{{GITHUB_LOGIN}}"));
+        // An explicit path is used as is; without the marker it is stale.
+        let explicit = dir.join("mine.md");
+        std::fs::write(&explicit, "# 내 규칙\n{{GITHUB_LOGIN}} 는 리뷰어").unwrap();
+        let g = resolve_guide(explicit.to_str().unwrap(), "me");
+        assert_eq!(g.source, GuideSource::Explicit { path: explicit.clone(), stale: true });
+        assert!(g.source.is_stale());
+        assert!(g.source.label().ends_with("mine.md (stale)"));
+        assert!(g.text.contains("me 는 리뷰어"));
+        std::fs::write(&explicit, format!("{GUIDE_MARKER_PREFIX} {GUIDE_VERSION} -->\n# 내 규칙")).unwrap();
+        let g = resolve_guide(explicit.to_str().unwrap(), "me");
+        assert!(!g.source.is_stale());
+        assert_eq!(g.source.label(), explicit.display().to_string());
+        // A missing explicit file falls back to the bundle rather than an empty prompt.
+        let g = resolve_guide(dir.join("missing.md").to_str().unwrap(), "me");
+        assert_eq!(g.source, GuideSource::Bundled);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn known_old_copy_is_renamed_and_edited_copy_becomes_explicit() {
+        let dir = std::env::temp_dir().join(format!("guide-mig-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = crate::config::AppConfig::default();
+        // Nothing to do without a copy.
+        assert_eq!(guide_migrate(&dir, &mut cfg), None);
+        // A copy identical to the current bundle is moved aside.
+        std::fs::write(dir.join("review-guide.md"), DEFAULT_GUIDE).unwrap();
+        match guide_migrate(&dir, &mut cfg) {
+            Some(GuideMigration::RenamedStale(target)) => {
+                assert!(target.file_name().unwrap().to_string_lossy().starts_with("review-guide.md.stale-"));
+                assert!(target.exists());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(!dir.join("review-guide.md").exists());
+        assert!(cfg.review_guide_path.is_empty());
+        // Twice on the same day does not clobber the first backup.
+        std::fs::write(dir.join("review-guide.md"), DEFAULT_GUIDE).unwrap();
+        assert!(matches!(guide_migrate(&dir, &mut cfg), Some(GuideMigration::RenamedStale(_))));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2);
+        // A user-edited copy becomes the explicit path and stays in place.
+        std::fs::write(dir.join("review-guide.md"), "# 우리 팀 규칙\n- 세미콜론 금지").unwrap();
+        assert_eq!(guide_migrate(&dir, &mut cfg), Some(GuideMigration::PromotedToExplicit(dir.join("review-guide.md"))));
+        assert_eq!(cfg.review_guide_path, dir.join("review-guide.md").display().to_string());
+        assert!(dir.join("review-guide.md").exists());
+        // With an explicit path set, nothing is touched again.
+        assert_eq!(guide_migrate(&dir, &mut cfg), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn known_old_guide_hash_matches_the_recorded_fingerprint_format() {
+        for h in KNOWN_OLD_GUIDE_HASHES {
+            assert!(h.starts_with("fnv1a64:") && h.len() == 8 + 16, "{h}");
+        }
+        assert!(!KNOWN_OLD_GUIDE_HASHES.contains(&crate::audit::fingerprint(DEFAULT_GUIDE).as_str()), "the current bundle is not an old copy");
     }
 
     #[test]
