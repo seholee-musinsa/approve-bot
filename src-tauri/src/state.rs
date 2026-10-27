@@ -39,6 +39,10 @@ pub struct ConnectionStatus {
     pub rate_limit_total: Option<u64>,
     pub last_error: Option<String>,
     pub checked_at: DateTime<Utc>,
+    /// Set while the review engine waits for the model's usage window to
+    /// reset; reviews are not run (and nothing is posted) until then.
+    #[serde(default)]
+    pub engine_paused_until: Option<DateTime<Utc>>,
 }
 
 impl ConnectionStatus {
@@ -50,6 +54,7 @@ impl ConnectionStatus {
             rate_limit_total: None,
             last_error: Some(reason.into()),
             checked_at: Utc::now(),
+            engine_paused_until: None,
         }
     }
 }

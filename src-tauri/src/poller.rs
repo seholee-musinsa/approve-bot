@@ -1,6 +1,6 @@
 use crate::github::{split_repo, GitHubClient, PullRequest};
 use crate::state::{ActivityEntry, ActivityKind, AppState, ConnectionStatus};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
@@ -39,6 +39,13 @@ const REVIEW_MARKER: &str = "<!-- approve-bot:review -->";
 /// `REVIEW_MARKER` it never counts as "reviewed" — the next commit gets a real
 /// review instead of a bare approve.
 const FAILED_MARKER: &str = "<!-- approve-bot:review-failed -->";
+/// Backoff key shared by every PR: the model's usage limit and login state
+/// are account-wide, so one failure pauses the engine everywhere.
+const ENGINE_KEY: &str = "engine";
+/// Non-limit failures on one head are retried this many times, then left
+/// until the next push — a PR that always breaks the parser must not burn
+/// money every quarter hour.
+const HEAD_FAILURE_LIMIT: u32 = 3;
 /// Warn once per process, not once per PR, when the explicit guide is stale.
 static STALE_GUIDE_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -154,10 +161,10 @@ fn decide_review_action(
     {
         return ReviewAction::Skip;
     }
-    // Already engine-reviewed THIS head (live) → don't re-post.
-    // Engine ran on THIS head (live), finished or failed → don't re-post.
+    // Already engine-reviewed THIS head (live) → don't re-post. A failed run
+    // on this head is not a review: the engine backoff decides when to retry.
     if reviews.iter().any(|(s, c, marker)| {
-        *marker != Marker::None && !s.eq_ignore_ascii_case("DISMISSED") && *c == Some(head_sha)
+        *marker == Marker::Reviewed && !s.eq_ignore_ascii_case("DISMISSED") && *c == Some(head_sha)
     }) {
         return ReviewAction::Skip;
     }
@@ -387,16 +394,57 @@ async fn hide_outdated(client: &GitHubClient, my_reviews: &[&crate::github::Revi
 }
 
 /// My earlier engine reviews that a new round makes outdated: every one not on
-/// the current head. Hidden after the new round is posted, so the timeline
-/// shows one live review instead of a stack of overviews.
+/// the current head, plus a failure notice an older build posted on this head
+/// (the real review now replaces it). Hidden after the new round is posted, so
+/// the timeline shows one live review instead of a stack of overviews.
 fn outdated_reviews<'a>(reviews: &[&'a crate::github::Review], head_sha: &str) -> Vec<&'a str> {
     reviews
         .iter()
-        .filter(|r| marker_of(&r.body) != Marker::None)
-        .filter(|r| r.commit_id.as_deref() != Some(head_sha))
+        .filter(|r| match marker_of(&r.body) {
+            Marker::None => false,
+            Marker::Failed => true,
+            Marker::Reviewed => r.commit_id.as_deref() != Some(head_sha),
+        })
         .filter(|r| !r.node_id.is_empty())
         .map(|r| r.node_id.as_str())
         .collect()
+}
+
+/// What to do after the model did not finish: which backoff key, how long,
+/// and what to tell the user. Pure so the policy is testable.
+#[derive(Debug, PartialEq)]
+struct FailureStep {
+    engine_wide: bool,
+    kind: &'static str,
+    delay_secs: u64,
+    /// Always tell the user (give-up, auth); otherwise only when the kind changes.
+    always_notify: bool,
+    message: String,
+}
+
+fn model_failure_step(failure: Option<&crate::review::EngineFailure>, prior_head_attempts: u32, now: DateTime<Utc>) -> FailureStep {
+    use crate::review::EngineFailure as F;
+    match failure {
+        Some(F::UsageLimit { reset_hint_secs }) => {
+            let delay = reset_hint_secs.unwrap_or(3600);
+            let until = (now + chrono::Duration::seconds(delay as i64)).with_timezone(&chrono::Local);
+            FailureStep { engine_wide: true, kind: "usage_limit", delay_secs: delay, always_notify: false,
+                message: format!("claude 사용 한도 도달 — {}까지 리뷰를 멈추고, 이후 자동으로 다시 시도합니다", until.format("%m/%d %H:%M")) }
+        }
+        Some(F::Auth) => FailureStep { engine_wide: true, kind: "auth", delay_secs: 900, always_notify: false,
+            message: "claude 로그인이 만료됐습니다 — 터미널에서 `claude login` 뒤 15분 안에 다시 시도합니다".into() },
+        other => {
+            let attempts = prior_head_attempts + 1;
+            if attempts >= HEAD_FAILURE_LIMIT {
+                FailureStep { engine_wide: false, kind: "engine_gave_up", delay_secs: 7 * 86_400, always_notify: true,
+                    message: format!("같은 커밋에서 리뷰 실행이 {attempts}회 실패해 다음 push 까지 멈춥니다") }
+            } else {
+                let what = match other { Some(F::Timeout) => "시간 초과", Some(F::Parse) => "출력 파싱 실패", _ => "실행 실패" };
+                FailureStep { engine_wide: false, kind: "engine", delay_secs: 900 * attempts as u64, always_notify: false,
+                    message: format!("리뷰 {what} ({attempts}/{HEAD_FAILURE_LIMIT}) — 15분 뒤 다시 시도합니다") }
+            }
+        }
+    }
 }
 
 /// Approve only when every condition holds. `blocking_issues` is checked here
@@ -492,6 +540,7 @@ pub async fn try_connect(app: &AppHandle, state: &Arc<AppState>) {
         Ok((user, rate)) => {
             *state.token.lock().await = Some(token);
             *state.current_user.lock().await = Some(user.login.clone());
+            let engine_paused_until = state.status.lock().await.engine_paused_until;
             let status = ConnectionStatus {
                 connected: true,
                 username: Some(user.login.clone()),
@@ -499,6 +548,7 @@ pub async fn try_connect(app: &AppHandle, state: &Arc<AppState>) {
                 rate_limit_total: rate.limit,
                 last_error: None,
                 checked_at: Utc::now(),
+                engine_paused_until,
             };
             *state.status.lock().await = status.clone();
             let _ = app.emit(STATUS_EVENT, &status);
@@ -775,7 +825,14 @@ async fn handle_pr(
         // This head already failed before reaching the model: wait for a new
         // commit instead of retrying (and logging) every poll.
         let retry_key = format!("{pr_key}@{head_sha}");
-        if !state.retries.lock().await.ready(&retry_key, Utc::now().timestamp()) { return; }
+        // Model failures live on their own key: the diff-fetch key is cleared
+        // on every successful fetch, so it cannot count model attempts.
+        let engine_head_key = format!("{retry_key}#engine");
+        {
+            let retries = state.retries.lock().await;
+            let now = Utc::now().timestamp();
+            if !retries.ready(&retry_key, now) || !retries.ready(&engine_head_key, now) || !retries.ready(ENGINE_KEY, now) { return; }
+        }
         let diff = match client.get_pr_diff(owner, repo, pr.number).await {
             Ok(d) => d,
             Err(e) => {
@@ -907,10 +964,49 @@ async fn handle_pr(
             "blocking_issues":outcome.blocking_issues, "summary": outcome.summary,
             "followups": outcome.followups, "rechecked": outcome.rechecked,
             "continued": outcome.continued, "explored": outcome.explored}));
+        if !outcome.finished_cleanly {
+            audit.error = Some(outcome.body.clone());
+        }
         audit.update(if outcome.finished_cleanly {"reviewed"} else {"model_failed"});
         state.record_review(&audit).await;
         (outcome, audit)
         };
+        // The engine did not finish: keep the error local, back off, say it
+        // once. Nothing is posted — a failure notice is not a review, and
+        // Weave scored the 38 posted on 10/26 as 61–75 point reviews.
+        if !outcome.finished_cleanly {
+            let now = Utc::now();
+            let prior = state.retries.lock().await.attempts(&engine_head_key);
+            let step = model_failure_step(outcome.failure.as_ref(), prior, now);
+            let key = if step.engine_wide { ENGINE_KEY.to_string() } else { engine_head_key.clone() };
+            let notify = state.retries.lock().await.failure(&key, now.timestamp(), Some(step.delay_secs), step.kind);
+            if step.kind == "usage_limit" {
+                set_engine_pause(app, state, Some(now + chrono::Duration::seconds(step.delay_secs as i64))).await;
+            }
+            if notify || step.always_notify {
+                push_and_emit(app, state, err_entry(repo_full, pr, format!("{} — {}", step.message, outcome.body.lines().next().unwrap_or("").chars().take(200).collect::<String>()))).await;
+            }
+            return;
+        }
+        if let Some(attempts) = state.retries.lock().await.success(ENGINE_KEY) {
+            set_engine_pause(app, state, None).await;
+            push_and_emit(app, state, ActivityEntry {
+                timestamp: Utc::now(), kind: ActivityKind::Info, repo: Some(repo_full.to_string()),
+                pr_number: None, pr_title: None, author: None, url: None,
+                message: format!("리뷰 엔진 복구 (실패 {attempts}회 묶음)"), detail: None,
+            }).await;
+        }
+        state.retries.lock().await.success(&engine_head_key);
+        // A later pass hit the limit: publish the first pass, pause the rest.
+        if let Some(crate::review::EngineFailure::UsageLimit { reset_hint_secs }) = &outcome.failure {
+            let now = Utc::now();
+            let delay = reset_hint_secs.unwrap_or(3600);
+            let notify = state.retries.lock().await.failure(ENGINE_KEY, now.timestamp(), Some(delay), "usage_limit");
+            set_engine_pause(app, state, Some(now + chrono::Duration::seconds(delay as i64))).await;
+            if notify {
+                push_and_emit(app, state, err_entry(repo_full, pr, model_failure_step(outcome.failure.as_ref(), 0, now).message)).await;
+            }
+        }
         {
             let mut pending = state.pending_reviews.lock().await;
             pending.insert(pending_key.clone(), crate::state::PendingReview {input_hash, outcome:outcome.clone(), audit:audit.clone()});
@@ -1085,8 +1181,8 @@ async fn handle_pr(
                     observe_publication(client, owner, repo, &mut audit).await;
                     state.record_review(&audit).await;
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
+                    hide_outdated(client, &my_reviews, head_sha).await;
                     if let Some(r) = &round {
-                        hide_outdated(client, &my_reviews, head_sha).await;
                         settle_threads(client, owner, repo, pr.number, r, &outcome.followups, head_sha).await;
                     }
                     if n > 0 {
@@ -1139,8 +1235,8 @@ async fn handle_pr(
                     observe_publication(client, owner, repo, &mut audit).await;
                     state.record_review(&audit).await;
                     let n = post_file_comments(client, owner, repo, pr, file_comments).await;
+                    hide_outdated(client, &my_reviews, head_sha).await;
                     if let Some(r) = &round {
-                        hide_outdated(client, &my_reviews, head_sha).await;
                         settle_threads(client, owner, repo, pr.number, r, &outcome.followups, head_sha).await;
                     }
                     if n > 0 {
@@ -1324,6 +1420,17 @@ async fn retry_error(app: &AppHandle, state: &Arc<AppState>, key: &str, repo: &s
     }
 }
 
+/// Show (or clear) the engine pause in the connection status the UI renders.
+async fn set_engine_pause(app: &AppHandle, state: &Arc<AppState>, until: Option<DateTime<Utc>>) {
+    let status = {
+        let mut s = state.status.lock().await;
+        if s.engine_paused_until == until { return; }
+        s.engine_paused_until = until;
+        s.clone()
+    };
+    let _ = app.emit(STATUS_EVENT, &status);
+}
+
 /// Build an `Error` activity entry for a PR (shared by the review/approve paths).
 fn err_entry(repo_full: &str, pr: &PullRequest, message: String) -> ActivityEntry {
     ActivityEntry {
@@ -1416,9 +1523,48 @@ mod tests {
     }
 
     #[test]
-    fn failed_run_on_head_is_not_reposted() {
+    fn failed_notice_on_head_is_reviewed_again() {
+        // The backoff state owns retry frequency now; a notice is not a review.
         let reviews = [("COMMENTED", Some(HEAD), F)];
-        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Skip);
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::Review);
+        // …and with an earlier finished review it becomes a follow-up round.
+        let reviews = [("COMMENTED", Some(OLD), R), ("COMMENTED", Some(HEAD), F)];
+        assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::FollowUp);
+    }
+
+    #[test]
+    fn outdated_reviews_include_a_failed_notice_on_head() {
+        let mk = |body: &str, sha: &str, node: &str| crate::github::Review {
+            id: 0, html_url: String::new(), user: crate::github::GhUser { login: "me".into() }, state: "COMMENTED".into(),
+            body: body.into(), commit_id: Some(sha.into()), submitted_at: None, node_id: node.into(),
+        };
+        let a = mk("<!-- approve-bot:review -->", OLD, "n-old");
+        let b = mk("<!-- approve-bot:review-failed -->", HEAD, "n-fail");
+        let c = mk("<!-- approve-bot:review -->", HEAD, "n-live");
+        let d = mk("👍", OLD, "n-human");
+        let ids = super::outdated_reviews(&[&a, &b, &c, &d], HEAD);
+        assert_eq!(ids, vec!["n-old", "n-fail"]);
+    }
+
+    #[test]
+    fn model_failure_step_pauses_engine_on_limit_and_gives_up_per_head() {
+        use crate::review::EngineFailure as F;
+        use chrono::TimeZone;
+        let now = chrono::Utc.with_ymd_and_hms(2026, 10, 26, 5, 0, 0).unwrap();
+        let limit = super::model_failure_step(Some(&F::UsageLimit { reset_hint_secs: Some(36_000) }), 0, now);
+        assert!(limit.engine_wide && limit.kind == "usage_limit" && limit.delay_secs == 36_000, "{limit:?}");
+        assert!(limit.message.contains("사용 한도"));
+        let unknown = super::model_failure_step(Some(&F::UsageLimit { reset_hint_secs: None }), 0, now);
+        assert_eq!(unknown.delay_secs, 3600, "no reset text → one hour");
+        let auth = super::model_failure_step(Some(&F::Auth), 0, now);
+        assert!(auth.engine_wide && auth.kind == "auth" && auth.message.contains("claude login"));
+        let first = super::model_failure_step(Some(&F::Timeout), 0, now);
+        assert!(!first.engine_wide && first.kind == "engine" && first.delay_secs == 900 && !first.always_notify);
+        assert!(first.message.contains("1/3"));
+        let last = super::model_failure_step(Some(&F::Parse), 2, now);
+        assert!(last.kind == "engine_gave_up" && last.always_notify && last.delay_secs >= 86_400, "{last:?}");
+        let none = super::model_failure_step(None, 0, now);
+        assert_eq!(none.kind, "engine");
     }
 
     #[test]

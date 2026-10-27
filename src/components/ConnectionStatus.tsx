@@ -151,6 +151,10 @@ export function ConnectionStatus() {
   }
 
   const ok = status?.connected ?? false;
+  const pausedUntil =
+    status?.engine_paused_until && new Date(status.engine_paused_until) > new Date()
+      ? new Date(status.engine_paused_until)
+      : null;
   const rate =
     status?.rate_limit_remaining != null && status?.rate_limit_total != null
       ? `${status.rate_limit_remaining}/${status.rate_limit_total}`
@@ -187,6 +191,12 @@ export function ConnectionStatus() {
           {checking ? "Checking…" : "Check now"}
         </button>
       </div>
+
+      {pausedUntil && (
+        <div className="row muted" style={{ gap: 8 }}>
+          ⏸ 리뷰 엔진 일시 중지 — claude 사용 한도. {pausedUntil.toLocaleString()} 이후 자동 재시도
+        </div>
+      )}
 
       {signingIn && (
         <div

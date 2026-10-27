@@ -193,6 +193,31 @@ pub struct ReviewOutcome {
     pub summary: ReviewSummary,
     /// True when the authorization/contract second pass ran and finished.
     pub rechecked: bool,
+    /// Why the engine did not finish (or why a later pass did not), so the
+    /// poller can back off instead of posting the error text as a review.
+    pub failure: Option<EngineFailure>,
+}
+
+/// Coarse class of an engine error. `UsageLimit` pauses the whole engine until
+/// the window resets; `Auth` needs a human; the rest retry per head.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EngineFailure {
+    UsageLimit { reset_hint_secs: Option<u64> },
+    Auth,
+    Timeout,
+    Parse,
+    Other,
+}
+
+/// Read the class and, for a usage limit, the reset time out of the error text.
+pub fn classify_failure(text: &str) -> EngineFailure {
+    match crate::audit::failure_kind(text) {
+        "usage_limit" => EngineFailure::UsageLimit { reset_hint_secs: crate::retry::usage_limit_reset_secs(text, chrono::Utc::now()) },
+        "auth" => EngineFailure::Auth,
+        "timeout" => EngineFailure::Timeout,
+        "parse" => EngineFailure::Parse,
+        _ => EngineFailure::Other,
+    }
 }
 
 /// What the model says the PR does and how it judged it, as short phrases.
@@ -215,8 +240,10 @@ impl ReviewSummary {
 
 impl ReviewOutcome {
     fn fail_closed(reason: impl Into<String>) -> Self {
+        let body: String = reason.into();
         Self {
-            body: reason.into(),
+            failure: Some(classify_failure(&body)),
+            body,
             verdict: "comment".into(),
             score: 0.0,
             blocking_issues: vec!["리뷰가 정상 완료되지 않아 자동승인 불가 — 사람 리뷰 필요".into()],
@@ -445,6 +472,11 @@ fn merge_file_comments(first: &mut ReviewOutcome, extra: Vec<FileComment>) {
 }
 
 fn merge_second_pass(first: &mut ReviewOutcome, second: ReviewOutcome) {
+    // A limit or auth failure in the second pass still has to pause the engine,
+    // even though the first pass's review is published as it is.
+    if !second.finished_cleanly && first.failure.is_none() {
+        first.failure = second.failure.clone();
+    }
     first.cost_usd = match (first.cost_usd, second.cost_usd) {
         (Some(a), Some(b)) => Some(a + b),
         _ => None, // A partial subtotal is not a known total for all performed passes.
@@ -1451,6 +1483,7 @@ fn run_claude(
                 followups: v.followups,
                 summary: v.summary,
                 rechecked: false,
+                failure: None,
             }
         }
         Err(e) => ReviewOutcome::fail_closed(format!("판정 파싱 실패: {e}")),
@@ -1609,6 +1642,9 @@ const CONTINUATION_NOTE: &str = "=== 추가 리뷰 ===\n앞선 리뷰가 diff �
 /// into the first review. Unlike the authorization re-check, this is a full
 /// review of other files, so its verdict and score count toward the gate.
 fn merge_continuation(first: &mut ReviewOutcome, extra: ReviewOutcome, round: usize) {
+    if !extra.finished_cleanly && first.failure.is_none() {
+        first.failure = extra.failure.clone();
+    }
     first.cost_usd = match (first.cost_usd, extra.cost_usd) {
         (Some(a), Some(b)) => Some(a + b),
         _ => None, // A partial subtotal is not a known total for all performed passes.
@@ -2006,6 +2042,7 @@ mod tests {
             followups: vec![],
             summary: ReviewSummary::default(),
             rechecked: false,
+            failure: None,
         }
     }
 
@@ -2111,6 +2148,25 @@ mod tests {
     fn recheck_section_ignores_headings_inside_code_fences() {
         let body = "# 재점검\n\n- ✅ a\n```md\n# 총평\n```\n- ❌ b\n\n# 총평\n\n버림";
         assert_eq!(recheck_section(body), "- ✅ a\n```md\n# 총평\n```\n- ❌ b");
+    }
+
+    #[test]
+    fn engine_error_text_is_classified() {
+        let limit = ReviewOutcome::fail_closed("claude 엔진 오류: You've hit your weekly limit · resets 12am (Asia/Seoul)");
+        assert!(matches!(limit.failure, Some(EngineFailure::UsageLimit { reset_hint_secs: Some(_) })), "{:?}", limit.failure);
+        assert!(!limit.finished_cleanly);
+        assert_eq!(ReviewOutcome::fail_closed("claude 엔진 오류: OAuth session expired").failure, Some(EngineFailure::Auth));
+        assert_eq!(ReviewOutcome::fail_closed("claude 실행 실패: Request timed out").failure, Some(EngineFailure::Timeout));
+        assert_eq!(ReviewOutcome::fail_closed("claude 출력 파싱 실패: EOF").failure, Some(EngineFailure::Parse));
+        assert_eq!(ReviewOutcome::fail_closed("boom").failure, Some(EngineFailure::Other));
+        // A clean first pass keeps its review but carries the later pass's failure.
+        let mut first = outcome(vec![], vec![]);
+        merge_second_pass(&mut first, ReviewOutcome::fail_closed("claude 엔진 오류: You've hit your weekly limit"));
+        assert!(first.finished_cleanly);
+        assert!(matches!(first.failure, Some(EngineFailure::UsageLimit { .. })));
+        let mut first = outcome(vec![], vec![]);
+        merge_continuation(&mut first, ReviewOutcome::fail_closed("claude 엔진 오류: OAuth session expired"), 1);
+        assert_eq!(first.failure, Some(EngineFailure::Auth));
     }
 
     #[test]
