@@ -158,20 +158,50 @@ fn cell(s: &str) -> String {
     crate::review::neutralize_suggestion_fences(s).trim().replace('\n', " ").replace('|', "\\|")
 }
 
+/// The verdict as a GitHub alert box so the conclusion is the first thing
+/// the eye lands on: green for an approval, purple when a human has to
+/// decide, yellow for a hold, red for a blocker (which `outcome_line`
+/// already wraps). The model's one-line judgement sits under the verdict.
+pub fn verdict_callout(verdict_line: &str, judgement: &str) -> String {
+    let verdict = verdict_line.trim();
+    if verdict.is_empty() {
+        return String::new();
+    }
+    let judgement = cell(judgement);
+    let mut out = if verdict.starts_with("> [!") {
+        verdict.to_string()
+    } else {
+        let kind = if verdict.starts_with('✅') {
+            "TIP"
+        } else if verdict.starts_with("👤") {
+            "IMPORTANT"
+        } else if verdict.starts_with('⏸') {
+            "WARNING"
+        } else {
+            "NOTE"
+        };
+        format!("> [!{kind}]\n> {verdict}")
+    };
+    if !judgement.is_empty() {
+        out.push_str(&format!("\n>\n> {judgement}"));
+    }
+    out
+}
+
 /// The report table at the top of a first review.
 ///
 /// ```text
 /// | 리뷰 요약 | |
 /// |---|---|
 /// | **변경** | 서버 스펙에 맞춤<br>배경색 추천 기준 변경 |
-/// | **판단** | 결함 없음. … |
 /// | **머지 전 확인** | 새 테스트 실행 |
 /// | **리뷰 범위** | 파일 26개 (+522 −217) · 코드 직접 열람 · 2차 재점검 포함 |
 /// ```
 ///
-/// The model fills the first three as short phrases (`summary`); the scope
-/// row is code. Rows with nothing to say are left out. Empty when the model
-/// gave no summary, so the caller keeps the prose overview instead.
+/// The model fills the first two as short phrases (`summary`); its judgement
+/// is shown in the verdict callout above, not here. The scope row is code.
+/// Rows with nothing to say are left out. Empty when the model gave no
+/// summary, so the caller keeps the prose overview instead.
 pub fn report_table(summary: &crate::review::ReviewSummary, scope: &Scope) -> String {
     if summary.is_empty() {
         return String::new();
@@ -181,7 +211,6 @@ pub fn report_table(summary: &crate::review::ReviewSummary, scope: &Scope) -> St
     };
     let mut rows: Vec<(&str, String)> = vec![
         ("변경", list(&summary.changes)),
-        ("판단", cell(&summary.judgement)),
         ("머지 전 확인", list(&summary.checks)),
     ];
     let mut covered = vec![format!("파일 {}개 (+{} −{})", scope.files, scope.added, scope.deleted)];
@@ -302,6 +331,12 @@ fn collapse_blank(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// A note right under a plain verdict line sits on the next line; under an
+/// alert box it needs a blank line, or GitHub pulls it into the box.
+fn notes_gap(so_far: &str) -> &'static str {
+    if so_far.starts_with("> [!") { "\n\n" } else { "\n" }
+}
+
 /// The first review's body as posted.
 ///
 /// ```text
@@ -368,7 +403,7 @@ pub fn compose_quiet_body(
     }
     let mut out = verdict_line.trim().to_string();
     if !notes.trim().is_empty() {
-        out.push_str(&format!("\n{}", notes.trim()));
+        out.push_str(&format!("{}{}", notes_gap(&out), notes.trim()));
     }
     if !report.trim().is_empty() {
         out.push_str(&format!("\n\n{}", report.trim()));
@@ -490,7 +525,7 @@ pub fn compose_body_with(
 
     let mut out = verdict_line.trim().to_string();
     if !notes.trim().is_empty() {
-        out.push_str(&format!("\n{}", notes.trim()));
+        out.push_str(&format!("{}{}", notes_gap(&out), notes.trim()));
     }
     // The report table replaces the prose overview; a diagram the model drew
     // there (mermaid) is kept under it.
@@ -826,6 +861,27 @@ mod tests {
     }
 
     #[test]
+    fn verdict_callout_colors_by_gate_and_carries_the_judgement() {
+        let ok = verdict_callout("✅ **승인** · minor 2", "결함 없음. 우회 주소 `a|b` 도 막음");
+        assert_eq!(ok, "> [!TIP]\n> ✅ **승인** · minor 2\n>\n> 결함 없음. 우회 주소 `a\\|b` 도 막음");
+        assert!(verdict_callout("👤 **사람 승인 필요** — 민감 파일", "").starts_with("> [!IMPORTANT]\n> 👤"));
+        assert!(verdict_callout("⏸ **승인 보류** — 점수", "x").starts_with("> [!WARNING]\n> ⏸"));
+        // A blocker is already a CAUTION box; only the judgement is added.
+        let caution = verdict_callout("> [!CAUTION]\n> **머지 전에 고쳐야 할 지적이 있습니다** · blocker 1", "저장이 깨짐");
+        assert_eq!(caution, "> [!CAUTION]\n> **머지 전에 고쳐야 할 지적이 있습니다** · blocker 1\n>\n> 저장이 깨짐");
+        assert_eq!(caution.matches("[!").count(), 1);
+        assert_eq!(verdict_callout("", "x"), "");
+        // Notes after a callout get a blank line so they stay out of the box.
+        let out = compose_body("본문", &ok, "> ⚠️ **게이트**: 큰 PR", "", &[]);
+        assert!(out.starts_with(&format!("{ok}\n\n> ⚠️ **게이트**: 큰 PR\n\n본문")), "{out}");
+        let plain = compose_body("본문", "✅ **승인**", "> ⚠️ 메모", "", &[]);
+        assert!(plain.starts_with("✅ **승인**\n> ⚠️ 메모"), "{plain}");
+        // The table no longer repeats the judgement.
+        let t = report_table(&summary(), &Scope::default());
+        assert!(!t.contains("판단"), "{t}");
+    }
+
+    #[test]
     fn report_table_has_fixed_rows_and_code_filled_scope() {
         let scope = Scope { files: 26, added: 522, deleted: 217, explored: true, rechecked: true, ..Default::default() };
         let t = report_table(&summary(), &scope);
@@ -833,7 +889,6 @@ mod tests {
             t,
             "| 리뷰 요약 | |\n|---|---|\n\
              | **변경** | 브랜드 DA 광고 제출을 서버 스펙에 맞춤<br>배경색 추천 기준 변경 |\n\
-             | **판단** | 결함 없음. 우회 주소 `a\\|b` 도 막음 |\n\
              | **리뷰 범위** | 파일 26개 (+522 −217) · 코드 직접 열람 · 2차 재점검 포함 |"
         );
         let thin = Scope { files: 1, added: 2, deleted: 0, omitted: 3, ..Default::default() };
