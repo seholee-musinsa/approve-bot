@@ -93,6 +93,8 @@ export interface PassState {
   pr_number: number | null;
   pr_title: string | null;
   stage: string | null;
+  /** The one repository a "Check now" asked for; null = every repository. */
+  scope: string | null;
   /** 0..1 share of the pass that is done. */
   fraction: number;
 }

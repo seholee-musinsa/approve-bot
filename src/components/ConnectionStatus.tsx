@@ -7,6 +7,10 @@ export function ConnectionStatus() {
   const [status, setStatus] = useState<Status | null>(null);
   // Live position of the running pass: repository n/N, PR, stage.
   const [pass, setPass] = useState<PassState | null>(null);
+  // "Check now" scope: "" = every repository, else one `owner/repo`.
+  const [scope, setScope] = useState("");
+  const [repos, setRepos] = useState<string[]>([]);
+  const loadRepos = () => api.getConfig().then((c) => setRepos(c.repositories)).catch(() => {});
   const [busy, setBusy] = useState(false);
   const [checking, setChecking] = useState(false);
   const [signingIn, setSigningIn] = useState(false);
@@ -48,6 +52,7 @@ export function ConnectionStatus() {
   useEffect(() => {
     api.getConnectionStatus().then(setStatus).catch(() => {});
     api.getPassState().then(setPass).catch(() => {});
+    loadRepos();
     const offStatus = onStatusChanged((s) => {
       setStatus(s);
       // A pass emits its own status snapshot on the way out, so let PASS_EVENT
@@ -105,7 +110,7 @@ export function ConnectionStatus() {
     setChecking(true);
     let ack: CheckNowAck;
     try {
-      ack = await api.forceCheckNow();
+      ack = await api.forceCheckNow(scope || undefined);
     } catch {
       stopChecking();
       showToast("Check failed", "error");
@@ -202,8 +207,22 @@ export function ConnectionStatus() {
             Sign in with GitHub
           </button>
         )}
-        <button onClick={checkNow} disabled={checking || busy}>
-          {checking ? "Checking…" : pass?.running ? "자동 검사 중 · 한 번 더" : "Check now"}
+        <select
+          value={scope}
+          onChange={(e) => setScope(e.target.value)}
+          onFocus={loadRepos}
+          disabled={checking || busy || pass?.running}
+          title="Check now 대상"
+        >
+          <option value="">전체</option>
+          {repos.map((r) => (
+            <option key={r} value={r}>
+              {r}
+            </option>
+          ))}
+        </select>
+        <button onClick={checkNow} disabled={checking || busy || pass?.running}>
+          {checking ? "Checking…" : pass?.running ? "검사 중…" : "Check now"}
         </button>
       </div>
 
@@ -213,7 +232,7 @@ export function ConnectionStatus() {
             <div className="progress-bar" style={{ width: `${Math.round((pass.fraction ?? 0) * 100)}%` }} />
           </div>
           <div className="muted" style={{ fontSize: 12 }}>
-            {pass.repo_total > 0 ? `저장소 ${pass.repo_index}/${pass.repo_total}` : "검사 준비 중"}
+            {pass.scope ? `${pass.scope} 만` : pass.repo_total > 0 ? `저장소 ${pass.repo_index}/${pass.repo_total}` : "검사 준비 중"}
             {pass.repo && ` · ${pass.repo}`}
             {pass.pr_number != null &&
               ` · PR #${pass.pr_number}${pass.pr_total ? ` (${pass.pr_index}/${pass.pr_total})` : ""}`}

@@ -29,8 +29,19 @@ pub struct PassState {
     pub pr_title: Option<String>,
     /// What is happening right now: `PR 목록 조회`, `확인`, `리뷰 중`, `게시`.
     pub stage: Option<String>,
+    /// `Some(repo)` when a "Check now" asked for one repository only.
+    pub scope: Option<String>,
     /// 0..=1 share of the pass that is done, for the progress bar.
     pub fraction: f64,
+}
+
+/// Repositories a pass covers: all of them, or just the one a "Check now"
+/// named (if it is configured — a stale name runs nothing rather than all).
+fn pass_targets(repositories: &[String], only: Option<&str>) -> Vec<String> {
+    match only {
+        None => repositories.to_vec(),
+        Some(one) => repositories.iter().filter(|r| r.eq_ignore_ascii_case(one)).cloned().collect(),
+    }
 }
 
 /// Share of the pass done: finished repositories count whole, the current one
@@ -788,9 +799,14 @@ async fn run_one_pass(app: &AppHandle, state: &Arc<AppState>) {
 
     let mut latest_rate: Option<(Option<u64>, Option<u64>)> = None;
 
-    let repo_total = cfg.repositories.len();
-    for (repo_i, repo_full) in cfg.repositories.iter().enumerate() {
+    // A "Check now" for one repository narrows this pass; the automatic pass
+    // and a plain "Check now" cover every configured repository.
+    let scope = state.check_scope.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let targets = pass_targets(&cfg.repositories, scope.as_deref());
+    let repo_total = targets.len();
+    for (repo_i, repo_full) in targets.iter().enumerate() {
         progress(app, state, |p| {
+            p.scope = scope.clone();
             p.repo_index = repo_i + 1;
             p.repo_total = repo_total;
             p.repo = Some(repo_full.clone());
@@ -1785,6 +1801,14 @@ mod tests {
         // …and with an earlier finished review it becomes a follow-up round.
         let reviews = [("COMMENTED", Some(OLD), R), ("COMMENTED", Some(HEAD), F)];
         assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::FollowUp);
+    }
+
+    #[test]
+    fn check_now_scope_narrows_the_pass_to_one_configured_repository() {
+        let repos: Vec<String> = ["musinsa/a", "musinsa/b"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(super::pass_targets(&repos, None), repos);
+        assert_eq!(super::pass_targets(&repos, Some("musinsa/B")), vec!["musinsa/b".to_string()]);
+        assert!(super::pass_targets(&repos, Some("musinsa/gone")).is_empty(), "a repository no longer configured is not reviewed");
     }
 
     #[test]
