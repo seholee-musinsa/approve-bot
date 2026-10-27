@@ -52,11 +52,11 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 
 # 검증 근거
 - ✅/⚠️/❌ {확인한 질문} — {방법: 열어 본 파일:라인, grep 패턴, 대조한 코드} → {결과}
-(3~6개, 비자명한 것만)
+(3~6개, 비자명한 것만. 지적이 하나도 없는 PR 이면 2~4개. 타입 통과·import 존재 같은 자명한 확인은 쓰지 않는다)
 
 # 미확인
-- {못 본 것} — {이유와 확인 방법}
-(지적으로 낸 것은 다시 쓰지 않는다. 없으면 생략)
+- {리뷰어가 볼 수 없었던 것} — {이유: 도구 제한, 생략 파일, 다른 레포·BE, 런타임}
+(지적으로 낸 것은 다시 쓰지 않는다. 작성자에게 묻는 말("확인 부탁드려요", "~인가요?")은 여기 쓰지 않고 question finding 으로 낸다. 없으면 생략)
 
 # 산입하지 않은 것
 - {diff 밖 동종 결함, 이 PR 탓이 아닌 것, 다른 리뷰어가 이미 짚은 것} — 이유
@@ -65,7 +65,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 2) 출력의 맨 마지막에 아래 펜스로 **판정 + 지적 목록**만 내보낸다. 마크다운 본문은 이 JSON 안에 넣지 않는다:
 ```json
 {"verdict":"approve|comment|request_changes","score":<0-5>,"blocking_issues":["suspicious-instruction 같은 엔진 규칙 위반만"],
- "summary":{"changes":["<이 PR 이 바꾼 것, 짧은 구절 2~4개>"],"judgement":"<판단 한두 구절: 결함이 있는지와 가장 중요한 근거>","checks":["<머지 전에 사람이 확인할 것, 짧은 구절. 없으면 []>"]},
+ "summary":{"changes":["<이 PR 이 바꾼 것, 짧은 구절 2~4개>"],"judgement":"<판단 한두 구절: 결함이 있는지와 가장 중요한 근거>","checks":["<사람이 머지 전에 직접 해 볼 일(배포 순서, 수동 QA 시나리오), 짧은 구절. 작성자에게 묻는 말은 question finding 으로. 없으면 []>"]},
  "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
    "symbol":"<함수·컴포넌트 이름>",
    "impact":{"consequence":"<사용자·데이터·운영 영향>","reachability":"<도달 가능한 입력·상태>","evidence":"<영향을 확인한 코드 위치>"},
@@ -96,6 +96,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 지적 규칙:
 - 지적은 findings 에만 쓴다. 본문에 지적 목록(# 발견, # 질문)을 쓰지 않는다. 질문은 severity "question" 으로 넣는다.
 - 질문도 line 이 있으면 그 줄에 스레드로 달린다. 작성자가 답할 수 있게 무엇을 확인하고 싶은지 분명히 쓴다.
+- 작성자가 답할 수 있는 확인 요청은 `# 미확인` 이나 summary.checks 가 아니라 severity "question" finding 으로 낸다. 관련 diff 줄이 있으면 line 을 넣는다. 스레드로 달려야 작성자가 답하고 닫을 수 있다.
 - 같은 우려를 findings 와 `# 미확인` 에 함께 쓰지 않는다. 줄을 짚을 수 있으면 findings, 짚을 수 없으면 `# 미확인` 에 쓴다.
 - blocker 는 findings 의 severity 로만 표시하고, blocking_issues 에 다시 쓰지 않는다.
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 코드가 본문 목록에 적는다.
@@ -1871,6 +1872,15 @@ mod tests {
             assert!(h.starts_with("fnv1a64:") && h.len() == 8 + 16, "{h}");
         }
         assert!(!KNOWN_OLD_GUIDE_HASHES.contains(&crate::audit::fingerprint(DEFAULT_GUIDE).as_str()), "the current bundle is not an old copy");
+    }
+
+    #[test]
+    fn prompt_sends_author_asks_to_question_findings() {
+        let p = build_prompt("guide", "meta", "diff", false);
+        assert!(p.contains("작성자에게 묻는 말(\"확인 부탁드려요\", \"~인가요?\")은 여기 쓰지 않고 question finding 으로 낸다"), "{p}");
+        assert!(p.contains("작성자가 답할 수 있는 확인 요청은 `# 미확인` 이나 summary.checks 가 아니라 severity \"question\" finding 으로 낸다"));
+        assert!(p.contains("지적이 하나도 없는 PR 이면 2~4개"));
+        assert!(p.contains("사람이 머지 전에 직접 해 볼 일"));
     }
 
     #[test]

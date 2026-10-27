@@ -494,6 +494,9 @@ pub struct MetricBucket {
     pub bodies_with_duplicate_evidence: usize,
     /// Model bodies that still wrote a `# 이전 지적 처리` or `# 총평` heading.
     pub bodies_with_legacy_headings: usize,
+    /// `# 미확인` bullets or summary `checks` that ask the author something
+    /// (should have been a question finding).
+    pub author_asks_outside_threads: usize,
     pub body_chars_median: Option<u64>,
     /// Length of the body as posted (gate line, table, folds); only for
     /// records written after the field existed.
@@ -599,6 +602,10 @@ impl MetricBucket {
                 if heading_count(body, "# 이전 지적 처리") > 0 || heading_count(body, "# 총평") > 0 {
                     self.bodies_with_legacy_headings += 1;
                 }
+                self.author_asks_outside_threads += unconfirmed_bullets(body).filter(|l| crate::layout::is_author_ask(l)).count();
+            }
+            if let Some(checks) = r.result.as_ref().and_then(|v| v.get("summary")).and_then(|s| s.get("checks")).and_then(|c| c.as_array()) {
+                self.author_asks_outside_threads += checks.iter().filter_map(|c| c.as_str()).filter(|c| crate::layout::is_author_ask(c)).count();
             }
             if let Some(n) = r.result.as_ref().and_then(|v| v.get("posted_len")).and_then(|n| n.as_u64()) {
                 self.posted_chars.push(n);
@@ -621,6 +628,18 @@ impl MetricBucket {
         self.posted_details_median = median(&mut self.posted_details);
         self.elapsed_ms_median = median(&mut self.elapsed);
     }
+}
+
+/// Bullets of the model's `# 미확인` section.
+fn unconfirmed_bullets(body: &str) -> impl Iterator<Item = &str> {
+    let mut inside = false;
+    body.lines().filter(move |l| {
+        if l.starts_with("# ") {
+            inside = l[2..].trim().starts_with("미확인");
+            return false;
+        }
+        inside && l.starts_with("- ")
+    })
 }
 
 fn body_of(r: &Record) -> &str {
@@ -677,7 +696,7 @@ fn opt(n: Option<u64>) -> String {
 /// published reviews (or approvals, for the approval columns).
 pub fn metrics_markdown(m: &Metrics) -> String {
     let mut out = format!(
-        "리뷰 지표 {}~{} ({})\n\n| 구간 | 게시 | 승인 | 지적 0건 승인 | 확신 major 승인 | 실패 게시 | 모델 실패 | 지적 | question | 검증근거 중복 | 옛 제목 | 본문 중앙값 | 게시 본문 중앙값 | 비용 $ |\n|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n",
+        "리뷰 지표 {}~{} ({})\n\n| 구간 | 게시 | 승인 | 지적 0건 승인 | 확신 major 승인 | 실패 게시 | 모델 실패 | 지적 | question | 본문 밖 질문 | 검증근거 중복 | 옛 제목 | 본문 중앙값 | 게시 본문 중앙값 | 비용 $ |\n|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n",
         m.from, m.to, m.timezone
     );
     let row = |name: &str, b: &MetricBucket| {
@@ -688,7 +707,7 @@ pub fn metrics_markdown(m: &Metrics) -> String {
             format!("{failed} ({})", b.failures_by_kind.iter().map(|(k, v)| format!("{k} {v}")).collect::<Vec<_>>().join(", "))
         };
         format!(
-            "| {name} | {} | {} | {} ({}) | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {:.2} |\n",
+            "| {name} | {} | {} | {} ({}) | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {:.2} |\n",
             b.published,
             b.approved,
             b.approved_without_findings,
@@ -699,6 +718,7 @@ pub fn metrics_markdown(m: &Metrics) -> String {
             b.findings,
             b.findings_by_severity.get("question").copied().unwrap_or(0),
             pct(b.findings_by_severity.get("question").copied().unwrap_or(0), b.findings),
+            b.author_asks_outside_threads,
             b.bodies_with_duplicate_evidence,
             b.bodies_with_legacy_headings,
             opt(b.body_chars_median),
@@ -970,7 +990,7 @@ mod tests {
         append(&p, &published("a", "2026-10-20T01:00:00Z", "approved", serde_json::json!({"body":"# 검증 근거\n- ✅ x","findings":[]}))).unwrap();
         append(&p, &published("b", "2026-10-20T02:00:00Z", "approved", serde_json::json!({"body":"# 검증 근거\n- ✅ x\n# 추가 리뷰 (1) — 앞선 리뷰가 보지 못한 파일\n# 검증 근거\n- ✅ y",
             "findings":[{"severity":"major","confidence":85.0},{"severity":"question","confidence":60.0}],"posted_len":1200,"posted_details":3}))).unwrap();
-        append(&p, &published("c", "2026-10-20T03:00:00Z", "commented", serde_json::json!({"body":"# 총평\n좋음\n# 이전 지적 처리 — 해소 0 · 부분 0 · 미해소 0 · 철회 0\n# 검증 근거\n- ✅","findings":[{"severity":"minor","confidence":90.0}]}))).unwrap();
+        append(&p, &published("c", "2026-10-20T03:00:00Z", "commented", serde_json::json!({"body":"# 총평\n좋음\n# 이전 지적 처리 — 해소 0 · 부분 0 · 미해소 0 · 철회 0\n# 검증 근거\n- ✅\n# 미확인\n- BE 는 못 봄\n- 키를 만들었는지 확인 부탁드려요","findings":[{"severity":"minor","confidence":90.0}],"summary":{"checks":["dev 배포 순서 확인","의도한 동작인가요?"]}}))).unwrap();
         let mut fail = published("d", "2026-10-20T04:00:00Z", "failure_notice", serde_json::json!({"body":"claude 엔진 오류: You've hit your weekly limit · resets 12am (Asia/Seoul)"}));
         fail.model = "claude-sonnet-5-5".into();
         append(&p, &fail).unwrap();
@@ -1007,7 +1027,8 @@ mod tests {
         assert_eq!(m.models["claude-sonnet-5-5"].failure_notices_posted, 1);
         assert_eq!(m.models["claude-opus-5-5"].published, 3);
         let md = metrics_markdown(&m);
-        assert!(md.contains("| 전체 | 3 | 2 | 1 (50%) | 1 | 1 | 2 (auth 1, usage_limit 1) | 3 | 1 (33%) | 1 | 1 |"), "{md}");
+        assert!(md.contains("| 전체 | 3 | 2 | 1 (50%) | 1 | 1 | 2 (auth 1, usage_limit 1) | 3 | 1 (33%) | 2 | 1 | 1 |"), "{md}");
+        assert_eq!(t.author_asks_outside_threads, 2);
         let json = serde_json::to_value(&m).unwrap();
         assert!(json["total"].get("body_chars").is_none(), "scratch vectors are not serialized");
         std::fs::remove_dir_all(p).unwrap();

@@ -322,6 +322,98 @@ pub fn compose_body(
     compose_body_with(model_body, verdict_line, notes, report, unposted, true)
 }
 
+/// Phrases that mean the model is asking the author something. Such a bullet
+/// must stay in sight even in a quiet approval; the prompt asks for it to be
+/// a question finding instead, and `review-metrics` counts the leftovers.
+pub const AUTHOR_ASK_MARKS: &[&str] = &["부탁", "주세요", "인가요", "일까요", "?"];
+
+pub fn is_author_ask(line: &str) -> bool {
+    AUTHOR_ASK_MARKS.iter().any(|m| line.contains(m))
+}
+
+/// An approval with no finding, as posted: the gate line and the report
+/// table stay; everything the model wrote to show its work goes into one
+/// `검토 기록` fold. `# 미확인` stays open only when a bullet asks the
+/// author something. 56% of runs were such approvals, each a 2,400-char
+/// page nobody had to read.
+pub fn compose_quiet_body(
+    model_body: &str,
+    verdict_line: &str,
+    notes: &str,
+    report: &str,
+) -> String {
+    let flat = compose_body_with(model_body, "", "", "", &[], false);
+    // Split the flat body into the overview (before the first `###`) and sections.
+    let mut overview: Vec<&str> = Vec::new();
+    let mut sections: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut in_fence = false;
+    for line in flat.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.starts_with("### ") {
+            sections.push((line[4..].trim().to_string(), Vec::new()));
+            continue;
+        }
+        match sections.last_mut() {
+            Some((_, lines)) => lines.push(line),
+            None => overview.push(line),
+        }
+    }
+    let mut out = verdict_line.trim().to_string();
+    if !notes.trim().is_empty() {
+        out.push_str(&format!("\n{}", notes.trim()));
+    }
+    if !report.trim().is_empty() {
+        out.push_str(&format!("\n\n{}", report.trim()));
+    }
+    let overview = overview.join("\n");
+    let overview = if report.trim().is_empty() { overview.trim().to_string() } else { fenced_only(&overview.lines().map(str::to_string).collect::<Vec<_>>()) };
+    if !overview.is_empty() {
+        out.push_str(&format!("\n\n{overview}"));
+    }
+    let mut open: Vec<String> = Vec::new();
+    let mut folded: Vec<String> = Vec::new();
+    let mut bullets = 0;
+    let mut warn = 0;
+    let mut fail = 0;
+    for (title, lines) in &sections {
+        let text = collapse_blank(lines.join("\n").trim());
+        if text.is_empty() {
+            continue;
+        }
+        let asks = title.starts_with("미확인") && lines.iter().any(|l| l.starts_with("- ") && is_author_ask(l));
+        if asks {
+            open.push(format!("### {title}\n\n{text}"));
+        } else {
+            for l in lines.iter().filter(|l| l.starts_with("- ")) {
+                bullets += 1;
+                if l.contains('⚠') {
+                    warn += 1;
+                }
+                if l.contains('❌') {
+                    fail += 1;
+                }
+            }
+            folded.push(format!("### {title}\n\n{text}"));
+        }
+    }
+    for section in open {
+        out.push_str(&format!("\n\n{section}"));
+    }
+    if !folded.is_empty() {
+        let mut summary = if bullets > 0 { format!("검토 기록 {bullets}건") } else { "검토 기록".to_string() };
+        if warn > 0 {
+            summary.push_str(&format!(" · ⚠️ {warn}"));
+        }
+        if fail > 0 {
+            summary.push_str(&format!(" · ❌ {fail}"));
+        }
+        out.push_str(&format!("\n\n<details>\n<summary>{summary}</summary>\n\n{}\n\n</details>", folded.join("\n\n")));
+    }
+    crate::review::neutralize_suggestion_fences(out.trim())
+}
+
 /// `compose_body` with a choice of folding. A re-review folds the whole first
 /// review under one `전체 리뷰 보기`, so inside it the audit sections stay flat
 /// (`###`) — a `<details>` inside a `<details>` reads as a broken page.
@@ -613,6 +705,35 @@ mod tests {
         let out = compose_body_with(body, "", "", "", &[], false);
         assert!(!out.contains("<details>"), "{out}");
         assert!(out.starts_with("### 검증 근거\n\n- ✅ 확인\n\n### 산입하지 않은 것"), "{out}");
+    }
+
+    #[test]
+    fn quiet_approval_folds_the_audit_sections_into_one() {
+        let body = "# 흐름\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n# 검증 근거\n\n- ✅ 첫째\n- ⚠️ 둘째\n\n# 미확인\n\n- BE 응답은 이 레포에서 볼 수 없음\n\n# 산입하지 않은 것\n\n- 남의 것\n\n# 권한·계약 재점검\n\n- ✅ 셋째\n";
+        let table = report_table(&summary(), &Scope { files: 2, added: 3, deleted: 1, explored: true, ..Default::default() });
+        let out = compose_quiet_body(body, "✅ **승인** · 지적 없음", "", &table);
+        assert!(out.starts_with("✅ **승인** · 지적 없음\n\n| 리뷰 요약 | |"), "{out}");
+        assert!(out.contains("```mermaid"), "a diagram stays visible: {out}");
+        assert_eq!(out.matches("<details>").count(), 1, "{out}");
+        assert!(out.contains("<summary>검토 기록 5건 · ⚠️ 1</summary>"), "{out}");
+        let fold = out.split("<details>").nth(1).unwrap();
+        assert!(fold.contains("### 검증 근거") && fold.contains("### 미확인") && fold.contains("### 산입하지 않은 것") && fold.contains("### 권한·계약 재점검"), "{out}");
+        assert!(!out.contains("<details>\n<summary>검증 근거"), "no per-section folds: {out}");
+        let visible = out.split("<details>").next().unwrap();
+        assert!(visible.len() < 400, "the visible part stays short: {visible}");
+    }
+
+    #[test]
+    fn quiet_approval_keeps_an_ask_to_the_author_in_sight() {
+        let body = "# 검증 근거\n\n- ✅ 첫째\n\n# 미확인\n\n- MunoConf 에 새 키를 만들었는지 확인 부탁드립니다\n";
+        let out = compose_quiet_body(body, "✅ **승인** · 지적 없음", "", "");
+        let visible = out.split("<details>").next().unwrap();
+        assert!(visible.contains("### 미확인\n\n- MunoConf 에 새 키를 만들었는지 확인 부탁드립니다"), "{out}");
+        assert!(out.contains("<summary>검토 기록 1건</summary>"), "{out}");
+        assert!(is_author_ask("의도한 동작인가요?") && !is_author_ask("BE 코드는 이 레포에 없음"));
+        // Nothing to fold → no empty fold.
+        let out = compose_quiet_body("# 미확인\n\n- 알려 주세요", "✅", "", "");
+        assert!(!out.contains("<details>"), "{out}");
     }
 
     #[test]
