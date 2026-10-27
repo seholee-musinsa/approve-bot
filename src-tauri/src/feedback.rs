@@ -53,7 +53,7 @@ fn contains_any(s: &str, phrases: &[&str]) -> bool {
     phrases.iter().any(|p| s.contains(p))
 }
 
-fn reply_outcome(body: &str) -> Outcome {
+pub(crate) fn reply_outcome(body: &str) -> Outcome {
     // Quoted reports and code examples are not the speaker's own claims.
     let mut code = false;
     let text = body
@@ -311,6 +311,11 @@ fn classify_pr(
                     ("partial", Outcome::Partial),
                     ("wont_fix", Outcome::Rejected),
                     ("unresolved", Outcome::Replied),
+                    // Settled from the author's reply alone, without a new commit.
+                    ("resolved_by_reply", Outcome::Fixed),
+                    ("answered", Outcome::Replied),
+                    ("deferred", Outcome::Deferred),
+                    ("noted", Outcome::Replied),
                 ]
                 .into_iter()
                 .find(|(s, _)| reply.body.contains(&format!("<!-- fu:{s} -->")));
@@ -807,6 +812,40 @@ mod tests {
         assert_eq!(p[0].author_reported.len(), 2);
         assert_eq!(p[0].bot_assessed[0].outcome, Outcome::Rejected);
         assert!(p[0].commit_verified.is_empty());
+    }
+
+    #[test]
+    fn bot_settlement_statuses_are_recorded_as_assessments() {
+        let p = classify_pr(
+            &[
+                c(1, "bot", BARE, None),
+                c(2, "author", "의도한 동작입니다", Some(1)),
+                c(3, "bot", "🙏 답변 감사합니다. 확인했습니다.\n\n<!-- fu:answered -->", Some(1)),
+            ],
+            Some("bot"),
+            Some("author"),
+            None,
+            Some(1),
+            false,
+        );
+        assert_eq!(p[0].bot_assessed.len(), 1);
+        assert_eq!(p[0].bot_assessed[0].assessment.as_deref(), Some("answered"));
+        assert_eq!(p[0].bot_assessed[0].outcome, Outcome::Replied);
+        let p = classify_pr(
+            &[
+                c(1, "bot", BARE, None),
+                c(2, "author", "반영했습니다", Some(1)),
+                c(3, "bot", "✅ 반영해 주셨다고 하셔서 정리합니다.\n\n<!-- fu:resolved_by_reply -->", Some(1)),
+            ],
+            Some("bot"),
+            Some("author"),
+            None,
+            Some(1),
+            false,
+        );
+        assert_eq!(p[0].bot_assessed[0].outcome, Outcome::Fixed);
+        assert_eq!(p[0].bot_assessed[0].assessment.as_deref(), Some("resolved_by_reply"));
+        assert!(p[0].commit_verified.is_empty(), "a reply-based settlement is not code verification");
     }
 
     #[test]

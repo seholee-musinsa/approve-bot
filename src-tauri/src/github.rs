@@ -53,6 +53,10 @@ pub struct PullRequest {
     /// Target branch. Only the name is used (eval diffs a pinned commit against it).
     #[serde(default)]
     pub base: PrBase,
+    /// Bumped by GitHub on any activity, review-thread replies included. Lets
+    /// the poller skip the thread check for a PR nothing happened on.
+    #[serde(default)]
+    pub updated_at: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]

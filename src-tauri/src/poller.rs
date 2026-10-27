@@ -325,6 +325,120 @@ fn short_files(files: &[String]) -> String {
     }
 }
 
+/// Whether a PR's threads need a look: yes when its `updated_at` moved since
+/// the last check, or when GitHub gave none (older API shape) — then every
+/// poll checks, which only costs calls on PRs that have threads.
+fn needs_reply_check(last_seen: Option<&str>, updated_at: Option<&str>) -> bool {
+    match updated_at {
+        None => true,
+        Some(now) => last_seen != Some(now),
+    }
+}
+
+/// Settle my threads the author replied to without pushing. Questions close
+/// on any answer, nits and minors on a fix report, a reason or a deferral; a
+/// major or blocker only gets a note and waits for the push. One reply per
+/// author reply (`author_reply_after_mine`), so nothing is said twice.
+async fn settle_replies(
+    app: &AppHandle,
+    state: &Arc<AppState>,
+    client: &GitHubClient,
+    owner: &str,
+    repo: &str,
+    pr: &PullRequest,
+    me: &str,
+) {
+    let key = format!("{owner}/{repo}#{}", pr.number);
+    let stamp = pr.updated_at.clone().unwrap_or_default();
+    {
+        let checks = state.reply_checks.lock().await;
+        if !needs_reply_check(checks.get(&key).map(String::as_str), pr.updated_at.as_deref()) {
+            return;
+        }
+    }
+    let comments = match client.list_review_comments(owner, repo, pr.number).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = %e, "could not read review comments; reply settlement skipped");
+            return;
+        }
+    };
+    let prev = crate::rereview::prev_findings(&comments, me);
+    let author = pr.user.login.as_str();
+    let candidates: Vec<(crate::rereview::PrevFinding, crate::rereview::ThreadStep)> = prev
+        .into_iter()
+        .filter_map(|p| {
+            let reply = crate::rereview::author_reply_after_mine(&comments, p.comment_id, me, author)?;
+            let step = crate::rereview::reply_step(&p.severity, crate::feedback::reply_outcome(&reply.body), p.last_reply.as_deref());
+            (step != crate::rereview::ThreadStep::Leave).then_some((p, step))
+        })
+        .collect();
+    if candidates.is_empty() {
+        state.reply_checks.lock().await.insert(key, stamp);
+        return;
+    }
+    let threads = match client.review_threads(owner, repo, pr.number).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "could not read review threads; reply settlement skipped");
+            return;
+        }
+    };
+    let head_sha = pr.head.sha.as_str();
+    let mut closed: Vec<String> = Vec::new();
+    let mut noted: Vec<String> = Vec::new();
+    for (p, step) in candidates {
+        let Some((thread_id, resolved)) = threads.get(&p.comment_id) else { continue };
+        if *resolved {
+            continue;
+        }
+        if client.ensure_publishable(owner, repo, pr.number, head_sha).await.is_err() {
+            return;
+        }
+        match step {
+            crate::rereview::ThreadStep::Close(body) => {
+                if let Err(e) = client.reply_to_review_comment(owner, repo, pr.number, p.comment_id, &body).await {
+                    warn!(error = %e, "settlement reply failed");
+                    continue;
+                }
+                if let Err(e) = client.resolve_review_thread(thread_id).await {
+                    warn!(error = %e, "resolving a settled thread failed");
+                }
+                closed.push(p.id.clone());
+            }
+            crate::rereview::ThreadStep::Note(body) => {
+                if let Err(e) = client.reply_to_review_comment(owner, repo, pr.number, p.comment_id, &body).await {
+                    warn!(error = %e, "settlement note failed");
+                    continue;
+                }
+                noted.push(p.id.clone());
+            }
+            crate::rereview::ThreadStep::Leave => {}
+        }
+    }
+    state.reply_checks.lock().await.insert(key, stamp);
+    if closed.is_empty() && noted.is_empty() {
+        return;
+    }
+    let repo_full = format!("{owner}/{repo}");
+    let mut audit = crate::audit::Record::start(&repo_full, pr.number, head_sha, "none", "none", "", "none".into());
+    audit.source = "settlement".into();
+    audit.timing_available = true;
+    audit.result = Some(serde_json::json!({"closed": closed, "noted": noted}));
+    audit.update("threads_settled");
+    state.record_review(&audit).await;
+    let message = match (closed.len(), noted.len()) {
+        (c, 0) => format!("답글을 보고 스레드 {c}건을 정리했습니다"),
+        (0, n) => format!("답글에 메모 {n}건을 남겼습니다 (push 뒤 다시 확인)"),
+        (c, n) => format!("답글을 보고 스레드 {c}건을 정리하고 메모 {n}건을 남겼습니다"),
+    };
+    push_and_emit(app, state, ActivityEntry {
+        timestamp: Utc::now(), kind: ActivityKind::Info, repo: Some(repo_full),
+        pr_number: Some(pr.number), pr_title: Some(pr.title.clone()), author: Some(pr.user.login.clone()),
+        url: Some(pr.html_url.clone()), message, detail: None,
+    }).await;
+}
+
 /// Hold reasons other than the one the first line already states.
 fn other_notes(decision: &Gate, sensitive: &[String], omitted: &[String], continued: bool) -> String {
     let sensitive: &[String] = if matches!(decision, Gate::HoldSensitive(_)) { &[] } else { sensitive };
@@ -748,6 +862,11 @@ async fn handle_pr(
         r.state.eq_ignore_ascii_case("APPROVED") && r.commit_id.as_deref() == Some(head_sha)
     });
     if approved_head {
+        // The PR is done from the gate's side, but the author may still be
+        // answering threads; settle those without a new review run.
+        if cfg.auto_approve_enabled && cfg.review_enabled {
+            settle_replies(app, state, client, owner, repo, pr, me).await;
+        }
         return;
     }
 
@@ -765,7 +884,10 @@ async fn handle_pr(
             .map(|r| (r.state.as_str(), r.commit_id.as_deref(), marker_of(&r.body)))
             .collect();
         match decide_review_action(&tuples, head_sha, cfg.approve_only_after_review) {
-            ReviewAction::Skip => return,
+            ReviewAction::Skip => {
+                settle_replies(app, state, client, owner, repo, pr, me).await;
+                return;
+            }
             action @ (ReviewAction::ApproveOnly | ReviewAction::FollowUp) => {
                 let pr_key = format!("{repo_full}#{}", pr.number);
                 if state.settled_heads.lock().await.get(&pr_key).map(String::as_str) == Some(head_sha) {
@@ -1530,6 +1652,14 @@ mod tests {
         // …and with an earlier finished review it becomes a follow-up round.
         let reviews = [("COMMENTED", Some(OLD), R), ("COMMENTED", Some(HEAD), F)];
         assert_eq!(decide_review_action(&reviews, HEAD, true), ReviewAction::FollowUp);
+    }
+
+    #[test]
+    fn reply_check_runs_only_when_pr_updated_at_changes() {
+        assert!(super::needs_reply_check(None, Some("2026-10-27T01:00:00Z")), "never checked");
+        assert!(!super::needs_reply_check(Some("2026-10-27T01:00:00Z"), Some("2026-10-27T01:00:00Z")), "nothing happened");
+        assert!(super::needs_reply_check(Some("2026-10-27T01:00:00Z"), Some("2026-10-27T02:00:00Z")), "activity");
+        assert!(super::needs_reply_check(Some("x"), None), "no timestamp from GitHub → check");
     }
 
     #[test]
