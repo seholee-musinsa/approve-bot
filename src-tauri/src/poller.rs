@@ -1251,13 +1251,20 @@ async fn handle_pr(
                     continued: outcome.continued,
                     omitted: outcome.omitted_files.len(),
                 };
-                crate::layout::compose_body(
-                    &outcome.body,
-                    &outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
-                    &notes,
-                    &crate::layout::report_table(&outcome.summary, &scope),
-                    &crate::review::unposted(&outcome.findings, &posted),
-                )
+                let verdict_line = outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score);
+                let table = crate::layout::report_table(&outcome.summary, &scope);
+                if decision == Gate::Approve && outcome.findings.is_empty() {
+                    // Nothing for the author to act on: keep the page short.
+                    crate::layout::compose_quiet_body(&outcome.body, &verdict_line, &notes, &table)
+                } else {
+                    crate::layout::compose_body(
+                        &outcome.body,
+                        &verdict_line,
+                        &notes,
+                        &table,
+                        &crate::review::unposted(&outcome.findings, &posted),
+                    )
+                }
             }
             _ => outcome.body.clone(),
         };
