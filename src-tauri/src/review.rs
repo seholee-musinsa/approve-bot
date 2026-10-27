@@ -1676,7 +1676,31 @@ fn merge_continuation(first: &mut ReviewOutcome, extra: ReviewOutcome, round: us
         }
     }
     first.findings.extend(new_findings);
-    first.body.push_str(&format!("\n\n# 추가 리뷰 ({round}) — 앞선 리뷰가 보지 못한 파일\n\n{}\n", extra.body.trim()));
+    // Only the pass's evidence sections travel; its own overview, finding
+    // lists and diagram would repeat the first review's.
+    let extra_body = strip_sections(extra.body.trim(), &["총평", "발견", "질문", "흐름", "이전 지적 처리"]);
+    first.body.push_str(&format!("\n\n# 추가 리뷰 ({round}) — 앞선 리뷰가 보지 못한 파일\n\n{}\n", extra_body.trim()));
+}
+
+/// The body without the named `# ` sections (heading and content), fences
+/// respected. The text before the first heading counts as `총평`.
+pub fn strip_sections(body: &str, titles: &[&str]) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut dropping = titles.contains(&"총평");
+    let mut in_fence = false;
+    for line in body.lines() {
+        if line.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+        }
+        if !in_fence && line.starts_with("# ") {
+            let t = line[2..].trim();
+            dropping = titles.iter().any(|d| t.starts_with(d));
+        }
+        if !dropping {
+            out.push(line);
+        }
+    }
+    out.join("\n").trim().to_string()
 }
 
 /// Shallow-checkout a PR head into a fresh temp dir. Token is injected via
@@ -2106,6 +2130,23 @@ mod tests {
         extra.verdict = "comment".into();
         merge_continuation(&mut first, extra, 1);
         assert_eq!((first.verdict.as_str(), first.score), ("comment", 3.5));
+    }
+
+    #[test]
+    fn continuation_body_has_one_evidence_section_per_title() {
+        let mut first = outcome(vec![], vec![]);
+        first.body = "# 검증 근거\n\n- ✅ 첫째\n\n# 미확인\n\n- 못 봄".into();
+        let mut extra = outcome(vec![], vec![]);
+        extra.body = "# 총평\n\n또 쓴 총평 5/5점\n\n# 흐름\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n# 발견\n\n- 중복\n\n# 검증 근거\n\n- ✅ 셋째\n\n# 산입하지 않은 것\n\n- 남의 것".into();
+        merge_continuation(&mut first, extra, 1);
+        assert!(!first.body.contains("또 쓴 총평") && !first.body.contains("mermaid") && !first.body.contains("- 중복"), "{}", first.body);
+        assert!(first.body.contains("# 추가 리뷰 (1) — 앞선 리뷰가 보지 못한 파일\n\n# 검증 근거\n\n- ✅ 셋째\n\n# 산입하지 않은 것"), "{}", first.body);
+        // Composed for GitHub, the two evidence sections become one fold.
+        let posted = crate::layout::compose_body(&first.body, "✅", "", "", &[]);
+        assert_eq!(posted.matches("<summary>검증 근거").count(), 1, "{posted}");
+        assert!(posted.contains("검증 근거 2건"), "{posted}");
+        assert_eq!(strip_sections("앞말\n\n# 검증 근거\n\n- a\n\n# 발견\n\n- b", &["총평", "발견"]), "# 검증 근거\n\n- a");
+        assert_eq!(strip_sections("# 검증 근거\n\n```md\n# 발견\n```", &["발견"]), "# 검증 근거\n\n```md\n# 발견\n```");
     }
 
     #[test]

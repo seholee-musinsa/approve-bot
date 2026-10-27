@@ -149,8 +149,8 @@ pub fn render(round: &Round) -> String {
          - unresolved: 그대로다.\n\
          - wont_fix: 작성자가 이유를 댔고 그 이유가 코드로 타당하다.\n\
          - withdrawn: 다시 보니 이전 지적이 틀렸다(스스로 철회).\n\
-         이전 지적을 새 finding 으로 다시 내지 않는다. 본문 맨 위 `# 총평` 아래에 \
-         `# 이전 지적 처리 — 해소 n · 부분 n · 미해소 n · 철회 n` 섹션을 두고, 해소는 ~~취소선~~ 으로 한 줄씩, 미해소는 이유만 짧게 적는다.\n\n\
+         이전 지적을 새 finding 으로 다시 내지 않는다. 처리 결과는 JSON `followups` 에만 적고 \
+         본문에 `# 이전 지적 처리` 나 `# 총평` 섹션을 쓰지 않는다. 코드가 결과를 본문 맨 위에 붙인다.\n\n\
          [이전 지적]\n",
         round.number,
         &round.prev_sha[..round.prev_sha.len().min(8)],
@@ -260,15 +260,15 @@ pub fn followup_summary(
                 open.push(format!("- {icon} {} · **{}** · `{}{at}`{note}", status_label(status), p.claim, p.path));
             }
         }
-        out.push_str(&format!(
-            "\n**이전 지적 {}건** — 해소 {} · 부분 {} · 미해소 {} · 반영 안 함 {} · 철회 {}\n",
-            round.prev.len(),
-            counts[0],
-            counts[1],
-            counts[2],
-            counts[3],
-            counts[4]
-        ));
+        // Non-zero parts only: `해소 1 · 미해소 2`, not five numbers with zeros.
+        let labels = ["해소", "부분", "미해소", "반영 안 함", "철회"];
+        let parts: Vec<String> = labels
+            .iter()
+            .zip(counts.iter())
+            .filter(|(_, n)| **n > 0)
+            .map(|(l, n)| format!("{l} {n}"))
+            .collect();
+        out.push_str(&format!("\n**이전 지적 {}건** — {}\n", round.prev.len(), parts.join(" · ")));
         for line in open {
             out.push_str(&line);
             out.push('\n');
@@ -281,8 +281,9 @@ pub fn followup_summary(
     }
 
     // Same cleanup as a first review's body: small headings, no duplicate
-    // finding lists, audit sections folded one by one.
-    let full = crate::layout::compose_body(full_body.trim(), "", "", "", &[]);
+    // finding lists. Flat inside the one fold below — a `<details>` inside a
+    // `<details>` reads as a broken page on GitHub.
+    let full = crate::layout::compose_body_with(full_body.trim(), "", "", "", &[], false);
     if !full.is_empty() {
         out.push_str(&format!("\n<details>\n<summary>전체 리뷰 보기</summary>\n\n{full}\n\n</details>\n"));
     }
@@ -415,7 +416,7 @@ mod tests {
         let out = followup_summary(&round, "0123456789", "✅ **승인** · 새 지적 nit 1", "", &followups, &[&f], full);
 
         assert!(out.starts_with("✅ **승인** · 새 지적 nit 1\n\n<sub>3회차 재리뷰 · `0123456` · 파일 2개 변경</sub>"), "{out}");
-        assert!(out.contains("**이전 지적 3건** — 해소 1 · 부분 1 · 미해소 1 · 반영 안 함 0 · 철회 0"), "{out}");
+        assert!(out.contains("**이전 지적 3건** — 해소 1 · 부분 1 · 미해소 1\n"), "zero counts are left out: {out}");
         // Resolved items are counted, not re-listed.
         assert!(!out.contains("헤더가 사라짐"), "{out}");
         assert!(out.contains("- 🟡 부분 · **권한 확인 없음** · `src/b.ts:20` — 쓰기만 막음"), "{out}");
@@ -424,7 +425,19 @@ mod tests {
         assert!(out.contains("**인라인에 달지 못한 새 지적 1건**\n- 🔘 **이름이 헷갈립니다** · `src/a.ts:1`"), "{out}");
         // The model's own review is still there, folded.
         assert!(out.contains("<summary>전체 리뷰 보기</summary>") && out.contains("긴 총평"), "{out}");
-        assert!(out.contains("<summary>검증 근거 1건</summary>"), "{out}");
+        let inner = out.split("<summary>전체 리뷰 보기</summary>").nth(1).unwrap();
+        assert!(inner.contains("### 검증 근거\n\n- ✅ 확인"), "{out}");
+        assert!(!inner.contains("<details>"), "no fold inside the fold: {out}");
+    }
+
+    #[test]
+    fn followup_drops_the_models_own_tally_and_prints_only_nonzero_counts() {
+        let round = Round { number: 2, prev_sha: "a".into(), prev: vec![prev("1111", "minor", "a.ts", 1, "x")], delta_diff: DELTA.into() };
+        let full = "# 총평\n\n총평\n\n# 이전 지적 처리 — 해소 1 · 부분 0 · 미해소 0 · 철회 0\n\n- ~~x~~\n\n# 검증 근거\n\n- ✅ 확인";
+        let out = followup_summary(&round, "abc", "✅ **승인** · 새 지적 없음", "", &[fu("1111", "resolved", "")], &[], full);
+        assert!(out.contains("**이전 지적 1건** — 해소 1\n"), "{out}");
+        assert!(!out.contains("이전 지적 처리") && !out.contains("~~x~~"), "{out}");
+        assert_eq!(out.matches("<details>").count(), 1, "{out}");
     }
 
     #[test]
