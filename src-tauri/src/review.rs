@@ -1027,8 +1027,9 @@ fn render_inline_with(f: &Finding, clickable: bool) -> String {
     if !claim.is_empty() && claim.trim_end_matches('.') != finding_title(f) {
         out.push_str(&format!("\n\n{}", sentence_lines(claim)));
     }
+    let has_table = matches!(&f.repro_case, Some(r) if [&r.input, &r.expected, &r.actual].iter().all(|v| !v.trim().is_empty()));
     match &f.repro_case {
-        Some(r) if [&r.input, &r.expected, &r.actual].iter().all(|v| !v.trim().is_empty()) => {
+        Some(r) if has_table => {
             out.push_str(&format!(
                 "\n\n| 상황 | 기대 | 실제 |\n|---|---|---|\n| {} | {} | {} |",
                 table_cell(&r.input),
@@ -1039,10 +1040,16 @@ fn render_inline_with(f: &Finding, clickable: bool) -> String {
         _ if !f.repro.trim().is_empty() => out.push_str(&format!("\n\n{}", sentence_lines(&f.repro))),
         _ => {}
     }
+    // With a repro table the 상황 and 실제 cells already say when it happens
+    // and what the user gets; repeating them as 영향/발생 조건 made 102 of 167
+    // threads state the same fact three times. The code evidence for the
+    // impact is audit trail and goes into the fold either way.
     if let Some(impact) = &f.impact {
-        for (label, value) in [("영향", &impact.consequence), ("발생 조건", &impact.reachability), ("영향 근거", &impact.evidence)] {
-            if !value.trim().is_empty() {
-                out.push_str(&format!("\n\n{label}: {}", value.trim()));
+        if !has_table {
+            for (label, value) in [("영향", &impact.consequence), ("발생 조건", &impact.reachability)] {
+                if !value.trim().is_empty() {
+                    out.push_str(&format!("\n\n{label}: {}", value.trim()));
+                }
             }
         }
     }
@@ -1091,6 +1098,11 @@ fn render_inline_with(f: &Finding, clickable: bool) -> String {
     }
     if !f.rule.trim().is_empty() {
         evidence.push(format!("팀 규칙: {}", f.rule.trim()));
+    }
+    if let Some(impact) = &f.impact {
+        if !impact.evidence.trim().is_empty() {
+            evidence.push(format!("영향 근거: {}", impact.evidence.trim()));
+        }
     }
     if !f.evidence.trim().is_empty() {
         evidence.push(sentence_lines(&f.evidence));
@@ -2439,6 +2451,19 @@ mod tests {
         assert!(body.contains("빈 배열을 거르지 않습니다.\n그래서 빈 목록이 그대로 저장됩니다."), "{body}");
         assert!(body.contains("| 상황 | 기대 | 실제 |\n|---|---|---|\n| `items = []` | 저장 거부 | 빈 목록 \\| 저장 |"), "{body}");
         assert!(at("빈 배열을") < at("| 상황") && at("| 상황") < at("length 도 검사"));
+        // With a repro table, the impact lines would repeat the table.
+        f.impact = Some(FindingImpact { consequence: "빈 목록이 저장됩니다".into(), reachability: "items 가 []".into(), evidence: "save.ts:12 는 길이를 보지 않음".into() });
+        let with_table = render_inline(&f);
+        assert!(!with_table.contains("\n영향: ") && !with_table.contains("발생 조건:"), "{with_table}");
+        assert!(with_table.split("<details>").nth(1).unwrap().contains("영향 근거: save.ts:12 는 길이를 보지 않음"), "{with_table}");
+        // Without a table they are the only place the impact is stated.
+        f.repro_case = None;
+        f.repro = String::new();
+        let no_table = render_inline(&f);
+        assert!(no_table.contains("\n\n영향: 빈 목록이 저장됩니다\n\n발생 조건: items 가 []"), "{no_table}");
+        assert!(!no_table.split("<details>").next().unwrap().contains("영향 근거"), "{no_table}");
+        f.repro_case = Some(ReproCase { input: "`items = []`".into(), expected: "저장 거부".into(), actual: "빈 목록 | 저장".into() });
+        f.impact = None;
         assert!(at("length 도 검사") < at("머지 전에 고치는 것을 권합니다."));
         assert!(at("머지 전에 고치는 것을 권합니다.") < at("if (!a?.length) return;"));
         assert!(at("if (!a?.length) return;") < at("<summary>근거</summary>"));
