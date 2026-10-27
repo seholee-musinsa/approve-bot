@@ -124,10 +124,56 @@ button.danger {
   padding: 2px 8px;
   font-size: 12px;
 }
-button:disabled {
+button:disabled, select:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+/* "Check now ▾": main button plus a narrow caret that opens the repo menu. */
+.split {
+  position: relative;
+  display: inline-flex;
+}
+.split > button:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+.split-caret {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  border-left: none;
+  padding: 6px 8px;
+}
+.menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 20;
+  min-width: 220px;
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+.menu-title {
+  color: var(--muted);
+  font-size: 11px;
+  padding: 4px 10px 6px;
+}
+.menu-item {
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  padding: 6px 10px;
+  white-space: nowrap;
+}
+.menu-item:hover { background: #475569; }
 
 ul.list {
   list-style: none;
