@@ -98,6 +98,16 @@ cargo run --manifest-path src-tauri/Cargo.toml -- review-report \
 이전 UI 기록에는 review ID가 없어 GitHub 기록과 자동으로 대조할 수 없으므로, 동일 날짜의
 정확한 집계에는 GitHub 스냅샷을 별도 디렉터리로 가져오는 편이 적합하다.
 
+기간 지표는 같은 감사 기록에서 주·모델별로 집계한다. 게시 수, 지적 0건 승인 비율, 확신 80 이상
+major를 동반한 승인, 실패 안내 게시 수와 모델 실패 종류, 지적·question 수, `# 검증 근거` 중복
+본문, 옛 제목(`# 총평`, `# 이전 지적 처리`) 본문, 본문·게시 본문 길이 중앙값을 보여 준다. 게시 본문
+길이는 이 기능이 들어간 뒤의 기록에만 있다. Weave나 GitHub를 조회하지 않는다.
+
+```bash
+cargo run --manifest-path src-tauri/Cargo.toml -- review-metrics \
+  --from 2026-10-15 --to 2026-10-27 --timezone +09:00 --format md
+```
+
 답글 통계는 작성자 보고, 참여자 보고, 봇의 후속 판단, 검증된 커밋 증거를 분리한다.
 이 수집기는 커밋을 직접 검증하지 않으므로 commit_verified는 비어 있다. 부분 반영·보류·반대는
 반영 완료와 분리하고, 질문은 별도 분모로 집계한다.

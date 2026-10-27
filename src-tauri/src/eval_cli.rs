@@ -25,6 +25,12 @@ pub fn maybe_run_headless() -> bool {
             Err(e) => { eprintln!("review-report failed: {e:#}"); std::process::exit(1); }
         }
     }
+    if args.first().map(String::as_str) == Some("review-metrics") {
+        match crate::audit::run_metrics_cli(&args[1..]) {
+            Ok(report) => { println!("{report}"); std::process::exit(0); }
+            Err(e) => { eprintln!("review-metrics failed: {e:#}"); std::process::exit(1); }
+        }
+    }
     if args.first().map(String::as_str) == Some("feedback") {
         match crate::feedback::run_cli(&args[1..]) {
             Ok(report) => {
