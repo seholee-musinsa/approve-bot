@@ -82,9 +82,19 @@ export interface ConnectionStatus {
 /// running and one more will follow it.
 export type CheckNowAck = "started" | "queued";
 
-/// Emitted when a poll pass starts and when it ends.
+/// Emitted when a poll pass starts, on every repository/PR step, and when it ends.
 export interface PassState {
   running: boolean;
+  repo_index: number;
+  repo_total: number;
+  repo: string | null;
+  pr_index: number;
+  pr_total: number;
+  pr_number: number | null;
+  pr_title: string | null;
+  stage: string | null;
+  /** 0..1 share of the pass that is done. */
+  fraction: number;
 }
 
 export type ActivityKind = "approved" | "skipped" | "error" | "info";

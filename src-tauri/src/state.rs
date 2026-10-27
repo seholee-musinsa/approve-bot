@@ -111,6 +111,8 @@ pub struct AppState {
     /// `owner/repo#n` → the PR `updated_at` whose threads were last checked
     /// for author replies. Unchanged PRs cost no extra GitHub calls.
     pub reply_checks: Mutex<std::collections::HashMap<String, String>>,
+    /// Where the current pass is (repository, PR, stage); emitted to the UI.
+    pub pass_progress: std::sync::Mutex<crate::poller::PassState>,
     /// True while a PR poll pass (including its reviews) is running. The sweep
     /// scheduler waits for it to be false so the two never compete.
     pub pass_running: std::sync::atomic::AtomicBool,
@@ -134,6 +136,7 @@ impl AppState {
             pending_reviews: Mutex::new(std::collections::HashMap::new()),
             settled_heads: Mutex::new(std::collections::HashMap::new()),
             reply_checks: Mutex::new(std::collections::HashMap::new()),
+            pass_progress: std::sync::Mutex::new(crate::poller::PassState::default()),
             pass_running: std::sync::atomic::AtomicBool::new(false),
             sweep_running: std::sync::atomic::AtomicBool::new(false),
         })

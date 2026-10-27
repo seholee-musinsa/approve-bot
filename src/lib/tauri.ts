@@ -26,6 +26,7 @@ export const PASS_EVENT = "approve-bot://pass-state";
 
 export const api = {
   getConnectionStatus: () => invoke<ConnectionStatus>("get_connection_status"),
+  getPassState: () => invoke<PassState>("get_pass_state"),
   reconnect: () => invoke<ConnectionStatus>("reconnect"),
   getConfig: () => invoke<AppConfig>("get_config"),
   updateConfig: (config: AppConfig) =>
