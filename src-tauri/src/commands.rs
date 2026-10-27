@@ -80,8 +80,11 @@ pub fn ack_for(pass_running: bool) -> CheckNowAck {
 }
 
 #[tauri::command]
-pub async fn force_check_now(state: State<'_, Arc<AppState>>) -> Result<CheckNowAck, String> {
+pub async fn force_check_now(state: State<'_, Arc<AppState>>, repo: Option<String>) -> Result<CheckNowAck, String> {
     state.retries.lock().await.reset();
+    // Empty or "전체" means every repository, like the automatic pass.
+    let scope = repo.map(|r| r.trim().to_string()).filter(|r| !r.is_empty() && r != "전체");
+    *state.check_scope.lock().unwrap_or_else(|e| e.into_inner()) = scope;
     state.poll_signal.notify_one();
     Ok(ack_for(
         state.pass_running.load(std::sync::atomic::Ordering::SeqCst),

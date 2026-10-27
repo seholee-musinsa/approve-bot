@@ -34,7 +34,7 @@ export const api = {
   getActivityLog: (limit = 100) =>
     invoke<ActivityEntry[]>("get_activity_log", { limit }),
   clearActivityLog: () => invoke<void>("clear_activity_log"),
-  forceCheckNow: () => invoke<CheckNowAck>("force_check_now"),
+  forceCheckNow: (repo?: string) => invoke<CheckNowAck>("force_check_now", { repo: repo ?? null }),
   searchUsers: (query: string) =>
     invoke<GhUserHint[]>("search_users", { query }),
   startGhLogin: () => invoke<void>("start_gh_login"),
