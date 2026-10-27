@@ -93,6 +93,12 @@ pub fn findings_list(heading: &str, findings: &[&crate::review::Finding]) -> Str
             (false, None) => format!(" · `{}`", f.path),
         };
         let mut item = format!("- {icon} **{}**{at}", crate::review::finding_title(f));
+        // 75 of 110 body-listed findings had a fix sentence and no code, and
+        // showed only their title; the author could not tell what to change.
+        let fix = f.fix.trim();
+        if !fix.is_empty() {
+            item.push_str(&format!("\n  {}", fix.replace('\n', " ")));
+        }
         if !f.suggestion.trim().is_empty() || !f.fix_code.trim().is_empty() {
             item.push_str(&format!("\n\n<details>\n<summary>수정안과 근거</summary>\n\n{}\n\n</details>\n", crate::review::render_inline(f)));
         }
@@ -767,6 +773,18 @@ mod tests {
         assert!(out.contains("Move the tag writer into a separate job first"));
         assert!(!out.contains("```suggestion"));
         assert!(out.contains("단독 적용"), "explain why this is only a proposal");
+    }
+
+    #[test]
+    fn findings_list_shows_the_fix_sentence_under_the_title() {
+        let mut only_prose = f("minor", "목차에 새 절이 없어 찾기 어렵습니다", "docs/a.md", Some(3));
+        only_prose.fix = "목차 맨 위에 새 절 링크를 추가합니다.\n같은 자리에 둡니다.".into();
+        let out = findings_list("지적", &[&only_prose]);
+        assert!(out.contains("- 🔵 **목차에 새 절이 없어 찾기 어렵습니다** · `docs/a.md:3`\n  목차 맨 위에 새 절 링크를 추가합니다. 같은 자리에 둡니다."), "{out}");
+        assert!(!out.contains("<details>"), "prose alone needs no fold: {out}");
+        let bare = f("question", "의도한 동작인가요", "a.ts", None);
+        let out = findings_list("지적", &[&bare]);
+        assert_eq!(out.lines().filter(|l| l.starts_with("  ")).count(), 0, "no fix, no second line: {out}");
     }
 
     #[test]

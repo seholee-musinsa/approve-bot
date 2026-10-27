@@ -1075,14 +1075,18 @@ fn render_inline_with(f: &Finding, clickable: bool) -> String {
     let refs: Vec<&String> = f.refs.iter().filter(|r| valid_ref(r)).take(2).collect();
     let mut evidence: Vec<String> = Vec::new();
     if let Some(safety) = &f.suggestion_safety {
-        evidence.push(format!("모델이 보고한 적용 가능성: {}", safety.applicability));
+        // Plain words for the author; "(모델 보고)" keeps it honest — this is
+        // what the model said about its own proposal, not an engine check.
+        evidence.push(format!("적용 범위 (모델 보고): {}", applicability_text(&safety.applicability)));
         if let Some(dependencies) = &safety.dependencies {
             if !dependencies.is_empty() {
                 evidence.push(format!("함께 필요한 변경: {}", dependencies.join("; ")));
             }
         }
         if let Some(v) = &safety.verification {
-            evidence.push(format!("모델이 보고한 검증: {} / {} — {}", v.method, v.result, v.evidence));
+            let how = verification_text(&v.method, &v.result);
+            let detail = v.evidence.trim();
+            evidence.push(if detail.is_empty() { format!("확인 (모델 보고): {how}") } else { format!("확인 (모델 보고): {how} — {detail}") });
         }
     }
     if !f.rule.trim().is_empty() {
@@ -1101,6 +1105,31 @@ fn render_inline_with(f: &Finding, clickable: bool) -> String {
     out.push_str(&format!("\n<!-- f:{} -->", finding_id(&f.path, &f.symbol, &f.claim)));
     format!("{}{}{}", neutralize_suggestion_fences(&out[..trusted_code_start]),
         &out[trusted_code_start..trusted_code_end], neutralize_suggestion_fences(&out[trusted_code_end..]))
+}
+
+fn applicability_text(applicability: &str) -> &'static str {
+    match applicability.trim() {
+        "standalone" => "이 수정만으로 끝납니다",
+        "requires_other_changes" => "다른 변경도 함께 필요합니다",
+        _ => "단독 적용 여부를 확인하지 못했습니다",
+    }
+}
+
+fn verification_text(method: &str, result: &str) -> String {
+    let how = match method.trim() {
+        "code_inspection" => "코드로 확인",
+        "test" => "테스트 실행",
+        "none" | "" => "확인 없음",
+        other => other,
+    };
+    let outcome = match result.trim() {
+        "passed" => "통과",
+        "failed" => "실패",
+        "not_run" => "미실행",
+        "" => "",
+        other => other,
+    };
+    if outcome.is_empty() { how.to_string() } else { format!("{how} · {outcome}") }
 }
 
 /// Findings that did not become a thread (no inline line, below the inline
@@ -2344,7 +2373,7 @@ mod tests {
         assert!(body.contains("release.ts:40"));
         assert!(body.contains("Move tag writer into a separate job"));
         assert!(body.contains("Writer still uses this token"));
-        assert!(body.contains("모델이 보고한"), "do not claim engine-executed verification");
+        assert!(body.contains("(모델 보고)"), "do not claim engine-executed verification");
         assert!(body.contains("sev:major c:75"));
         assert!(s.blockers.is_empty(), "impact text never promotes severity automatically");
     }
@@ -2414,6 +2443,14 @@ mod tests {
         assert!(at("머지 전에 고치는 것을 권합니다.") < at("if (!a?.length) return;"));
         assert!(at("if (!a?.length) return;") < at("<summary>근거</summary>"));
         assert!(body.contains("팀 규칙: 빈 입력은 서버 전에 막는다"));
+        // The fold speaks the author's language, not the JSON enum's.
+        assert!(body.contains("적용 범위 (모델 보고): 이 수정만으로 끝납니다"), "{body}");
+        assert!(body.contains("확인 (모델 보고): 코드로 확인 · 통과"), "{body}");
+        assert!(!body.contains("standalone") && !body.contains("code_inspection"), "{body}");
+        assert_eq!(applicability_text("requires_other_changes"), "다른 변경도 함께 필요합니다");
+        assert_eq!(applicability_text("unknown"), "단독 적용 여부를 확인하지 못했습니다");
+        assert_eq!(verification_text("test", "not_run"), "테스트 실행 · 미실행");
+        assert_eq!(verification_text("none", ""), "확인 없음");
         // Only the valid ref survives as a permalink placeholder.
         assert!(body.contains("{{permalink:src/save.ts:10-14}}"), "{body}");
         assert!(!body.contains("passwd") && !body.contains("src/a.ts:1-100"), "{body}");
