@@ -284,7 +284,9 @@ pub fn followup_summary(
     let files = crate::diffprep::changed_paths(&round.delta_diff).len();
     let mut out = outcome_line.trim().to_string();
     if !notes.trim().is_empty() {
-        out.push_str(&format!("\n{}", notes.trim()));
+        // Under an alert box a note needs a blank line or GitHub pulls it in.
+        let gap = if out.starts_with("> [!") { "\n\n" } else { "\n" };
+        out.push_str(&format!("{gap}{}", notes.trim()));
     }
     out.push_str(&format!(
         "\n\n<sub>{}회차 재리뷰 · `{}` · 파일 {files}개 변경</sub>\n",

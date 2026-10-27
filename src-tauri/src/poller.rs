@@ -1280,7 +1280,10 @@ async fn handle_pr(
                 crate::rereview::followup_summary(
                     r,
                     head_sha,
-                    &outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
+                    &crate::layout::verdict_callout(
+                        &outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
+                        &outcome.summary.judgement,
+                    ),
                     &notes,
                     &outcome.followups,
                     &unposted,
@@ -1300,7 +1303,10 @@ async fn handle_pr(
                     continued: outcome.continued,
                     omitted: outcome.omitted_files.len(),
                 };
-                let verdict_line = outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score);
+                let verdict_line = crate::layout::verdict_callout(
+                    &outcome_line(&decision, &counts, outcome.blocking_issues.len(), &score_str, cfg.min_approve_score),
+                    &outcome.summary.judgement,
+                );
                 let table = crate::layout::report_table(&outcome.summary, &scope);
                 if decision == Gate::Approve && outcome.findings.is_empty() {
                     // Nothing for the author to act on: keep the page short.
