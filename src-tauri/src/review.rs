@@ -66,7 +66,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 ```json
 {"verdict":"approve|comment|request_changes","score":<0-5>,"blocking_issues":["suspicious-instruction 같은 엔진 규칙 위반만"],
  "summary":{"changes":["<이 PR 이 바꾼 것, 짧은 구절 2~4개>"],"judgement":"<판단 한두 구절: 결함이 있는지와 가장 중요한 근거>","checks":["<사람이 머지 전에 직접 해 볼 일(배포 순서, 수동 QA 시나리오), 짧은 구절. 작성자에게 묻는 말은 question finding 으로. 없으면 []>"]},
- "findings":[{"severity":"blocker|major|minor|nit|question","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
+ "findings":[{"severity":"blocker|major|minor|nit|question","kind":"defect|simplicity|library","confidence":<0-100>,"path":"<repo 기준 경로>","line":<diff 줄 앞 숫자 또는 null>,
    "symbol":"<함수·컴포넌트 이름>",
    "impact":{"consequence":"<사용자·데이터·운영 영향>","reachability":"<도달 가능한 입력·상태>","evidence":"<영향을 확인한 코드 위치>"},
    "title":"<스레드 제목 한 줄: 작성자나 사용자가 겪게 될 일. 35자 안팎>",
@@ -102,6 +102,7 @@ const CLI_OUTPUT_FORMAT: &str = r#"=== 출력 형식 (반드시 지킬 것 — �
 - line 은 diff 줄 앞에 찍힌 숫자만 쓴다. 삭제된 줄·diff 밖 줄이면 null. 그런 지적은 코드가 본문 목록에 적는다.
 - confidence 는 코드로 확인한 정도다. 70 미만은 인라인으로 달리지 않는다. 영향 크기나 수정 줄 수와 혼동하지 않는다.
 - impact 에 실제 결과, 도달 가능한 조건, 코드 근거를 분리해 적는다. 높은 confidence 만으로 blocker 로 올리지 않는다.
+- kind 는 지적의 관점이다. 동작·데이터가 틀리거나 틀릴 수 있으면 defect, 동작은 맞지만 불필요하게 복잡하거나 과설계됐으면 simplicity, 이미 쓰는 라이브러리를 더 맞게 쓸 수 있으면 library 다. 라이브러리를 잘못 써서 동작이 틀리면 defect 다. simplicity·library 는 minor·nit 로만 내고, 합쳐 리뷰당 최대 3건이다.
 - major 는 특정 입력·상태에서 동작이나 데이터가 틀리는, 코드로 확인한 결함이다. 시안과의 시각 차이(px·색·간격·정렬)는 기능이 깨지지 않으면 minor 또는 nit 다. 예) "팝오버 항목이 시안보다 2px 좁아집니다" 는 minor, "저장 요청이 두 번 나가 중복 생성됩니다" 는 major.
 - 빈 값 허용, 저장 중 값 변경, 조회 중 항목 누락, 부분 성공, 동시성, 권한 문제는 입력부터 소비처까지 추적한다. 실제 사용자 흐름이 깨지면 한 줄 수정이라도 minor 로 낮추지 않는다. 의도된 정책과 명시된 선행 PR 은 반증 없이는 결함으로 단정하지 않는다.
 - suggestion 은 **그 한 줄을 그대로 대체하는 코드**일 때만 쓴다. 여러 줄이 바뀌면 suggestion 은 비우고, 수정 후 코드를 fix_code 에 적는다.
@@ -705,6 +706,9 @@ pub struct Finding {
     /// A behavior bug's case, shown as a one-row table.
     #[serde(default)]
     pub repro_case: Option<ReproCase>,
+    /// The lens: `defect`, `simplicity` or `library`. Blank is read as a defect.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub kind: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, serde::Serialize)]
@@ -965,7 +969,18 @@ pub(crate) const PERMALINK_OPEN: &str = "{{permalink:";
 /// round and the feedback tally read severity and confidence from it.
 fn meta_line(f: &Finding) -> String {
     let c = f.confidence.map(|c| format!(" c:{c:.0}")).unwrap_or_default();
-    format!("<!-- meta sev:{}{c} -->", f.severity)
+    let k = kind_label(&f.kind).map(|_| format!(" kind:{}", f.kind)).unwrap_or_default();
+    format!("<!-- meta sev:{}{c}{k} -->", f.severity)
+}
+
+/// Visible tag for a non-defect lens, so the author can tell a cleanup
+/// suggestion from a bug at a glance. Defects (and blank) carry none.
+pub(crate) fn kind_label(kind: &str) -> Option<&'static str> {
+    match kind {
+        "simplicity" => Some("단순화 제안"),
+        "library" => Some("라이브러리 활용"),
+        _ => None,
+    }
 }
 
 /// What a posted finding thread says about itself: severity, confidence and
@@ -975,6 +990,8 @@ pub(crate) struct InlineHead {
     pub severity: String,
     pub confidence: Option<u32>,
     pub title: String,
+    /// `simplicity`·`library` from the meta line; `defect` otherwise.
+    pub kind: String,
 }
 
 pub(crate) fn parse_inline_head(body: &str) -> InlineHead {
@@ -984,11 +1001,14 @@ pub(crate) fn parse_inline_head(body: &str) -> InlineHead {
         let meta = rest.split("-->").next().unwrap_or("");
         let mut severity = "question".to_string();
         let mut confidence = None;
+        let mut kind = "defect".to_string();
         for tok in meta.split_whitespace() {
             if let Some(v) = tok.strip_prefix("sev:") {
                 severity = v.to_string();
             } else if let Some(v) = tok.strip_prefix("c:") {
                 confidence = v.parse().ok();
+            } else if let Some(v) = tok.strip_prefix("kind:") {
+                kind = v.to_string();
             }
         }
         let title = body
@@ -998,7 +1018,7 @@ pub(crate) fn parse_inline_head(body: &str) -> InlineHead {
             .unwrap_or("")
             .trim()
             .to_string();
-        return InlineHead { severity, confidence, title };
+        return InlineHead { severity, confidence, title, kind };
     }
     let first = body.lines().next().unwrap_or("");
     let severity = SEVERITIES
@@ -1010,7 +1030,7 @@ pub(crate) fn parse_inline_head(body: &str) -> InlineHead {
         .split_once("(확신 ")
         .and_then(|(_, r)| r.split(')').next()?.trim().parse().ok());
     let title = first.split_once(" — ").map(|(_, c)| c.trim()).unwrap_or(first).to_string();
-    InlineHead { severity, confidence, title }
+    InlineHead { severity, confidence, title, kind: "defect".into() }
 }
 
 /// `clickable`: the caller verified both applicability evidence and diff anchor.
@@ -1020,7 +1040,10 @@ pub(crate) fn parse_inline_head(body: &str) -> InlineHead {
 /// for the gate, not the author, so it only lives in the hidden meta line.
 fn render_inline_with(f: &Finding, clickable: bool) -> String {
     let (emoji, _) = severity_label(&f.severity);
-    let head = format!("{emoji} **{}**", finding_title(f));
+    let head = match kind_label(&f.kind) {
+        Some(tag) => format!("{emoji} **{}** · {tag}", finding_title(f)),
+        None => format!("{emoji} **{}**", finding_title(f)),
+    };
     // A blocker is the one thing that should stop the eye.
     let mut out = if f.severity == "blocker" { format!("> [!CAUTION]\n> {head}") } else { head };
     let claim = f.claim.trim();
@@ -2514,6 +2537,37 @@ mod tests {
         // `a.b` and a period inside inline code stay put.
         assert_eq!(sentence_lines("`x.다. y` 를 씁니다. 다음"), "`x.다. y` 를 씁니다.\n다음");
         assert_eq!(sentence_lines("e.g. 이런 경우"), "e.g. 이런 경우");
+    }
+
+    #[test]
+    fn simplicity_and_library_findings_are_tagged_and_read_back() {
+        let mut f = finding("minor", 85.0, "src/x.ts", Some(11), "호출처가 하나뿐입니다.");
+        f.title = "래퍼 없이 바로 부를 수 있습니다".into();
+        f.kind = "simplicity".into();
+        let body = render_inline(&f);
+        assert!(body.starts_with("🔵 **래퍼 없이 바로 부를 수 있습니다** · 단순화 제안"), "{body}");
+        assert!(body.contains("<!-- meta sev:minor c:85 kind:simplicity -->"), "{body}");
+        let head = parse_inline_head(&body);
+        assert_eq!((head.title.as_str(), head.kind.as_str()), ("래퍼 없이 바로 부를 수 있습니다", "simplicity"));
+        f.kind = "library".into();
+        assert!(render_inline(&f).contains("· 라이브러리 활용"));
+        // A defect, a blank kind or an unknown word carries no tag.
+        for kind in ["defect", "", "style"] {
+            f.kind = kind.into();
+            let body = render_inline(&f);
+            assert!(body.lines().next().unwrap().ends_with("부를 수 있습니다**") && !body.contains("kind:"), "{kind}: {body}");
+            assert_eq!(parse_inline_head(&body).kind, "defect");
+        }
+    }
+
+    #[test]
+    fn guide_and_output_contract_ask_for_simplicity_and_library_lenses() {
+        assert!(DEFAULT_GUIDE.contains("## 단순성·라이브러리 점검"));
+        assert!(DEFAULT_GUIDE.contains("새 의존성 추가는 제안하지 않는다"));
+        let prompt = build_prompt(DEFAULT_GUIDE, "", "", true);
+        assert!(prompt.contains(r#""kind":"defect|simplicity|library""#));
+        let v: Verdict = serde_json::from_str(r#"{"findings":[{"severity":"nit","kind":null,"claim":"c"},{"severity":"minor","kind":"library","claim":"d"}]}"#).unwrap();
+        assert_eq!((v.findings[0].kind.as_str(), v.findings[1].kind.as_str()), ("", "library"));
     }
 
     #[test]

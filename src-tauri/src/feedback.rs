@@ -34,6 +34,8 @@ pub struct Evidence {
 pub struct Posted {
     pub id: String,
     pub severity: String,
+    /// `defect`, `simplicity` or `library`, from the thread's meta line.
+    pub kind: String,
     pub confidence: Option<u32>,
     pub has_code: bool,
     /// Latest substantive author report; bot assessments never overwrite this.
@@ -341,6 +343,7 @@ fn classify_pr(
         out.push(Posted {
             id,
             severity: head.severity,
+            kind: head.kind,
             confidence: head.confidence,
             has_code: root.body.contains("```"),
             outcome,
@@ -449,6 +452,10 @@ pub fn summarize(posted: &[Posted]) -> String {
     out.push_str(&table(
         "심각도별 (question 별도)",
         &group_by(posted, |p| p.severity.clone()),
+    ));
+    out.push_str(&table(
+        "관점별 (question 제외)",
+        &group_by(&resolution, |p| p.kind.clone()),
     ));
     out.push_str(&table(
         "코드 블록 (question 제외)",
@@ -678,6 +685,24 @@ mod tests {
     #[test]
     fn empty_input_says_so() {
         assert!(summarize(&[]).contains("찾지 못함"));
+    }
+
+    #[test]
+    fn threads_are_tallied_by_lens() {
+        let mut f = crate::review::Finding::default();
+        f.severity = "minor".into();
+        f.confidence = Some(80.0);
+        f.claim = "호출처가 하나뿐입니다.".into();
+        f.kind = "simplicity".into();
+        let tagged = crate::review::render_inline_for_test(&f);
+        f.kind = String::new();
+        f.claim = "빈 목록이 통과합니다.".into();
+        let plain = crate::review::render_inline_for_test(&f);
+        let p = classify(&[c(1, "bot", &tagged, None), c(2, "bot", &plain, None)], "bot");
+        assert_eq!((p[0].kind.as_str(), p[1].kind.as_str()), ("simplicity", "defect"));
+        let s = summarize(&p);
+        assert!(s.contains("관점별"), "{s}");
+        assert!(s.contains("| simplicity | 1 |") && s.contains("| defect | 1 |"), "{s}");
     }
 
     #[test]
